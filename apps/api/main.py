@@ -30,3 +30,15 @@ def health(user: str = Depends(authenticate)):
 @app.get("/matches")
 def list_matches(user: str = Depends(authenticate)):
     return []
+import pandas as pd
+
+@app.get("/test-excel")
+def test_excel():
+    try:
+        df = pd.read_excel(FILE_PATH)
+        return {
+            "rows": len(df),
+            "columns": list(df.columns)
+        }
+    except Exception as e:
+        return {"error": str(e)}
