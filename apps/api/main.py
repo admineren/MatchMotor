@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import os
 import secrets
-FILE_PATH = "data/SadeOran.xlsx"
+FILE_PATH = "../../data/SadeOran.xlsx"
 print("Using file:", FILE_PATH)
 app = FastAPI(title="MatchMotor API")
 
