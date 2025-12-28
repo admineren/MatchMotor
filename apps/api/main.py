@@ -337,12 +337,12 @@ gol_dist = {
     "6+":  int((tg_series >= 6).sum()),
 }
     # IY / MS dağılımı
-    iy_ms_dist = (
-        df["_iy_ms"]
-        .dropna()
-        .value_counts()
-        .to_dict()
-    )
+iy_ms_dist = (
+    df["_iy_ms"]
+    .dropna()
+    .value_counts()
+    .to_dict()
+)
 
     total = int(len(df))
     rows = df.head(limit).to_dict(orient="records")
