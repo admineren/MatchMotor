@@ -201,22 +201,9 @@ def list_matches(
 
         # MS Skor'dan toplam gol
         if "MS Skor" in df.columns:
-            df["_tg"] = df["MS Skor"].apply(score_to_total_goals)
+            df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
         else:
             df["_tg"] = None
-
-        # _tg güvenliği: sayı yap, yoksa/boşsa patlamasın
-        df["_tg"] = pd.to_numeric(df.get("_tg"), errors="coerce")
-        
-        if "_tg" not in df.columns or df["_tg"].dropna().empty:
-            return {
-                "total": int(len(df)),
-                "returned": 0,
-                "limit": limit,
-                "goal_dist": {},
-                "iy_ms_dist": {},
-                "matches": [],
-            }
 
         # 1.4) Toplam gol aralığı filtresi
         if tg_filter and "_tg" in df.columns:
@@ -350,4 +337,4 @@ def docs(user: str = Depends(authenticate)):
     return get_swagger_ui_html(
         openapi_url="/openapi.json",
         title="MatchMotor API - Docs",
-    )
+)
