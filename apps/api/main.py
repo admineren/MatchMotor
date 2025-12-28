@@ -53,8 +53,15 @@ def list_matches(
     lig: Optional[str] = None,
     ligs: Optional[str] = None,
     limit: int = 20,
+
+    ms1_min: Optional[float] = None,
+    ms1_max: Optional[float] = None,
+    ms0_min: Optional[float] = None,
+    ms0_max: Optional[float] = None,
+    ms2_min: Optional[float] = None,
+    ms2_max: Optional[float] = None,
 ):
-    # Güvenlik: limit çok büyümesin
+    # Güvenlik: limit sınırı
     if limit < 1:
         limit = 1
     if limit > 500:
@@ -66,15 +73,40 @@ def list_matches(
     if lig:
         df = df[df["Lig"].astype(str) == lig]
 
-    # Çoklu lig filtresi (opsiyonel) -> ligs=CHN2,ENG1 gibi
+    # Çoklu lig filtresi (opsiyonel) -> ligs=CHN2,ENG1
     if ligs:
         lig_list = [x.strip() for x in ligs.split(",") if x.strip()]
         if lig_list:
             df = df[df["Lig"].astype(str).isin(lig_list)]
 
-    # Sonuç (limit kadar)
-    return df.head(limit).to_dict(orient="records")
+    # Virgüllü oranları sayıya çevir (MS1/MS0/MS2)
+    def to_float_series(s):
+        s = s.astype(str).str.strip()
+        s = s.str.replace("\u00a0", "", regex=False)  # bazen gizli boşluk
+        s = s.str.replace(",", ".", regex=False)
+        return pd.to_numeric(s, errors="coerce")
 
+    for c in ["MS1", "MS0", "MS2"]:
+        if c in df.columns:
+            df[c] = to_float_series(df[c])
+
+    # Oran aralık filtreleri (manuel)
+    if ms1_min is not None:
+        df = df[df["MS1"] >= ms1_min]
+    if ms1_max is not None:
+        df = df[df["MS1"] <= ms1_max]
+
+    if ms0_min is not None:
+        df = df[df["MS0"] >= ms0_min]
+    if ms0_max is not None:
+        df = df[df["MS0"] <= ms0_max]
+
+    if ms2_min is not None:
+        df = df[df["MS2"] >= ms2_min]
+    if ms2_max is not None:
+        df = df[df["MS2"] <= ms2_max]
+
+    return df.head(limit).to_dict(orient="records")
 
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
