@@ -205,6 +205,19 @@ def list_matches(
         else:
             df["_tg"] = None
 
+        # _tg güvenliği: sayı yap, yoksa/boşsa patlamasın
+        df["_tg"] = pd.to_numeric(df.get("_tg"), errors="coerce")
+        
+        if "_tg" not in df.columns or df["_tg"].dropna().empty:
+            return {
+                "total": int(len(df)),
+                "returned": 0,
+                "limit": limit,
+                "goal_dist": {},
+                "iy_ms_dist": {},
+                "matches": [],
+            }
+
         # 1.4) Toplam gol aralığı filtresi
         if tg_filter and "_tg" in df.columns:
             s = str(tg_filter).strip()
