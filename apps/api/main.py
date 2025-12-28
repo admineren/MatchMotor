@@ -186,8 +186,7 @@ def list_matches(
     lig: Optional[str] = None,
     ligs: Optional[str] = None,   # virgülle çoklu lig: "TSL,ENG1"
     limit: int = 20,
-    iy: Optional[int] = None,   # 1 / 0 / 2
-    ms: Optional[int] = None,   # 1 / 0 / 2
+    tg: Optional[str] = None,   # "0-1", "2-3", "4-5", "6+"
     
     ms1_min: Optional[float] = None,
     ms1_max: Optional[float] = None,
@@ -226,6 +225,17 @@ def list_matches(
         df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
     else:
         df["_tg"] = None
+    # 1.4) Toplam gol aralığı filtresi (tg)
+    if tg and "_tg" in df.columns:
+        tg = str(tg).strip()
+        if tg == "0-1":
+            df = df[(df["_tg"] >= 0) & (df["_tg"] <= 1)]
+        elif tg == "2-3":
+            df = df[(df["_tg"] >= 2) & (df["_tg"] <= 3)]
+        elif tg == "4-5":
+            df = df[(df["_tg"] >= 4) & (df["_tg"] <= 5)]
+        elif tg in ("6+", "6"):
+            df = df[df["_tg"] >= 6]
    
    # IY / MS sonucu (1/1, 1/0, 0/2)
     if "IY Skor" in df.columns and "MS Skor" in df.columns:
