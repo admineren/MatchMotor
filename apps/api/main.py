@@ -3,6 +3,8 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
+from fastapi import HTTPException
+import traceback
 from typing import Optional
 
 import os
@@ -34,11 +36,13 @@ def _to_float_series(s: pd.Series) -> pd.Series:
     s2 = s2.replace({"nan": None, "None": None, "": None})
     return pd.to_numeric(s2, errors="coerce")
 
-
-def normalize_odds(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+def normalize_odds(df, cols):
     for c in cols:
         if c in df.columns:
-            df[c] = _to_float_series(df[c])
+            s = df[c].astype(str).str.strip()
+            s = s.str.replace(",", ".", regex=False)
+            s = s.replace({"": None, "nan": None, "None": None, "-": None})
+            df[c] = pd.to_numeric(s, errors="coerce")
     return df
 
 # Swagger'ı otomatik kapatıyoruz (biz kendimiz /docs açacağız)
@@ -208,6 +212,7 @@ def list_matches(
     iy2_min: Optional[float] = None,
     iy2_max: Optional[float] = None,
 ):
+    try:
     # güvenlik: limit 1..500
     if limit < 1:
         limit = 1
@@ -354,6 +359,10 @@ def list_matches(
         "iy_ms_dist": iy_ms_dist,
         "matches": rows,
     }
+    
+    except Exception as e:
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
