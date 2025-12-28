@@ -229,7 +229,7 @@ def list_matches(
         )
     
     # 1) oranları sayıya çevir
-    df = normalize_odds(df, ["MS1","MS0","MS2","İY 1","İY 0","İY 2","KG Var","KG Yok"])
+        df = normalize_odds(df, ["MS1","MS0","MS2","İY 1","İY 0","İY 2","KG Var","KG Yok"])
     
     # MS Skor'dan toplam gol
     if "MS Skor" in df.columns:
