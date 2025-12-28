@@ -328,34 +328,33 @@ def list_matches(
                 df = df[df["KG Yok"].notna()]
 
     # Gol dağılımı (0-1, 2-3, 4-5, 6+)
-tg_series = df["_tg"].dropna()
-
-gol_dist = {
-    "0-1": int(((tg_series >= 0) & (tg_series <= 1)).sum()),
-    "2-3": int(((tg_series >= 2) & (tg_series <= 3)).sum()),
-    "4-5": int(((tg_series >= 4) & (tg_series <= 5)).sum()),
-    "6+":  int((tg_series >= 6).sum()),
-}
+    tg_series = df["_tg"].dropna()
+    gol_dist = {
+        "0-1": int(((tg_series >= 0) & (tg_series <= 1)).sum()),
+        "2-3": int(((tg_series >= 2) & (tg_series <= 3)).sum()),
+        "4-5": int(((tg_series >= 4) & (tg_series <= 5)).sum()),
+        "6+":  int((tg_series >= 6).sum()),
+    }
     # IY / MS dağılımı
-iy_ms_dist = (
-    df["_iy_ms"]
-    .dropna()
-    .value_counts()
-    .to_dict()
-)
-
-total = int(len(df))
-rows = df.head(limit).to_dict(orient="records")
-returned = int(len(rows))
-
-return {
-    "total": total,
-    "returned": returned,
-    "limit": limit,
-    "goal_dist": gol_dist,
-    "iy_ms_dist": iy_ms_dist,
-    "matches": rows,
-}
+    iy_ms_dist = (
+        df["_iy_ms"]
+        .dropna()
+        .value_counts()
+        .to_dict()
+    )
+    
+    total = int(len(df))
+    rows = df.head(limit).to_dict(orient="records")
+    returned = int(len(rows))
+    
+    return {
+        "total": total,
+        "returned": returned,
+        "limit": limit,
+        "goal_dist": gol_dist,
+        "iy_ms_dist": iy_ms_dist,
+        "matches": rows,
+    }
 
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
