@@ -304,7 +304,7 @@ def list_matches(
         df = df[df["İY 0"] <= iy0_max]
     
     if iy2_min is not None:
-    df = df[df["İY 2"] >= iy2_min]
+        df = df[df["İY 2"] >= iy2_min]
     if iy2_max is not None:
         df = df[df["İY 2"] <= iy2_max]
     
