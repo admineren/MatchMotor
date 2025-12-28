@@ -70,6 +70,29 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 def health(user: str = Depends(authenticate)):
     return {"status": "ok"}
 
+def parse_score_total_goals(x):
+    # örnek: "2-1" / "2 - 1" / "2:1"
+    if x is None or pd.isna(x):
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+
+    # ":" gibi ayırıcıları "-" yap, boşlukları temizle
+    s = s.replace(":", "-").replace("–", "-")
+    s = s.replace(" ", "")
+
+    parts = s.split("-")
+    if len(parts) != 2:
+        return None
+
+    try:
+        a = int(parts[0])
+        b = int(parts[1])
+        return a + b
+    except:
+        return None
+
 @app.get("/matches")
 def list_matches(
     user: str = Depends(authenticate),
@@ -94,7 +117,12 @@ def list_matches(
 
     # 1) oranları sayıya çevir
     df = normalize_odds(df, ["MS1", "MS0", "MS2"])
-
+    # MS Skor'dan toplam gol (_tg)
+if "MS Skor" in df.columns:
+    df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
+else:
+    df["_tg"] = None
+    
     # 2) lig filtresi (lig veya ligs doluysa)
     if lig:
         df = df[df["Lig"].astype(str) == lig]
@@ -119,6 +147,16 @@ def list_matches(
     if ms2_max is not None:
         df = df[df["MS2"] <= ms2_max]
 
+    # Gol dağılımı (0-1, 2-3, 4-5, 6+)
+tg = df["_tg"].dropna()
+
+gol_dist = {
+    "0-1": int(((tg >= 0) & (tg <= 1)).sum()),
+    "2-3": int(((tg >= 2) & (tg <= 3)).sum()),
+    "4-5": int(((tg >= 4) & (tg <= 5)).sum()),
+    "6+":  int((tg >= 6).sum()),
+}
+    
     total = int(len(df))
     rows = df.head(limit).to_dict(orient="records")
     returned = int(len(rows))
@@ -127,6 +165,7 @@ def list_matches(
         "total": total,
         "returned": returned,
         "limit": limit,
+        "goal_dist": gol_dist,
         "matches": rows,
 }
 
