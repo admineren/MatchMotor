@@ -213,20 +213,20 @@ def list_matches(
     iy2_max: Optional[float] = None,
 ):
     try:
-    # güvenlik: limit 1..500
-    if limit < 1:
-        limit = 1
-    if limit > 500:
-        limit = 500
-
-    df = pd.read_excel(FILE_PATH)
-    
-    df.columns = (
-        df.columns
-        .str.strip()
-        .str.replace("İ", "I")
-        .str.replace("ı", "i")
-    )
+        # güvenlik: limit 1..500
+        if limit < 1:
+            limit = 1
+        if limit > 500:
+            limit = 500
+            
+        df = pd.read_excel(FILE_PATH)
+        
+        df.columns = (
+            df.columns
+            .str.strip()
+            .str.replace("İ", "I")
+            .str.replace("ı", "i")
+        )
     
     # 1) oranları sayıya çevir
     df = normalize_odds(df, ["MS1","MS0","MS2","İY 1","İY 0","İY 2","KG Var","KG Yok"])
