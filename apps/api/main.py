@@ -148,18 +148,17 @@ else:
         df = df[df["MS2"] <= ms2_max]
 
     # Gol dağılımı (0-1, 2-3, 4-5, 6+)
-tg = df["_tg"].dropna()
+    tg = df["_tg"].dropna()
 
     gol_dist = {
         "0-1": int(((tg >= 0) & (tg <= 1)).sum()),
         "2-3": int(((tg >= 2) & (tg <= 3)).sum()),
         "4-5": int(((tg >= 4) & (tg <= 5)).sum()),
-        "6+":  int((tg >= 6).sum()),
-}
-    
+        "6+": int((tg >= 6).sum()),
+    }
+
     total = int(len(df))
-    rows = 
-    df.head(limit).to_dict(orient="records")
+    rows = df.head(limit).to_dict(orient="records")
     returned = int(len(rows))
 
     return {
@@ -168,7 +167,7 @@ tg = df["_tg"].dropna()
         "limit": limit,
         "goal_dist": gol_dist,
         "matches": rows,
-}
+            }
 
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
