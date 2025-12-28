@@ -243,7 +243,7 @@ def list_matches(
         elif tg_filter == "4-5":
             df = df[(df["_tg"] >= 4) & (df["_tg"] <= 5)]
         elif tg_filter in ("6+", "6"):
-            df = df[df["_tg"] >= 6
+            df = df[df["_tg"] >= 6]
    
    # IY / MS sonucu (1/1, 1/0, 0/2)
     if "IY Skor" in df.columns and "MS Skor" in df.columns:
