@@ -3,6 +3,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
+from typing import Optional
 
 import os
 import secrets
@@ -47,10 +48,32 @@ def health(user: str = Depends(authenticate)):
 
 
 @app.get("/matches")
-def list_matches(user: str = Depends(authenticate)):
+def list_matches(
+    user: str = Depends(authenticate),
+    lig: Optional[str] = None,
+    ligs: Optional[str] = None,
+    limit: int = 20,
+):
+    # Güvenlik: limit çok büyümesin
+    if limit < 1:
+        limit = 1
+    if limit > 500:
+        limit = 500
+
     df = pd.read_excel(FILE_PATH)
-    # test için ilk 20 satır
-    return df.head(20).to_dict(orient="records")
+
+    # Lig filtresi (opsiyonel)
+    if lig:
+        df = df[df["Lig"].astype(str) == lig]
+
+    # Çoklu lig filtresi (opsiyonel) -> ligs=CHN2,ENG1 gibi
+    if ligs:
+        lig_list = [x.strip() for x in ligs.split(",") if x.strip()]
+        if lig_list:
+            df = df[df["Lig"].astype(str).isin(lig_list)]
+
+    # Sonuç (limit kadar)
+    return df.head(limit).to_dict(orient="records")
 
 
 @app.get("/test-excel")
