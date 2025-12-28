@@ -148,7 +148,7 @@ else:
         df = df[df["MS2"] <= ms2_max]
 
     # Gol dağılımı (0-1, 2-3, 4-5, 6+)
-    tg = df["_tg"].dropna()
+tg = df["_tg"].dropna()
 
     gol_dist = {
         "0-1": int(((tg >= 0) & (tg <= 1)).sum()),
@@ -158,7 +158,8 @@ else:
 }
     
     total = int(len(df))
-    rows = df.head(limit).to_dict(orient="records")
+    rows = 
+    df.head(limit).to_dict(orient="records")
     returned = int(len(rows))
 
     return {
