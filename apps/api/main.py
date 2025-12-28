@@ -195,6 +195,13 @@ def list_matches(
     ms0_max: Optional[float] = None,
     ms2_min: Optional[float] = None,
     ms2_max: Optional[float] = None,
+
+    iy1_min: Optional[float] = None,
+    iy1_max: Optional[float] = None,
+    iy0_min: Optional[float] = None,
+    iy0_max: Optional[float] = None,
+    iy2_min: Optional[float] = None,
+    iy2_max: Optional[float] = None,
 ):
     # güvenlik: limit 1..500
     if limit < 1:
@@ -263,6 +270,22 @@ def list_matches(
         df = df[df["MS2"] >= ms2_min]
     if ms2_max is not None:
         df = df[df["MS2"] <= ms2_max]
+    
+    # İY oran filtreleri
+    if iy1_min is not None:
+        df = df[df["İY 1"] >= iy1_min]
+    if iy1_max is not None:
+        df = df[df["İY 1"] <= iy1_max]
+    
+    if iy0_min is not None:
+        df = df[df["İY 0"] >= iy0_min]
+    if iy0_max is not None:
+        df = df[df["İY 0"] <= iy0_max]
+    
+    if iy2_min is not None:
+    df = df[df["İY 2"] >= iy2_min]
+    if iy2_max is not None:
+        df = df[df["İY 2"] <= iy2_max]
 
     # Gol dağılımı (0-1, 2-3, 4-5, 6+)
     tg = df["_tg"].dropna()
