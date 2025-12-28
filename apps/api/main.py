@@ -93,6 +93,93 @@ def parse_score_total_goals(x):
     except:
         return None
 
+def parse_score_1x2(x):
+    """
+    "2-1" / "2 - 1" / "2:1" -> "1" (ev), "0" (beraber), "2" (deplasman)
+    """
+    if x is None or pd.isna(x):
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+
+    s = s.replace(":", "-").replace("–", "-")
+    s = s.replace(" ", "")
+    parts = s.split("-")
+    if len(parts) != 2:
+        return None
+
+    try:
+        a = int(parts[0])
+        b = int(parts[1])
+    except:
+        return None
+
+    if a > b:
+        return "1"
+    if a == b:
+        return "0"
+    return "2"
+
+def make_iy_ms(iy_skor, ms_skor):
+    """
+    IY Skor ve MS Skor'dan 1/1, 1/0, 2/1 gibi kombinasyon üretir
+    """
+    iy = parse_score_1x2(iy_skor)
+    ms = parse_score_1x2(ms_skor)
+
+    if iy is None or ms is None:
+        return None
+
+    return f"{iy}/{ms}"
+
+def make_iy_ms(iy_res, ms_res):
+    # "1" + "0" -> "1/0"
+    if iy_res is None or ms_res is None:
+        return None
+    return f"{iy_res}/{ms_res}"
+
+def parse_score_1x2(x):
+    """
+    MS Skor veya IY Skor gibi '2-1', '0 - 0', '1:2' formatlarını
+    1/0/2 sonucuna çevirir.
+    1 = Ev kazanır, 0 = Beraberlik, 2 = Deplasman kazanır
+    """
+    if x is None or pd.isna(x):
+        return None
+
+    s = str(x).strip()
+    if not s:
+        return None
+
+    s = s.replace(":", "-").replace(".", "-")
+    s = s.replace(" ", "")
+    parts = s.split("-")
+    if len(parts) != 2:
+        return None
+
+    try:
+        a = int(parts[0])
+        b = int(parts[1])
+    except:
+        return None
+
+    if a > b:
+        return 1
+    if a == b:
+        return 0
+    return 2
+
+def build_iy_ms_key(iy_skor, ms_skor):
+    """
+    IY Skor ve MS Skor'u alıp '1/1', '1/0', '0/2' gibi anahtar üretir.
+    """
+    iy = parse_score_1x2(iy_skor)
+    ms = parse_score_1x2(ms_skor)
+    if iy is None or ms is None:
+        return None
+    return f"{iy}/{ms}"
+
 @app.get("/matches")
 def list_matches(
     user: str = Depends(authenticate),
@@ -123,7 +210,16 @@ def list_matches(
         df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
     else:
         df["_tg"] = None
-
+   
+   # IY / MS sonucu (1/1, 1/0, 0/2)
+    if "IY Skor" in df.columns and "MS Skor" in df.columns:
+        df["_iy_ms"] = df.apply(
+            lambda r: build_iy_ms_key(r["IY Skor"], r["MS Skor"]),
+            axis=1
+        )
+    else:
+        df["_iy_ms"] = None
+    
     # 2) lig filtresi (lig veya ligs doluysa)
     if lig:
         df = df[df["Lig"].astype(str) == lig]
@@ -157,6 +253,13 @@ def list_matches(
         "4-5": int(((tg >= 4) & (tg <= 5)).sum()),
         "6+": int((tg >= 6).sum()),
     }
+    # IY / MS dağılımı
+    iy_ms_dist = (
+        df["_iy_ms"]
+        .dropna()
+        .value_counts()
+        .to_dict()
+    )
 
     total = int(len(df))
     rows = df.head(limit).to_dict(orient="records")
@@ -167,6 +270,7 @@ def list_matches(
         "returned": returned,
         "limit": limit,
         "goal_dist": gol_dist,
+        "iy_ms_dist": iy_ms_dist,
         "matches": rows,
     }
 
