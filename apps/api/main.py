@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import os
 import secrets
+import pandas as pd 
 FILE_PATH = "../../data/SadeOran.xlsx"
 print("Using file:", FILE_PATH)
 app = FastAPI(title="MatchMotor API")
@@ -29,11 +30,8 @@ def health(user: str = Depends(authenticate)):
 
 @app.get("/matches")
 def list_matches(user: str = Depends(authenticate)):
-import pandas as pd
-
 df = pd.read_excel(FILE_PATH)
 return df.head(20).to_dict(orient="records")
-import pandas as pd
 
 @app.get("/test-excel")
 def test_excel():
