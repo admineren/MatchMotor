@@ -161,12 +161,12 @@ total = int(len(df))
 rows = df.head(limit).to_dict(orient="records")
 returned = int(len(rows))
 
-    return {
-        "total": total,
-        "returned": returned,
-        "limit": limit,
-        "goal_dist": gol_dist,
-        "matches": rows,
+return {
+    "total": total,
+    "returned": returned,
+    "limit": limit,
+    "goal_dist": gol_dist,
+    "matches": rows,
 }
 
 @app.get("/test-excel")
