@@ -17,6 +17,30 @@ FILE_PATH = os.path.join(BASE_DIR, "data", "SadeOran.xlsx")
 FILE_PATH = os.path.abspath(FILE_PATH)
 print("Using file:", FILE_PATH)
 
+def _to_float_series(s: pd.Series) -> pd.Series:
+    """
+    Excel'den gelen oran sütunları bazen '1,25' gibi string/metin olur.
+    Hepsini güvenli şekilde float'a çevirir.
+    """
+    if s is None:
+        return s
+    # önce stringe çevir, virgülü noktaya çevir, boşları NaN yap
+    s2 = (
+        s.astype(str)
+         .str.replace(",", ".", regex=False)
+         .str.replace(" ", "", regex=False)
+    )
+    # 'nan', '' gibi şeyler NaN'a dönsün
+    s2 = s2.replace({"nan": None, "None": None, "": None})
+    return pd.to_numeric(s2, errors="coerce")
+
+
+def normalize_odds(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = _to_float_series(df[c])
+    return df
+
 # Swagger'ı otomatik kapatıyoruz (biz kendimiz /docs açacağız)
 app = FastAPI(
     title="MatchMotor API",
@@ -46,12 +70,11 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 def health(user: str = Depends(authenticate)):
     return {"status": "ok"}
 
-
 @app.get("/matches")
 def list_matches(
     user: str = Depends(authenticate),
     lig: Optional[str] = None,
-    ligs: Optional[str] = None,
+    ligs: Optional[str] = None,   # virgülle çoklu lig: "TSL,ENG1"
     limit: int = 20,
 
     ms1_min: Optional[float] = None,
@@ -61,7 +84,7 @@ def list_matches(
     ms2_min: Optional[float] = None,
     ms2_max: Optional[float] = None,
 ):
-    # Güvenlik: limit sınırı
+    # güvenlik: limit 1..500
     if limit < 1:
         limit = 1
     if limit > 500:
@@ -69,28 +92,18 @@ def list_matches(
 
     df = pd.read_excel(FILE_PATH)
 
-    # Lig filtresi (opsiyonel)
+    # 1) oranları sayıya çevir
+    df = normalize_odds(df, ["MS1", "MS0", "MS2"])
+
+    # 2) lig filtresi (lig veya ligs doluysa)
     if lig:
         df = df[df["Lig"].astype(str) == lig]
-
-    # Çoklu lig filtresi (opsiyonel) -> ligs=CHN2,ENG1
-    if ligs:
+    elif ligs:
         lig_list = [x.strip() for x in ligs.split(",") if x.strip()]
         if lig_list:
             df = df[df["Lig"].astype(str).isin(lig_list)]
 
-    # Virgüllü oranları sayıya çevir (MS1/MS0/MS2)
-    def to_float_series(s):
-        s = s.astype(str).str.strip()
-        s = s.str.replace("\u00a0", "", regex=False)  # bazen gizli boşluk
-        s = s.str.replace(",", ".", regex=False)
-        return pd.to_numeric(s, errors="coerce")
-
-    for c in ["MS1", "MS0", "MS2"]:
-        if c in df.columns:
-            df[c] = to_float_series(df[c])
-
-    # Oran aralık filtreleri (manuel)
+    # 3) oran filtreleri (dolu olanlar uygulanır)
     if ms1_min is not None:
         df = df[df["MS1"] >= ms1_min]
     if ms1_max is not None:
@@ -106,7 +119,16 @@ def list_matches(
     if ms2_max is not None:
         df = df[df["MS2"] <= ms2_max]
 
-    return df.head(limit).to_dict(orient="records")
+    total = int(len(df))
+    rows = df.head(limit).to_dict(orient="records")
+    returned = int(len(rows))
+
+    return {
+        "total": total,
+        "returned": returned,
+        "limit": limit,
+        "matches": rows,
+}
 
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
