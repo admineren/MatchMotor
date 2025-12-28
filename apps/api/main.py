@@ -30,8 +30,8 @@ def health(user: str = Depends(authenticate)):
 
 @app.get("/matches")
 def list_matches(user: str = Depends(authenticate)):
-df = pd.read_excel(FILE_PATH)
-return df.head(20).to_dict(orient="records")
+    df = pd.read_excel(FILE_PATH)
+    return df.head(20).to_dict(orient="records")
 
 @app.get("/test-excel")
 def test_excel():
