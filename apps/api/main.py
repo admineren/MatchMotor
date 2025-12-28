@@ -186,9 +186,8 @@ def list_matches(
     lig: Optional[str] = None,
     ligs: Optional[str] = None,   # virgülle çoklu lig: "TSL,ENG1"
     limit: int = 20,
-
-    tg_filter: Optional[str] = None,   # "0-1", "2-3", "4-5", "6+"
-    kg: Optional[str] = None,  # "var" / "yok"
+    tg_filter: Optional[str] = None,
+    kg: Optional[str] = None,
     
     kg_var_min: Optional[float] = None,
     kg_var_max: Optional[float] = None,
@@ -235,14 +234,14 @@ def list_matches(
     
     # 1.4) Toplam gol aralığı filtresi (tg_filter)
     if tg_filter and "_tg" in df.columns:
-        tg_filter = str(tg_filter).strip()
-        if tg_filter == "0-1":
+        s = str(tg_filter).strip()
+        if s == "0-1":
             df = df[(df["_tg"] >= 0) & (df["_tg"] <= 1)]
-        elif tg_filter == "2-3":
+        elif s == "2-3":
             df = df[(df["_tg"] >= 2) & (df["_tg"] <= 3)]
-        elif tg_filter == "4-5":
+        elif s == "4-5":
             df = df[(df["_tg"] >= 4) & (df["_tg"] <= 5)]
-        elif tg_filter in ("6+", "6"):
+        elif s in ("6+", "6"):
             df = df[df["_tg"] >= 6]
    
     # IY / MS sonucu (1/1, 1/0, 0/2)
