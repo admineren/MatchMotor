@@ -157,9 +157,9 @@ gol_dist = {
     "6+":  int((tg >= 6).sum()),
 }
     
-    total = int(len(df))
-    rows = df.head(limit).to_dict(orient="records")
-    returned = int(len(rows))
+total = int(len(df))
+rows = df.head(limit).to_dict(orient="records")
+returned = int(len(rows))
 
     return {
         "total": total,
