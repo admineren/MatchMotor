@@ -117,12 +117,13 @@ def list_matches(
 
     # 1) oranları sayıya çevir
     df = normalize_odds(df, ["MS1", "MS0", "MS2"])
+
     # MS Skor'dan toplam gol (_tg)
-if "MS Skor" in df.columns:
-    df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
-else:
-    df["_tg"] = None
-    
+    if "MS Skor" in df.columns:
+        df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
+    else:
+        df["_tg"] = None
+
     # 2) lig filtresi (lig veya ligs doluysa)
     if lig:
         df = df[df["Lig"].astype(str) == lig]
@@ -167,7 +168,7 @@ else:
         "limit": limit,
         "goal_dist": gol_dist,
         "matches": rows,
-            }
+    }
 
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
@@ -193,4 +194,4 @@ def docs(user: str = Depends(authenticate)):
     return get_swagger_ui_html(
         openapi_url="/openapi.json",
         title="MatchMotor API - Docs",
-    )
+)
