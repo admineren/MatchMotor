@@ -186,8 +186,10 @@ def list_matches(
     lig: Optional[str] = None,
     ligs: Optional[str] = None,   # virgülle çoklu lig: "TSL,ENG1"
     limit: int = 20,
-    tg: Optional[str] = None,   # "0-1", "2-3", "4-5", "6+"
-    kg: Optional[str] = None,
+
+    tg_filter: Optional[str] = None,   # "0-1", "2-3", "4-5", "6+"
+    kg: Optional[str] = None,  # "var" / "yok"
+    
     kg_var_min: Optional[float] = None,
     kg_var_max: Optional[float] = None,
     kg_yok_min: Optional[float] = None,
@@ -223,30 +225,25 @@ def list_matches(
     )
     
     # 1) oranları sayıya çevir
-    df = normalize_odds(
-        df,
-        [
-            "MS1", "MS0", "MS2",
-            "İY 1", "İY 0", "İY 2",
-            "KG Var", "KG Yok"
-        ]
-    )
-    # MS Skor'dan toplam gol (_tg)
+    df = normalize_odds(df, ["MS1","MS0","MS2","İY 1","İY 0","İY 2","KG Var","KG Yok"])
+    
+    # MS Skor'dan toplam gol
     if "MS Skor" in df.columns:
         df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
     else:
         df["_tg"] = None
-    # 1.4) Toplam gol aralığı filtresi (tg)
-    if tg and "_tg" in df.columns:
-        tg = str(tg).strip()
-        if tg == "0-1":
+    
+    # Toplam gol aralığı filtresi (tg_filter)
+    if tg_filter and "_tg" in df.columns:
+        tg_filter = str(tg_filter).strip()
+        if tg_filter == "0-1":
             df = df[(df["_tg"] >= 0) & (df["_tg"] <= 1)]
-        elif tg == "2-3":
+        elif tg_filter == "2-3":
             df = df[(df["_tg"] >= 2) & (df["_tg"] <= 3)]
-        elif tg == "4-5":
+        elif tg_filter == "4-5":
             df = df[(df["_tg"] >= 4) & (df["_tg"] <= 5)]
-        elif tg in ("6+", "6"):
-            df = df[df["_tg"] >= 6]
+        elif tg_filter in ("6+", "6"):
+            df = df[df["_tg"] >= 6
    
    # IY / MS sonucu (1/1, 1/0, 0/2)
     if "IY Skor" in df.columns and "MS Skor" in df.columns:
@@ -317,23 +314,28 @@ def list_matches(
         df = df[df["KG Yok"] >= kg_yok_min]
     if kg_yok_max is not None:
         df = df[df["KG Yok"] <= kg_yok_max]
-    # KG Var / KG Yok basit filtresi
+    
+    # KG Var / KG Yok (tek kutu)
     if kg:
-        kg = kg.lower().strip()
-    if kg == "var" and "KG Var" in df.columns:
-        df = df[df["KG Var"].notna()]
-    elif kg == "yok" and "KG Yok" in df.columns:
-        df = df[df["KG Yok"].notna()]
+        kg_s = str(kg).strip().lower()
+        
+        if kg_s == "var":
+            if "KG Var" in df.columns:
+                df = df[df["KG Var"].notna()]
+        
+        elif kg_s == "yok":
+            if "KG Yok" in df.columns:
+                df = df[df["KG Yok"].notna()]
 
     # Gol dağılımı (0-1, 2-3, 4-5, 6+)
-    tg = df["_tg"].dropna()
+tg_series = df["_tg"].dropna()
 
-    gol_dist = {
-        "0-1": int(((tg >= 0) & (tg <= 1)).sum()),
-        "2-3": int(((tg >= 2) & (tg <= 3)).sum()),
-        "4-5": int(((tg >= 4) & (tg <= 5)).sum()),
-        "6+": int((tg >= 6).sum()),
-    }
+gol_dist = {
+    "0-1": int(((tg_series >= 0) & (tg_series <= 1)).sum()),
+    "2-3": int(((tg_series >= 2) & (tg_series <= 3)).sum()),
+    "4-5": int(((tg_series >= 4) & (tg_series <= 5)).sum()),
+    "6+":  int((tg_series >= 6).sum()),
+}
     # IY / MS dağılımı
     iy_ms_dist = (
         df["_iy_ms"]
