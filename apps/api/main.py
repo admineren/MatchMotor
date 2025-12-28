@@ -233,7 +233,7 @@ def list_matches(
     else:
         df["_tg"] = None
     
-    # Toplam gol aralığı filtresi (tg_filter)
+    # 1.4) Toplam gol aralığı filtresi (tg_filter)
     if tg_filter and "_tg" in df.columns:
         tg_filter = str(tg_filter).strip()
         if tg_filter == "0-1":
@@ -245,7 +245,7 @@ def list_matches(
         elif tg_filter in ("6+", "6"):
             df = df[df["_tg"] >= 6]
    
-   # IY / MS sonucu (1/1, 1/0, 0/2)
+    # IY / MS sonucu (1/1, 1/0, 0/2)
     if "IY Skor" in df.columns and "MS Skor" in df.columns:
         df["_iy_ms"] = df.apply(
             lambda r: build_iy_ms_key(r["IY Skor"], r["MS Skor"]),
