@@ -344,9 +344,9 @@ iy_ms_dist = (
     .to_dict()
 )
 
-    total = int(len(df))
-    rows = df.head(limit).to_dict(orient="records")
-    returned = int(len(rows))
+total = int(len(df))
+rows = df.head(limit).to_dict(orient="records")
+returned = int(len(rows))
 
     return {
         "total": total,
