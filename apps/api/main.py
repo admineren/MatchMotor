@@ -29,7 +29,10 @@ def health(user: str = Depends(authenticate)):
 
 @app.get("/matches")
 def list_matches(user: str = Depends(authenticate)):
-    return []
+import pandas as pd
+
+df = pd.read_excel(FILE_PATH)
+return df.head(20).to_dict(orient="records")
 import pandas as pd
 
 @app.get("/test-excel")
