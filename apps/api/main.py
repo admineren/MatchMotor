@@ -187,6 +187,11 @@ def list_matches(
     ligs: Optional[str] = None,   # virgülle çoklu lig: "TSL,ENG1"
     limit: int = 20,
     tg: Optional[str] = None,   # "0-1", "2-3", "4-5", "6+"
+    kg: Optional[str] = None,
+    kg_var_min: Optional[float] = None,
+    kg_var_max: Optional[float] = None,
+    kg_yok_min: Optional[float] = None,
+    kg_yok_max: Optional[float] = None,
     
     ms1_min: Optional[float] = None,
     ms1_max: Optional[float] = None,
@@ -216,10 +221,16 @@ def list_matches(
         .str.replace("İ", "I")
         .str.replace("ı", "i")
     )
-
+    
     # 1) oranları sayıya çevir
-    df = normalize_odds(df, ["MS1", "MS0", "MS2"])
-
+    df = normalize_odds(
+        df,
+        [
+            "MS1", "MS0", "MS2",
+            "İY 1", "İY 0", "İY 2",
+            "KG Var", "KG Yok"
+        ]
+    )
     # MS Skor'dan toplam gol (_tg)
     if "MS Skor" in df.columns:
         df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
@@ -296,6 +307,23 @@ def list_matches(
     df = df[df["İY 2"] >= iy2_min]
     if iy2_max is not None:
         df = df[df["İY 2"] <= iy2_max]
+    
+    # KG Var / KG Yok oran filtreleri
+    if kg_var_min is not None:
+        df = df[df["KG Var"] >= kg_var_min]
+    if kg_var_max is not None:
+        df = df[df["KG Var"] <= kg_var_max]
+    if kg_yok_min is not None:
+        df = df[df["KG Yok"] >= kg_yok_min]
+    if kg_yok_max is not None:
+        df = df[df["KG Yok"] <= kg_yok_max]
+    # KG Var / KG Yok basit filtresi
+    if kg:
+        kg = kg.lower().strip()
+    if kg == "var" and "KG Var" in df.columns:
+        df = df[df["KG Var"].notna()]
+    elif kg == "yok" and "KG Yok" in df.columns:
+        df = df[df["KG Yok"].notna()]
 
     # Gol dağılımı (0-1, 2-3, 4-5, 6+)
     tg = df["_tg"].dropna()
