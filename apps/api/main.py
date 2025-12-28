@@ -186,7 +186,9 @@ def list_matches(
     lig: Optional[str] = None,
     ligs: Optional[str] = None,   # virgülle çoklu lig: "TSL,ENG1"
     limit: int = 20,
-
+    iy: Optional[int] = None,   # 1 / 0 / 2
+    ms: Optional[int] = None,   # 1 / 0 / 2
+    
     ms1_min: Optional[float] = None,
     ms1_max: Optional[float] = None,
     ms0_min: Optional[float] = None,
@@ -226,6 +228,17 @@ def list_matches(
         )
     else:
         df["_iy_ms"] = None
+        # 1.5) IY / MS filtreleri (iy=1, ms=2 gibi)
+    if iy is not None or ms is not None:
+        if "IY Skor" in df.columns and "MS Skor" in df.columns:
+            # IY filtresi
+            if iy is not None:
+                df["_iy_res"] = df["IY Skor"].apply(parse_score_1x2)
+                df = df[df["_iy_res"] == int(iy)]
+                # MS filtresi
+            if ms is not None:
+                df["_ms_res"] = df["MS Skor"].apply(parse_score_1x2)
+                df = df[df["_ms_res"] == int(ms)]
     
     # 2) lig filtresi (lig veya ligs doluysa)
     if lig:
