@@ -201,6 +201,13 @@ def list_matches(
         limit = 500
 
     df = pd.read_excel(FILE_PATH)
+    
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.replace("İ", "I")
+        .str.replace("ı", "i")
+    )
 
     # 1) oranları sayıya çevir
     df = normalize_odds(df, ["MS1", "MS0", "MS2"])
@@ -277,8 +284,8 @@ def list_matches(
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
     df = pd.read_excel(FILE_PATH)
+    
     return {"rows": len(df), "columns": list(df.columns)}
-
 
 # Korumalı OpenAPI json
 @app.get("/openapi.json")
