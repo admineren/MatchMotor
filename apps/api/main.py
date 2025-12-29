@@ -90,27 +90,6 @@ def parse_score_home_away(score):
     except Exception:
         return (None, None)
 
-def score_to_kg_result(ms_skor):
-    """
-    MS Skor'a göre KG sonucu üretir.
-    var -> iki takım da en az 1 gol
-    yok -> takımlardan biri 0 gol
-    """
-    if not isinstance(ms_skor, str):
-        return None
-
-    try:
-        a, b = ms_skor.split("-")
-        a = int(a.strip())
-        b = int(b.strip())
-    except:
-        return None
-
-    if a > 0 and b > 0:
-        return "var"
-    else:
-        return "yok"
-
 def parse_score_total_goals(x):
     # örnek: "2-1" / "2 - 1" / "2:1"
     if x is None or pd.isna(x):
@@ -180,6 +159,27 @@ def build_iy_ms_key(iy_skor, ms_skor):
     if iy is None or ms is None:
         return None
     return f"{iy}/{ms}"
+
+def parse_kg_result_from_score(ms_skor)
+    """
+    MS Skor'a göre KG sonucu üretir.
+    var -> iki takım da en az 1 gol
+    yok -> takımlardan biri 0 gol
+    """
+    if not isinstance(ms_skor, str):
+        return None
+
+    try:
+        a, b = ms_skor.split("-")
+        a = int(a.strip())
+        b = int(b.strip())
+    except:
+        return None
+
+    if a > 0 and b > 0:
+        return "var"
+    else:
+        return "yok"   
 
 @app.get("/matches")
 def list_matches(
@@ -321,7 +321,7 @@ def list_matches(
                 if "_kg_res" not in df.columns:
                     
                     if "MS Skor" in df.columns:
-                        df["_kg_res"] = df["MS Skor"].apply(score_to_kg_result)
+                        df["_kg_res"] = df["MS Skor"].apply(parse_kg_result_from_score)
                     else:
                         df["_kg_res"] = None
                         
