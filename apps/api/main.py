@@ -322,12 +322,17 @@ def list_matches(
                 "4-5": int(((tg_series >= 4) & (tg_series <= 5)).sum()),
                 "6+": int((tg_series >= 6).sum()),
             }
+        else:
+            gol_dist = {}
+        
         # KG Var / KG Yok dağılımı
-            kg_dist = {}
+        kg_dist = {}
+        
         if "KG Var" in df.columns:
             kg_dist["var"] = int(df["KG Var"].notna().sum())
         else:
-           kg_dist["var"] = 0
+            kg_dist["var"] = 0
+        
         if "KG Yok" in df.columns:
             kg_dist["yok"] = int(df["KG Yok"].notna().sum())
         else:
