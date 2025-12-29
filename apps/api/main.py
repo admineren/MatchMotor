@@ -347,7 +347,7 @@ def list_matches(
             "returned": returned,
             "limit": limit,
             "goal_dist": gol_dist,
-            "kg_dist": kg_dist
+            "kg_dist": kg_dist,
             "iy_ms_dist": iy_ms_dist,
             "matches": rows,
         }
