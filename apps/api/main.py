@@ -12,6 +12,50 @@ import os
 import secrets
 import pandas as pd
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
+Base = declarative_base()
+from sqlalchemy import Column, Integer, String, Date, Float, DateTime
+from datetime import datetime
+
+
+class Match(Base):
+    __tablename__ = "matches"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    match_date = Column(Date, index=True)
+    league = Column(String, index=True)
+    home_team = Column(String, index=True)
+    away_team = Column(String, index=True)
+
+    iy_score = Column(String)   # "1-0" gibi
+    ms_score = Column(String)   # "2-1" gibi
+
+    iy1 = Column(Float)
+    iy0 = Column(Float)
+    iy2 = Column(Float)
+
+    ms1 = Column(Float)
+    ms0 = Column(Float)
+    ms2 = Column(Float)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 security = HTTPBasic()
 
 # Excel dosyası: repo kökü/data/SadeOran.xlsx
@@ -54,6 +98,7 @@ app = FastAPI(
     openapi_url=None,
 )
 
+Base.metadata.create_all(bind=engine)
 
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
     admin_user = os.getenv("ADMIN_USER", "")
