@@ -117,7 +117,7 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 @app.get("/health")
-def health(user: str = Depends(authenticate)):
+def health():
     return {"status": "ok"}
 
 
