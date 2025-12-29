@@ -160,7 +160,7 @@ def build_iy_ms_key(iy_skor, ms_skor):
         return None
     return f"{iy}/{ms}"
 
-def parse_kg_result_from_score(ms_skor)
+def parse_kg_result_from_score(ms_skor):
     """
     MS Skor'a göre KG sonucu üretir.
     var -> iki takım da en az 1 gol
