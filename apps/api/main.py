@@ -5,6 +5,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi import HTTPException
 import traceback
+import re
 from typing import Optional
 
 import os
@@ -318,8 +319,16 @@ def list_matches(
                 "4-5": int(((tg_series >= 4) & (tg_series <= 5)).sum()),
                 "6+": int((tg_series >= 6).sum()),
             }
+        # KG Var / KG Yok dağılımı
+            kg_dist = {}
+       if "KG Var" in df.columns:
+           kg_dist["var"] = int(df["KG Var"].notna().sum())
+       else:
+           kg_dist["var"] = 0
+        if "KG Yok" in df.columns:
+            kg_dist["yok"] = int(df["KG Yok"].notna().sum())
         else:
-            gol_dist = {}
+            kg_dist["yok"] = 0
 
         # İY / MS dağılımı
         iy_ms_dist = (
@@ -338,6 +347,7 @@ def list_matches(
             "returned": returned,
             "limit": limit,
             "goal_dist": gol_dist,
+            "kg_dist": kg_dist
             "iy_ms_dist": iy_ms_dist,
             "matches": rows,
         }
