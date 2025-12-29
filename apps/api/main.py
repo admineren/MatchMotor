@@ -245,11 +245,14 @@ def list_matches(
                 df = df[df["_tg"] >= 6]
 
         # İY / MS sonucu (1/1, 1/0, 0/2...)
-        if "IY Skor" in df.columns and "MS Skor" in df.columns:
-            df["_iy_ms"] = df.apply(build_iy_ms_key, axis=1)
-        else:
-            df["_iy_ms"] = None
-
+        if "İY Skor" in df.columns and "MS Skor" in df.columns:
+                df["_iy_ms"] = df.apply(
+                    lambda r: build_iy_ms_key(r["İY Skor"], r["MS Skor"]),
+                    axis=1
+                )
+            else:
+                df["_iy_ms"] = None
+        
         # 1.5) İY / MS skor filtresi (iy ve/veya ms girilirse)
         if iy is not None or ms is not None:
             if "IY Skor" in df.columns:
