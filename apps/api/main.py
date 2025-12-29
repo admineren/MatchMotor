@@ -321,9 +321,9 @@ def list_matches(
             }
         # KG Var / KG Yok dağılımı
             kg_dist = {}
-       if "KG Var" in df.columns:
-           kg_dist["var"] = int(df["KG Var"].notna().sum())
-       else:
+        if "KG Var" in df.columns:
+            kg_dist["var"] = int(df["KG Var"].notna().sum())
+        else:
            kg_dist["var"] = 0
         if "KG Yok" in df.columns:
             kg_dist["yok"] = int(df["KG Yok"].notna().sum())
