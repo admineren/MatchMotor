@@ -90,13 +90,26 @@ def parse_score_home_away(score):
     except Exception:
         return (None, None)
 
-def parse_kg_result_from_score(score):
-    """KG sonucu: her iki takım gol attıysa 'var' yoksa 'yok'."""
-    h, a = parse_score_home_away(score)
-    if h is None or a is None:
+def score_to_kg_result(ms_skor):
+    """
+    MS Skor'a göre KG sonucu üretir.
+    var -> iki takım da en az 1 gol
+    yok -> takımlardan biri 0 gol
+    """
+    if not isinstance(ms_skor, str):
         return None
-    return "var" if (h > 0 and a > 0) else "yok"
 
+    try:
+        a, b = ms_skor.split("-")
+        a = int(a.strip())
+        b = int(b.strip())
+    except:
+        return None
+
+    if a > 0 and b > 0:
+        return "var"
+    else:
+        return "yok"
 
 def parse_score_total_goals(x):
     # örnek: "2-1" / "2 - 1" / "2:1"
@@ -245,13 +258,13 @@ def list_matches(
                 df = df[df["_tg"] >= 6]
 
         # İY / MS sonucu (1/1, 1/0, 0/2...)
-        if "İY Skor" in df.columns and "MS Skor" in df.columns:
-                df["_iy_ms"] = df.apply(
-                    lambda r: build_iy_ms_key(r["İY Skor"], r["MS Skor"]),
-                    axis=1
-                )
-            else:
-                df["_iy_ms"] = None
+        if "IY Skor" in df.columns and "MS Skor" in df.columns:
+            df["_iy_ms"] = df.apply(
+                lambda r: build_iy_ms_key(r["IY Skor"], r["MS Skor"]),
+                axis=1
+            )
+        else:
+            df["_iy_ms"] = None
         
         # 1.5) İY / MS skor filtresi (iy ve/veya ms girilirse)
         if iy is not None or ms is not None:
@@ -299,19 +312,21 @@ def list_matches(
         apply_range("KG Var", kg_var_min, kg_var_max)
         apply_range("KG Yok", kg_yok_min, kg_yok_max)
 
-        # KG Var / KG Yok (tek kutu) -> sonuç (var/yok)
+        # KG Var / KG Yok (tek kutu – skor bazlı)
         if kg:
             kg_s = str(kg).strip().lower()
+            
             if kg_s in ("var", "yok"):
-                if "_kg_res" not in df.columns:
-            # güvenlik
-            if "MS Skor" in df.columns:
-                df["_kg_res"] = df["MS Skor"].apply(score_to_kg_result)
-            else:
-                df["_kg_res"] = None
                 
-            df = df[df["_kg_res"] == kg_s]
-
+                if "_kg_res" not in df.columns:
+                    
+                    if "MS Skor" in df.columns:
+                        df["_kg_res"] = df["MS Skor"].apply(score_to_kg_result)
+                    else:
+                        df["_kg_res"] = None
+                        
+                df = df[df["_kg_res"] == kg_s]     
+        
         # Gol dağılımı (0-1, 2-3, 4-5, 6+)
         if "_tg" in df.columns:
             tg_series = df["_tg"].dropna()
@@ -324,18 +339,14 @@ def list_matches(
         else:
             gol_dist = {}
         
-        # KG Var / KG Yok dağılımı
-        kg_dist = {}
-        
-        if "KG Var" in df.columns:
-            kg_dist["var"] = int(df["KG Var"].notna().sum())
+        # KG Var / KG Yok dağılımı (sonuçtan)
+        if "_kg_res" in df.columns:
+            kg_dist = {
+                "var": int((df["_kg_res"] == "var").sum()),
+                "yok": int((df["_kg_res"] == "yok").sum()),
+            }
         else:
-            kg_dist["var"] = 0
-        
-        if "KG Yok" in df.columns:
-            kg_dist["yok"] = int(df["KG Yok"].notna().sum())
-        else:
-            kg_dist["yok"] = 0
+            kg_dist = {"var": 0, "yok": 0}
 
         # İY / MS dağılımı
         iy_ms_dist = (
