@@ -250,8 +250,8 @@ def list_matches(
                     lambda r: build_iy_ms_key(r["İY Skor"], r["MS Skor"]),
                     axis=1
                 )
-            else:
-                df["_iy_ms"] = None
+                else:
+                    df["_iy_ms"] = None
         
         # 1.5) İY / MS skor filtresi (iy ve/veya ms girilirse)
         if iy is not None or ms is not None:
