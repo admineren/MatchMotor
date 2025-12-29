@@ -299,19 +299,18 @@ def list_matches(
         apply_range("KG Var", kg_var_min, kg_var_max)
         apply_range("KG Yok", kg_yok_min, kg_yok_max)
 
-        
-        # KG Var / KG Yok (tek kutu) -> sonuç filtresi (MS Skor'dan)
-        # NOT: 'kg' parametresi bahis oranı değil, "karşılıklı gol oldu mu?" filtresidir.
+        # KG Var / KG Yok (tek kutu) -> sonuç (var/yok)
         if kg:
             kg_s = str(kg).strip().lower()
             if kg_s in ("var", "yok"):
                 if "_kg_res" not in df.columns:
-                    # güvenlik
-                    if "MS Skor" in df.columns:
-                        df["_kg_res"] = df["MS Skor"].apply(parse_kg_result_from_score)
-                    else:
-                        df["_kg_res"] = None
-                df = df[df["_kg_res"] == kg_s]
+            # güvenlik
+            if "MS Skor" in df.columns:
+                df["_kg_res"] = df["MS Skor"].apply(score_to_kg_result)
+            else:
+                df["_kg_res"] = None
+                
+            df = df[df["_kg_res"] == kg_s]
 
         # Gol dağılımı (0-1, 2-3, 4-5, 6+)
         if "_tg" in df.columns:
