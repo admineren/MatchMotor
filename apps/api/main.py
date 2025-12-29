@@ -74,6 +74,29 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 def health(user: str = Depends(authenticate)):
     return {"status": "ok"}
 
+
+def parse_score_home_away(score):
+    """'4 - 2' gibi skor metninden (ev, dep) tuple döndürür."""
+    if score is None:
+        return (None, None)
+    s = str(score).strip()
+    # bazı dosyalarda '4-2' ya da '4 : 2' gibi gelebilir
+    m = re.match(r"^\s*(\d+)\s*[-:]\s*(\d+)\s*$", s)
+    if not m:
+        return (None, None)
+    try:
+        return (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        return (None, None)
+
+def parse_kg_result_from_score(score):
+    """KG sonucu: her iki takım gol attıysa 'var' yoksa 'yok'."""
+    h, a = parse_score_home_away(score)
+    if h is None or a is None:
+        return None
+    return "var" if (h > 0 and a > 0) else "yok"
+
+
 def parse_score_total_goals(x):
     # örnek: "2-1" / "2 - 1" / "2:1"
     if x is None or pd.isna(x):
@@ -197,13 +220,16 @@ def list_matches(
         )
 
         # 1) oranları sayıya çevir
-        df = normalize_odds(df, ["MS1", "MS0", "MS2", "İY 1", "İY 0", "İY 2", "KG Var", "KG Yok"])
+        df = normalize_odds(df, ["MS1", "MS0", "MS2", "IY 1", "IY 0", "IY 2", "KG Var", "KG Yok"])
 
         # MS Skor'dan toplam gol
         if "MS Skor" in df.columns:
             df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
+            # MS Skor'dan KG sonucu (var/yok)
+            df["_kg_res"] = df["MS Skor"].apply(parse_kg_result_from_score)
         else:
             df["_tg"] = None
+            df["_kg_res"] = None
 
         # 1.4) Toplam gol aralığı filtresi
         if tg_filter and "_tg" in df.columns:
@@ -218,15 +244,15 @@ def list_matches(
                 df = df[df["_tg"] >= 6]
 
         # İY / MS sonucu (1/1, 1/0, 0/2...)
-        if "İY Skor" in df.columns and "MS Skor" in df.columns:
+        if "IY Skor" in df.columns and "MS Skor" in df.columns:
             df["_iy_ms"] = df.apply(build_iy_ms_key, axis=1)
         else:
             df["_iy_ms"] = None
 
         # 1.5) İY / MS skor filtresi (iy ve/veya ms girilirse)
         if iy is not None or ms is not None:
-            if "İY Skor" in df.columns:
-                df["_iy_res"] = df["İY Skor"].apply(parse_score_1x2)
+            if "IY Skor" in df.columns:
+                df["_iy_res"] = df["IY Skor"].apply(parse_score_1x2)
             else:
                 df["_iy_res"] = None
 
@@ -262,20 +288,26 @@ def list_matches(
         apply_range("MS0", ms0_min, ms0_max)
         apply_range("MS2", ms2_min, ms2_max)
 
-        apply_range("İY 1", iy1_min, iy1_max)
-        apply_range("İY 0", iy0_min, iy0_max)
-        apply_range("İY 2", iy2_min, iy2_max)
+        apply_range("IY 1", iy1_min, iy1_max)
+        apply_range("IY 0", iy0_min, iy0_max)
+        apply_range("IY 2", iy2_min, iy2_max)
 
         apply_range("KG Var", kg_var_min, kg_var_max)
         apply_range("KG Yok", kg_yok_min, kg_yok_max)
 
-        # KG Var / KG Yok (tek kutu)
+        
+        # KG Var / KG Yok (tek kutu) -> sonuç filtresi (MS Skor'dan)
+        # NOT: 'kg' parametresi bahis oranı değil, "karşılıklı gol oldu mu?" filtresidir.
         if kg:
             kg_s = str(kg).strip().lower()
-            if kg_s == "var" and "KG Var" in df.columns:
-                df = df[df["KG Var"].notna()]
-            elif kg_s == "yok" and "KG Yok" in df.columns:
-                df = df[df["KG Yok"].notna()]
+            if kg_s in ("var", "yok"):
+                if "_kg_res" not in df.columns:
+                    # güvenlik
+                    if "MS Skor" in df.columns:
+                        df["_kg_res"] = df["MS Skor"].apply(parse_kg_result_from_score)
+                    else:
+                        df["_kg_res"] = None
+                df = df[df["_kg_res"] == kg_s]
 
         # Gol dağılımı (0-1, 2-3, 4-5, 6+)
         if "_tg" in df.columns:
