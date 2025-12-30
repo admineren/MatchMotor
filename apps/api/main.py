@@ -14,6 +14,7 @@ import pandas as pd
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import text
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -120,6 +121,14 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 def health():
     return {"status": "ok"}
 
+@app.get("/db-health")
+def db_health():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"db": "ok"}
+    except Exception as e:
+        return {"db": "error", "detail": str(e)}
 
 def parse_score_home_away(score):
     """'4 - 2' gibi skor metninden (ev, dep) tuple döndürür."""
