@@ -69,6 +69,9 @@ class Match(Base):
     ms0 = Column(Float)
     ms2 = Column(Float)
 
+    under25 = Column(Float)
+    over25 = Column(Float)
+
     created_at = Column(DateTime, default=datetime.utcnow)
 
 security = HTTPBasic()
