@@ -12,6 +12,7 @@ from typing import Optional
 import os
 import secrets
 import pandas as pd
+import math
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -217,187 +218,106 @@ def _col(df, *names):
 
 
 @app.post("/import/file")
-async def import_file(
-    file: UploadFile = File(...),
-    user: str = Depends(authenticate),
-    db: Session = Depends(get_db),
-):
+def import_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Excel dosyasını (xlsx) okuyup Match tablosuna toplu şekilde yazar.
+    Not: Satır satır 'var mı' sorgusu yapmadığımız için çok daha hızlıdır.
+    """
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Sadece Excel (.xlsx/.xls) dosyası destekleniyor")
+
+    # Dosyayı diske yaz (Render'da /tmp güvenli)
+    tmp_path = f"/tmp/{file.filename}"
     try:
-        content = await file.read()
-        fname = (file.filename or "").lower()
+        with open(tmp_path, "wb") as f:
+            f.write(file.file.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Dosya kaydedilemedi: {e}")
 
-        # CSV / Excel oku
-        if fname.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(content))
-        elif fname.endswith(".xlsx") or fname.endswith(".xls"):
-            df = pd.read_excel(io.BytesIO(content))
-        else:
-            raise HTTPException(status_code=400, detail="Sadece .csv, .xlsx, .xls destekleniyor")
+    try:
+        df = pd.read_excel(tmp_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Excel okunamadı: {e}")
 
-        # Kolon isimlerini normalize et (basit)
-        df.columns = [str(c).strip() for c in df.columns]
+    if df.empty:
+        return {"inserted": 0, "message": "Dosya boş"}
 
-        # Muhtemel kolon adları (senin excel)
-        c_league = _col(df, "Lig", "League")
-        c_home  = _col(df, "Ev", "Home", "Home Team")
-        c_away  = _col(df, "Deplasman", "Away", "Away Team")
-        c_iy    = _col(df, "İY Skor", "IY Skor", "HT Score")
-        c_ms    = _col(df, "MS Skor", "FT Score", "MS Skor")
+    # Sütun isimlerini normalize et
+    df.columns = [str(c).strip() for c in df.columns]
 
-        c_iy1 = _col(df, "İY 1", "IY 1")
-        c_iy0 = _col(df, "İY 0", "IY 0")
-        c_iy2 = _col(df, "İY 2", "IY 2")
+    # Beklenen minimum alanlar (sende SadeOran.xlsx için)
+    required = ["Saat", "Lig", "Ev", "Deplasman", "İY Skor", "MS Skor"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Eksik sütun(lar): {missing}. Mevcut sütunlar: {list(df.columns)}",
+        )
 
-        c_ms1 = _col(df, "MS1", "MS 1")
-        c_ms0 = _col(df, "MS0", "MS 0", "MSX")
-        c_ms2 = _col(df, "MS2", "MS 2")
+    def to_float(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        s = str(v).strip().replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return None
 
-        # Zorunlu kolon kontrolü
-        missing = [x for x in [("Lig", c_league), ("Ev", c_home), ("Deplasman", c_away), ("MS Skor", c_ms)] if x[1] is None]
-        if missing:
-            raise HTTPException(status_code=400, detail=f"Eksik kolonlar: {', '.join([m[0] for m in missing])}")
+    inserted = 0
+    failed_rows = 0
 
-        inserted = 0
-        skipped = 0
+    batch = []
+    BATCH_SIZE = 1000  # istersen 500 de yapabilirsin
 
-        # Basit duplicate önleme: (league, home, away, ms_score) aynıysa skip
-        # (İleride tarih/saat ekleyince onu kullanırız)
-        for _, r in df.iterrows():
-            league = str(r.get(c_league, "")).strip()
-            home = str(r.get(c_home, "")).strip()
-            away = str(r.get(c_away, "")).strip()
-            iy_score = str(r.get(c_iy, "")).strip() if c_iy else None
-            ms_score = str(r.get(c_ms, "")).strip()
-
-            if not (league and home and away and ms_score):
-                skipped += 1
-                continue
-
-            exists = db.query(Match.id).filter(
-                Match.league == league,
-                Match.home_team == home,
-                Match.away_team == away,
-                Match.ms_score == ms_score,
-            ).first()
-
-            if exists:
-                skipped += 1
-                continue
+    try:
+        for row in df.itertuples(index=False):
+            # Tuple'dan alanları güvenli al (kolon sırası değişse bile çalışsın)
+            r = row._asdict() if hasattr(row, "_asdict") else dict(zip(df.columns, row))
 
             m = Match(
-                league=league,
-                home_team=home,
-                away_team=away,
-                iy_score=iy_score,
-                ms_score=ms_score,
-                iy1=_to_float(r.get(c_iy1)) if c_iy1 else None,
-                iy0=_to_float(r.get(c_iy0)) if c_iy0 else None,
-                iy2=_to_float(r.get(c_iy2)) if c_iy2 else None,
-                ms1=_to_float(r.get(c_ms1)) if c_ms1 else None,
-                ms0=_to_float(r.get(c_ms0)) if c_ms0 else None,
-                ms2=_to_float(r.get(c_ms2)) if c_ms2 else None,
+                match_date=date.today(),  # dosyada tarih yoksa bugünü yazıyoruz
+                league=str(r.get("Lig", "")).strip() or None,
+                home_team=str(r.get("Ev", "")).strip() or None,
+                away_team=str(r.get("Deplasman", "")).strip() or None,
+                iy_score=str(r.get("İY Skor", "")).strip() or None,
+                ms_score=str(r.get("MS Skor", "")).strip() or None,
+
+                ms1=to_float(r.get("MS1")),
+                ms0=to_float(r.get("MS0")),
+                ms2=to_float(r.get("MS2")),
+
+                under25=to_float(r.get("2.5 Alt")),
+                over25=to_float(r.get("2.5 Üst")),
+
+                btts_yes=to_float(r.get("KG Var")),
+                btts_no=to_float(r.get("KG Yok")),
             )
 
-            db.add(m)
-            inserted += 1
+            batch.append(m)
 
-        db.commit()
-        return {
-            "ok": True,
-            "rows": int(len(df)),
-            "inserted": inserted,
-            "skipped": skipped,
-            "filename": file.filename,
-        }
+            if len(batch) >= BATCH_SIZE:
+                db.bulk_save_objects(batch)
+                db.commit()
+                inserted += len(batch)
+                batch.clear()
 
-    except HTTPException:
-        raise
+        # kalanlar
+        if batch:
+            db.bulk_save_objects(batch)
+            db.commit()
+            inserted += len(batch)
+            batch.clear()
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB yazma hatası: {e}")
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"import error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Import sırasında hata: {e}")
 
-    # ":" gibi ayırıcıları "-" yap, boşlukları temizle
-    s = s.replace(":", "-").replace("–", "-")
-    s = s.replace(" ", "")
+    return {"inserted": inserted, "failed_rows": failed_rows}
 
-    parts = s.split("-")
-    if len(parts) != 2:
-        return None
 
-    try:
-        a = int(parts[0])
-        b = int(parts[1])
-        return a + b
-    except:
-        return None
-
-def make_iy_ms(iy_res, ms_res):
-    # "1" + "0" -> "1/0"
-    if iy_res is None or ms_res is None:
-        return None
-    return f"{iy_res}/{ms_res}"
-
-def parse_score_1x2(x):
-    """
-    MS Skor veya IY Skor gibi '2-1', '0 - 0', '1:2' formatlarını
-    1/0/2 sonucuna çevirir.
-    1 = Ev kazanır, 0 = Beraberlik, 2 = Deplasman kazanır
-    """
-    if x is None or pd.isna(x):
-        return None
-
-    s = str(x).strip()
-    if not s:
-        return None
-
-    s = s.replace(":", "-").replace(".", "-")
-    s = s.replace(" ", "")
-    parts = s.split("-")
-    if len(parts) != 2:
-        return None
-
-    try:
-        a = int(parts[0])
-        b = int(parts[1])
-    except:
-        return None
-
-    if a > b:
-        return 1
-    if a == b:
-        return 0
-    return 2
-
-def build_iy_ms_key(iy_skor, ms_skor):
-    """
-    IY Skor ve MS Skor'u alıp '1/1', '1/0', '0/2' gibi anahtar üretir.
-    """
-    iy = parse_score_1x2(iy_skor)
-    ms = parse_score_1x2(ms_skor)
-    if iy is None or ms is None:
-        return None
-    return f"{iy}/{ms}"
-
-def parse_kg_result_from_score(ms_skor):
-    """
-    MS Skor'a göre KG sonucu üretir.
-    var -> iki takım da en az 1 gol
-    yok -> takımlardan biri 0 gol
-    """
-    if not isinstance(ms_skor, str):
-        return None
-
-    try:
-        a, b = ms_skor.split("-")
-        a = int(a.strip())
-        b = int(b.strip())
-    except:
-        return None
-
-    if a > 0 and b > 0:
-        return "var"
-    else:
-        return "yok"   
 
 @app.get("/matches")
 def list_matches(
@@ -615,4 +535,4 @@ def docs(user: str = Depends(authenticate)):
     return get_swagger_ui_html(
         openapi_url="/openapi.json",
         title="MatchMotor API - Docs",
-)
+    )
