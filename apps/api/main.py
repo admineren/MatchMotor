@@ -535,4 +535,4 @@ def docs(user: str = Depends(authenticate)):
     return get_swagger_ui_html(
         openapi_url="/openapi.json",
         title="MatchMotor API - Docs",
-    )
+)
