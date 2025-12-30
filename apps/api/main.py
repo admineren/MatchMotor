@@ -4,6 +4,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi import HTTPException
+from fastapi import UploadFile, File, HTTPException
 import traceback
 import re
 from typing import Optional
@@ -16,6 +17,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
+import io
 from datetime import date
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -188,6 +191,130 @@ def parse_score_total_goals(x):
     s = str(x).strip()
     if not s:
         return None
+
+def _to_float(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return None
+    # maçkolik kopyalarında virgül oluyor
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except:
+        return None
+
+
+def _col(df, *names):
+    """df'de isimlerden ilk bulunan kolonu döndür."""
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+@app.post("/import/file")
+async def import_file(
+    file: UploadFile = File(...),
+    user: str = Depends(authenticate),
+    db: Session = Depends(get_db),
+):
+    try:
+        content = await file.read()
+        fname = (file.filename or "").lower()
+
+        # CSV / Excel oku
+        if fname.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(content))
+        elif fname.endswith(".xlsx") or fname.endswith(".xls"):
+            df = pd.read_excel(io.BytesIO(content))
+        else:
+            raise HTTPException(status_code=400, detail="Sadece .csv, .xlsx, .xls destekleniyor")
+
+        # Kolon isimlerini normalize et (basit)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # Muhtemel kolon adları (senin excel)
+        c_league = _col(df, "Lig", "League")
+        c_home  = _col(df, "Ev", "Home", "Home Team")
+        c_away  = _col(df, "Deplasman", "Away", "Away Team")
+        c_iy    = _col(df, "İY Skor", "IY Skor", "HT Score")
+        c_ms    = _col(df, "MS Skor", "FT Score", "MS Skor")
+
+        c_iy1 = _col(df, "İY 1", "IY 1")
+        c_iy0 = _col(df, "İY 0", "IY 0")
+        c_iy2 = _col(df, "İY 2", "IY 2")
+
+        c_ms1 = _col(df, "MS1", "MS 1")
+        c_ms0 = _col(df, "MS0", "MS 0", "MSX")
+        c_ms2 = _col(df, "MS2", "MS 2")
+
+        # Zorunlu kolon kontrolü
+        missing = [x for x in [("Lig", c_league), ("Ev", c_home), ("Deplasman", c_away), ("MS Skor", c_ms)] if x[1] is None]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Eksik kolonlar: {', '.join([m[0] for m in missing])}")
+
+        inserted = 0
+        skipped = 0
+
+        # Basit duplicate önleme: (league, home, away, ms_score) aynıysa skip
+        # (İleride tarih/saat ekleyince onu kullanırız)
+        for _, r in df.iterrows():
+            league = str(r.get(c_league, "")).strip()
+            home = str(r.get(c_home, "")).strip()
+            away = str(r.get(c_away, "")).strip()
+            iy_score = str(r.get(c_iy, "")).strip() if c_iy else None
+            ms_score = str(r.get(c_ms, "")).strip()
+
+            if not (league and home and away and ms_score):
+                skipped += 1
+                continue
+
+            exists = db.query(Match.id).filter(
+                Match.league == league,
+                Match.home_team == home,
+                Match.away_team == away,
+                Match.ms_score == ms_score,
+            ).first()
+
+            if exists:
+                skipped += 1
+                continue
+
+            m = Match(
+                league=league,
+                home_team=home,
+                away_team=away,
+                iy_score=iy_score,
+                ms_score=ms_score,
+                iy1=_to_float(r.get(c_iy1)) if c_iy1 else None,
+                iy0=_to_float(r.get(c_iy0)) if c_iy0 else None,
+                iy2=_to_float(r.get(c_iy2)) if c_iy2 else None,
+                ms1=_to_float(r.get(c_ms1)) if c_ms1 else None,
+                ms0=_to_float(r.get(c_ms0)) if c_ms0 else None,
+                ms2=_to_float(r.get(c_ms2)) if c_ms2 else None,
+            )
+
+            db.add(m)
+            inserted += 1
+
+        db.commit()
+        return {
+            "ok": True,
+            "rows": int(len(df)),
+            "inserted": inserted,
+            "skipped": skipped,
+            "filename": file.filename,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"import error: {str(e)}")
 
     # ":" gibi ayırıcıları "-" yap, boşlukları temizle
     s = s.replace(":", "-").replace("–", "-")
