@@ -69,6 +69,8 @@ class Match(Base):
     ms0 = Column(Float)
     ms2 = Column(Float)
 
+    btts_yes = Column(Float)
+    btts_no = Column(Float)
     under25 = Column(Float)
     over25 = Column(Float)
 
