@@ -121,6 +121,27 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 def health():
     return {"status": "ok"}
 
+@app.post("/debug/insert-test-match")
+def insert_test_match():
+    with Session(engine) as session:
+        m = Match(
+            match_date=date(2024, 1, 1),
+            league="TEST LIG",
+            home_team="A",
+            away_team="B",
+            iy_score="0-0",
+            ms_score="1-0",
+            iy1=2.1,
+            iy0=1.9,
+            iy2=3.4,
+            ms1=1.8,
+            ms0=3.2,
+            ms2=4.5,
+        )
+        session.add(m)
+        session.commit()
+        return {"inserted": True}
+
 @app.get("/db-health")
 def db_health():
     try:
