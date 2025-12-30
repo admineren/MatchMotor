@@ -1,9 +1,7 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-annotated-types
-pandas
-openpyxl
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
 SQLAlchemy==2.0.36
 psycopg[binary]==3.2.3
+pandas==2.2.3
+openpyxl==3.1.5
 python-multipart==0.0.9
