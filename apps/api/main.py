@@ -15,6 +15,8 @@ import pandas as pd
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import text
+from sqlalchemy.orm import Session
+from datetime import date
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -28,6 +30,13 @@ SessionLocal = sessionmaker(
     autoflush=False,
     bind=engine
 )
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 Base = declarative_base()
 from sqlalchemy import Column, Integer, String, Date, Float, DateTime
@@ -122,25 +131,32 @@ def health():
     return {"status": "ok"}
 
 @app.post("/debug/insert-test-match")
-def insert_test_match():
-    with Session(engine) as session:
+def insert_test_match(
+    db: Session = Depends(get_db),
+    user: str = Depends(authenticate),
+):
+    try:
         m = Match(
-            match_date=date(2024, 1, 1),
+            match_date=date.today(),
             league="TEST LIG",
             home_team="A",
             away_team="B",
             iy_score="0-0",
             ms_score="1-0",
-            iy1=2.1,
-            iy0=1.9,
-            iy2=3.4,
-            ms1=1.8,
-            ms0=3.2,
-            ms2=4.5,
+            iy1=2.10,
+            iy0=1.90,
+            iy2=3.40,
+            ms1=1.80,
+            ms0=3.20,
+            ms2=4.50,
         )
-        session.add(m)
-        session.commit()
-        return {"inserted": True}
+        db.add(m)
+        db.commit()
+        db.refresh(m)
+        return {"inserted": True, "id": m.id}
+    except Exception as e:
+        db.rollback()
+        return {"inserted": False, "error": str(e)}
 
 @app.get("/db-health")
 def db_health():
