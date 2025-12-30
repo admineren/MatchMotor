@@ -6,3 +6,4 @@ pandas
 openpyxl
 SQLAlchemy==2.0.36
 psycopg[binary]==3.2.3
+python-multipart==0.0.9
