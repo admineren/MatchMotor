@@ -1,147 +1,176 @@
+# app/core/mock_source.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from datetime import date
-from typing import Dict, List, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Dict, Optional, List, Any
 
-from .datasource import DataSource
-from .models import Match, MsOdds
+from .datasource import DataSource, FixtureBundle
+from .models import Match, MsOdds, Score
 
 
-@dataclass
-class FixtureBundle:
-    day: str
+@dataclass(frozen=True)
+class _MockDayCache:
     matches: List[Match]
+    status_by_id: Dict[int, str]
+    odds_by_id: Dict[int, MsOdds]
+    score_by_id: Dict[int, Score]
 
 
 class MockSource(DataSource):
+    """
+    Sıfırdan stabil Mock datasource.
+
+    - get_fixtures(day): deterministik fixture listesi üretir (Match listesi)
+    - get_ms_odds(match_id): odds varsa MsOdds döner, yoksa None
+    - get_score(match_id): sadece FT olanlar için Score döner, yoksa None
+
+    Notlar:
+    - day parametresi date tipidir (DataSource sözleşmesi).
+    - kickoff_utc timezone-aware (UTC) üretilir.
+    - ms_odds_ratio ile "odds varmış gibi davranma oranı" ayarlanabilir.
+    - Constructor **fazladan keyword** alsa bile patlamaz (**kwargs).
+    """
 
     def __init__(
         self,
         seed: int = 42,
         fixtures_count: int = 420,
-        ms_odds_ratio: float = 1.0,
+        ms_odds_ratio: float = 0.85,
+        ft_ratio: float = 0.20,
+        ignore_ratio: float = 0.03,
+        **kwargs: Any,
     ):
-        self.seed = seed
-        self.fixtures_count = fixtures_count
-        self.ms_odds_ratio = ms_odds_ratio
+        self.seed = int(seed)
+        self.fixtures_count = int(fixtures_count)
+        self.ms_odds_ratio = float(ms_odds_ratio)
+        self.ft_ratio = float(ft_ratio)
+        self.ignore_ratio = float(ignore_ratio)
 
-        self._bundle_cache = {}
+        self._cache_by_day: Dict[date, _MockDayCache] = {}
+        self._day_by_match_id: Dict[int, date] = {}
 
-    # -----------------------------
-    # Helpers (deterministic random)
-    # -----------------------------
-    def _rng(self, n: int) -> int:
-        # basit deterministic pseudo-random
-        x = (n * 1103515245 + 12345 + self.seed) & 0x7FFFFFFF
-        return x
+    # -------------------------
+    # Deterministic pseudo-rng
+    # -------------------------
+    def _rng(self, x: int) -> int:
+        # basit deterministik LCG
+        return (x * 1103515245 + 12345 + self.seed) & 0x7FFFFFFF
 
-    def _day_base_utc(self, day):
-    # day: "YYYY-MM-DD" (str) veya datetime.date/datetime gelebilir
-        if isinstance(day, datetime):
-            d = day.date()
-        elif isinstance(day, date):
-            d = day
-        else:
-            # string veya başka bir şey gelirse stringe çevirip parse et
-            d = datetime.strptime(str(day), "%Y-%m-%d").date()
-            
-        # gün başlangıcı UTC
-        return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
+    def _rand01(self, x: int) -> float:
+        return (self._rng(x) % 10_000) / 10_000.0
 
-    def _make_match(self, idx: int, kickoff_utc: datetime, status: str) -> Match:
-        league_id = 1 + (idx % 40)
-        home_team_id = 1000 + (idx * 2)
-        away_team_id = 1000 + (idx * 2) + 1
+    def _kickoff_for(self, d: date, i: int) -> datetime:
+        # gün içine dağıt: 00:00 - 23:59 UTC
+        base = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
+        hour = self._rng(i + 100) % 24
+        minute = self._rng(i + 200) % 60
+        return base + timedelta(hours=hour, minutes=minute)
 
-        return Match(
-            match_id=idx,
-            league_id=league_id,
-            kickoff_utc=kickoff_utc,
-            home_team_id=home_team_id,
-            away_team_id=away_team_id,
-            status=status,
-            is_done=False,
-            is_ignored=False,
-        )
-
-    def _make_bundle(self, day: str) -> FixtureBundle:
-        if day in self._bundle_cache:
-            return self._bundle_cache[day]
-
-        base = self._day_base_utc(day)
+    def _make_day_cache(self, d: date) -> _MockDayCache:
+        if d in self._cache_by_day:
+            return self._cache_by_day[d]
 
         matches: List[Match] = []
-        for i in range(1, self.fixtures_count + 1):
-            # 0..23 saat dağıt
-            hour = self._rng(i) % 24
-            minute = self._rng(i + 999) % 60
-            kickoff = base + timedelta(hours=hour, minutes=minute)
+        status_by_id: Dict[int, str] = {}
+        odds_by_id: Dict[int, MsOdds] = {}
+        score_by_id: Dict[int, Score] = {}
 
-            # çoğu NS, küçük kısmı PST/CANC karışık
-            r = self._rng(i + 202) % 100
-            if r < 85:
-                status = "NS"
-            elif r < 92:
-                status = "PST"
+        # Match ID'leri gün bazlı çakışmasın diye date'ten offset üret
+        # (yeterince deterministik ve stabil)
+        day_key = int(d.strftime("%Y%m%d"))
+        base_id = (day_key % 1_000_000) * 10_000  # 20251231 -> 1231xxxx gibi
+
+        for n in range(1, self.fixtures_count + 1):
+            match_id = base_id + n
+            league_id = 1 + (n % 40)
+            home_team_id = 1000 + (n * 2)
+            away_team_id = 1000 + (n * 2) + 1
+            kickoff_utc = self._kickoff_for(d, n)
+
+            r = self._rand01(match_id)
+
+            # ignore (PST/CANC)
+            if r < self.ignore_ratio:
+                status = "PST" if (self._rng(match_id) % 2 == 0) else "CANC"
+            # FT
+            elif r < self.ignore_ratio + self.ft_ratio:
+                status = "FT"
+            # default NS
             else:
-                status = "CANC"
+                status = "NS"
 
-            matches.append(self._make_match(i, kickoff, status))
-
-        bundle = FixtureBundle(day=day, matches=matches)
-        self._bundle_cache[day] = bundle
-        return bundle
-
-    # -----------------------------
-    # DataSource required methods
-    # -----------------------------
-    def get_fixtures(self, day: str) -> FixtureBundle:
-        # jobs.py FixtureBundle bekliyorsa bu isim aynı kalmalı.
-        return self._make_bundle(day)
-
-    def get_ms_odds(self, match_id: int):
-        return None
-
-    def get_ms_odds_bulk(self, day: str) -> Dict[int, MsOdds]:
-        """
-        15:00 job burayı çağırıyor.
-        match_id -> MsOdds map döndür.
-        """
-        bundle = self._make_bundle(day)
-        odds_map: Dict[int, MsOdds] = {}
-
-        for m in bundle.matches:
-            # Odds olmayan lig/maç simülasyonu (PST/CANC genelde odds yok gibi)
-            if m.status in ("PST", "CANC"):
-                continue
-
-            # 1X2 oranları: deterministic üret
-            r1 = (self._rng(m.match_id + 10) % 200) / 100.0  # 0.00..1.99
-            r2 = (self._rng(m.match_id + 20) % 200) / 100.0
-            r3 = (self._rng(m.match_id + 30) % 200) / 100.0
-
-            home = 1.20 + r1
-            draw = 2.40 + r2
-            away = 1.60 + r3
-
-            odds_map[m.match_id] = MsOdds(
-                match_id=m.match_id,
-                home=round(home, 2),
-                draw=round(draw, 2),
-                away=round(away, 2),
-                taken_at=datetime.now(timezone.utc),
+            m = Match(
+                match_id=match_id,
+                league_id=league_id,
+                kickoff_utc=kickoff_utc,
+                home_team_id=home_team_id,
+                away_team_id=away_team_id,
+                status=status,
+                is_done=False,
+                is_ignored=False,
             )
+            matches.append(m)
+            status_by_id[match_id] = status
+            self._day_by_match_id[match_id] = d
 
-        return odds_map
+            # Odds üretimi (oranı ms_odds_ratio kadar)
+            if status not in ("PST", "CANC"):
+                if self._rand01(match_id + 999) < self.ms_odds_ratio:
+                    # deterministik 1X2
+                    a = 1.20 + (self._rng(match_id + 10) % 200) / 100.0
+                    b = 2.40 + (self._rng(match_id + 20) % 200) / 100.0
+                    c = 1.60 + (self._rng(match_id + 30) % 200) / 100.0
 
-    def get_score(self, match_id: int) -> Optional[Dict]:
-        """
-        23:00 job skor kapatırken burayı çağırabilir.
-        Basit skor simülasyonu döndürüyoruz.
-        """
-        # deterministic skor
-        hg = self._rng(match_id + 500) % 5
-        ag = self._rng(match_id + 800) % 5
-        return {"home_goals": int(hg), "away_goals": int(ag), "status": "FT"}
+                    odds_by_id[match_id] = MsOdds(
+                        home=round(a, 2),
+                        draw=round(b, 2),
+                        away=round(c, 2),
+                        taken_at=datetime.now(timezone.utc),
+                    )
+
+            # Score üretimi (sadece FT)
+            if status == "FT":
+                hg = self._rng(match_id + 500) % 5
+                ag = self._rng(match_id + 800) % 5
+                # HT basit türet
+                ht_h = min(int(hg), int(self._rng(match_id + 1500) % 3))
+                ht_a = min(int(ag), int(self._rng(match_id + 1800) % 3))
+                score_by_id[match_id] = Score(
+                    ht_home=ht_h,
+                    ht_away=ht_a,
+                    ft_home=int(hg),
+                    ft_away=int(ag),
+                    went_extra_time=False,
+                    went_penalties=False,
+                )
+
+        cache = _MockDayCache(
+            matches=matches,
+            status_by_id=status_by_id,
+            odds_by_id=odds_by_id,
+            score_by_id=score_by_id,
+        )
+        self._cache_by_day[d] = cache
+        return cache
+
+    # -------------------------
+    # DataSource implementation
+    # -------------------------
+    def get_fixtures(self, day: date) -> FixtureBundle:
+        cache = self._make_day_cache(day)
+        return FixtureBundle(matches=cache.matches)
+
+    def get_ms_odds(self, match_id: int) -> Optional[MsOdds]:
+        d = self._day_by_match_id.get(match_id)
+        if d is None:
+            return None
+        cache = self._make_day_cache(d)
+        return cache.odds_by_id.get(match_id)
+
+    def get_score(self, match_id: int) -> Optional[Score]:
+        d = self._day_by_match_id.get(match_id)
+        if d is None:
+            return None
+        cache = self._make_day_cache(d)
+        return cache.score_by_id.get(match_id)
