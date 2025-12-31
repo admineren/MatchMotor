@@ -21,10 +21,10 @@ class MockSource(DataSource):
         self.fixtures_count = fixtures_count
         self.ms_odds_ratio = ms_odds_ratio
         self._bundle_cache: Dict[str, FixtureBundle] = {}
-
-    # -----------------------------
-    # Helpers
-    # -----------------------------
+        
+        # -----------------------------
+        # Helpers
+        # -----------------------------
     def _day_key(self, day: str) -> str:
         return str(day)
 
@@ -79,7 +79,7 @@ class MockSource(DataSource):
                     return Match(match_id=idx, kickoff=kickoff, status=status)  # type: ignore
                 except TypeError:
                     # son çare: sadece id
-                    return Match(idx)  # type: ignore
+                return Match(idx)  # type: ignore
 
     def _make_bundle(self, day: str) -> FixtureBundle:
         key = self._day_key(day)
