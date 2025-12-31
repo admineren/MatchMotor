@@ -75,16 +75,16 @@ class MockSource(DataSource):
         
         odds_map = {}
 
-    for m in bundle.matches:
-        # mock ortamda: bazı maçlara odds var, bazılarına yok gibi davran
-        if m.match_id % 3 == 0:   # keyfi mock kural
-            odds_map[m.match_id] = MsOdds(
-                home=1.85,
-                draw=3.40,
-                away=4.20
-            )
-            
-            return odds_map
+        for m in bundle.matches:
+            # mock ortamda: bazı maçlara odds var, bazılarına yok gibi davran
+            if m.match_id % 3 == 0:   # keyfi mock kural
+                odds_map[m.match_id] = MsOdds(
+                    home=1.85,
+                    draw=3.40,
+                    away=4.20
+                )
+                
+        return odds_map
        
         # Gerçekçi bir 1X2 odds üretimi (tam bilimsel değil, test için yeterli)
         home = round(rng.uniform(1.20, 4.50), 2)
