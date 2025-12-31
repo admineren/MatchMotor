@@ -41,7 +41,7 @@ class DataSource(ABC):
         """
         MS (1X2) odds döndürür.
         - Yoksa None.
-        - Job tarafında sadece status=NS iken çağrılır.
+        - Job tarafında, MS odds eksik olan maçlar için çağrılır.
         """
         raise NotImplementedError
 
