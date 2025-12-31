@@ -87,4 +87,4 @@ class MockSource(DataSource):
         dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         base_ts = int(dt.timestamp())
 
-        matches: List[Match] =
+        matches = []
