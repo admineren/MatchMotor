@@ -2,89 +2,92 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+import random
+from datetime import datetime, date, time, timedelta
 
 from .datasource import DataSource
-from .models import FixtureBundle, Match, MsOdds
+from .models import Match, FixtureBundle, MsOdds
 
 
 class MockSource(DataSource):
     """
-    Mock data kaynağı.
-    - get_fixtures(day): o güne ait sabit bir fixture listesi döner
-    - get_ms_odds_bulk(day): fixture içinden seçili maçlara MS odds döner (bulk)
+    Mock DataSource (DEV/TEST):
+    - Gerçek API çağrısı yok.
+    - jobs.py akışını test etmek için deterministik/tekrar üretilebilir fixture + MS odds üretir.
     """
 
-    def __init__(self) -> None:
-        # day -> FixtureBundle cache
-        self._cache: Dict[str, FixtureBundle] = {}
+    def __init__(self, seed: int = 42, fixture_count: int = 420):
+        self._seed = seed
+        self._fixture_count = fixture_count
+        self._generated = {}  # day -> FixtureBundle
 
-    def get_fixtures(self, day: str) -> FixtureBundle:
-        """
-        day formatı: 'YYYY-MM-DD'
-        """
-        if day in self._cache:
-            return self._cache[day]
+    # ---------------------------
+    # Public API (DataSource)
+    # ---------------------------
 
-        # Mock fixture üret
-        matches = self._generate_mock_matches(day)
-        bundle = FixtureBundle(day=day, matches=matches)
+    def get_fixtures(self, day: date) -> FixtureBundle:
+        # Aynı gün aynı veriyi versin diye cache + sabit seed
+        if day in self._generated:
+            return self._generated[day]
 
-        self._cache[day] = bundle
+        rng = random.Random(self._seed + int(day.strftime("%Y%m%d")))
+
+        # Gün içi maç saatlerini yay: 00:00 - 23:59 arası (TR mantığı gibi)
+        matches = []
+        base_dt = datetime.combine(day, time(0, 0))
+
+        for i in range(self._fixture_count):
+            # kickoff'u gün içine dağıt
+            minute_of_day = rng.randint(0, 23 * 60 + 59)
+            kickoff = base_dt + timedelta(minutes=minute_of_day)
+
+            # status üret: DONE/NS/1H/HT/2H vb.
+            # job mantığını test etmek için bir kısmını DONE yapıyoruz.
+            roll = rng.random()
+            if roll < 0.35:
+                status = "FT"        # bitti
+            elif roll < 0.45:
+                status = "NS"        # başlamadı
+            elif roll < 0.60:
+                status = "HT"        # devre
+            else:
+                status = "LIVE"      # oynanıyor
+
+            # MS odds var/yok:
+            # büyük kısmında var; bir kısmında yok (ignored sayısı artsın diye)
+            has_ms_odds = (rng.random() < 0.55)
+
+            m = Match(
+                id=100000 + i,
+                kickoff_ts=int(kickoff.timestamp()),
+                status=status,
+                has_ms_odds=has_ms_odds,
+            )
+            matches.append(m)
+
+        bundle = FixtureBundle(matches=matches)
+        self._generated[day] = bundle
         return bundle
 
-    def get_ms_odds_bulk(self, day: str) -> Dict[int, MsOdds]:
+    def get_ms_odds_bulk(self, day: date):
         """
-        Bulk MS odds.
-        DİKKAT: Match üzerinde ms_odds alanı yok; biz map döndürüyoruz:
-          {match_id: MsOdds(...)}
+        jobs.py 23:00 tarafında bulk odds çekiyor.
+        Burada: fixture listesi içinden has_ms_odds=True olanlara MsOdds üretip map döndürüyoruz.
         """
         bundle = self.get_fixtures(day)
-        odds_map: Dict[int, MsOdds] = {}
+        rng = random.Random(self._seed + 999 + int(day.strftime("%Y%m%d")))
 
+        odds_map = {}
         for m in bundle.matches:
-            # Her maçta odds olmasın: yaklaşık %35-40’ına odds verelim
-            # (gerçeğe benzer: bazı alt liglerde odds yok)
-            if (m.match_id % 5) in (0, 2):
-                # Basit ama değişken odds üretimi
-                home = 1.60 + (m.match_id % 20) * 0.03   # 1.60 - 2.17
-                draw = 3.00 + (m.match_id % 15) * 0.04   # 3.00 - 3.56
-                away = 3.20 + (m.match_id % 25) * 0.05   # 3.20 - 4.45
+            if not getattr(m, "has_ms_odds", False):
+                continue
 
-                odds_map[m.match_id] = MsOdds(
-                    home=round(home, 2),
-                    draw=round(draw, 2),
-                    away=round(away, 2),
-                )
+            # Basit ama mantıklı oranlar üretelim (1 / X / 2)
+            # 1.20 - 6.50 bandı
+            o1 = round(rng.uniform(1.20, 3.20), 2)
+            ox = round(rng.uniform(2.60, 4.80), 2)
+            o2 = round(rng.uniform(1.60, 6.50), 2)
+
+            odds_map[m.id] = MsOdds(home=o1, draw=ox, away=o2)
 
         return odds_map
-
-    # -----------------------
-    # internal helpers
-    # -----------------------
-
-    def _generate_mock_matches(self, day: str) -> List[Match]:
-        """
-        jobs.py içinde kullanılan alanlara uygun Match üretir.
-        Match modelinde hangi alanlar zorunluysa, onu doldururuz.
-
-        Burada varsayım:
-          Match(
-            match_id: int,
-            kickoff_ts: int,
-            status: str,
-            home: str,
-            away: str,
-            league: str
-          )
-        Eğer senin models.py farklıysa, bana models.py ekran görüntüsü at;
-        30 saniyede birebir uyarlarız.
-        """
-
-        # Günün başlangıcı (UTC) -> TS
-        dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        base_ts = int(dt.timestamp())
-
-        matches = []
