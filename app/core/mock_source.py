@@ -67,20 +67,15 @@ class MockSource(DataSource):
             # bu blok TypeError yakalayıp farklı ihtimalleri deneyecek
             pass
 
-        # farklı constructor ihtimalleri için denemeler
         try:
-            return Match(**kwargs)  # type: ignore
+            return Match(**kwargs)
         except TypeError:
-            # minimum set dene
             try:
-                return Match(id=idx, kickoff=kickoff, status=status)  # type: ignore
+                return Match(id=idx, kickoff=kickoff)
             except TypeError:
-                try:
-                    return Match(match_id=idx, kickoff=kickoff, status=status)  # type: ignore
-                except TypeError:
-                    # son çare: sadece id
+                # son çare: sadece id
                 return Match(idx)  # type: ignore
-
+                
     def _make_bundle(self, day: str) -> FixtureBundle:
         key = self._day_key(day)
         if key in self._bundle_cache:
