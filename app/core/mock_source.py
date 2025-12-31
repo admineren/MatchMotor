@@ -16,9 +16,10 @@ class MockSource(DataSource):
     Signature uyuşmazlığı sorun olmasın diye bazı methodlar *args/**kwargs kabul eder.
     """
 
-    def __init__(self, seed: int = 42, fixtures_count: int = 420):
+    def __init__(self, seed: int = 42, fixtures_count: int = 420, ms_odds_ratio: float = 1.0, **kwargs):
         self.seed = seed
         self.fixtures_count = fixtures_count
+        self.ms_odds_ratio = ms_odds_ratio
         self._bundle_cache: Dict[str, FixtureBundle] = {}
 
     # -----------------------------
