@@ -71,18 +71,14 @@ class MockSource(DataSource):
             return None
 
     def get_ms_odds_bulk(self, day):
-        """
-        Mock: Günlük MS odds toplu snapshot.
-        - 1 request simüle eder
-        - match_id -> MsOdds dict döndürür
-        """
+        bundle = self.get_fixtures(day)  # FixtureBundle
+        
         odds_map = {}
-
-        for m in self.fixtures.matches:
+        for m in bundle.matches:
             if m.ms_odds is not None:
                 odds_map[m.match_id] = m.ms_odds
                 
-                return odds_map
+            return odds_map
 
         # Gerçekçi bir 1X2 odds üretimi (tam bilimsel değil, test için yeterli)
         home = round(rng.uniform(1.20, 4.50), 2)
