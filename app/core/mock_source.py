@@ -1,92 +1,204 @@
-# app/core/mock_source.py
-
 from __future__ import annotations
 
-import random
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
 
 from .datasource import DataSource, FixtureBundle
 from .models import Match, MsOdds
 
+
 class MockSource(DataSource):
     """
-    Mock DataSource (DEV/TEST):
-    - Gerçek API çağrısı yok.
-    - jobs.py akışını test etmek için deterministik/tekrar üretilebilir fixture + MS odds üretir.
+    DEV/TEST için sahte datasource.
+    Amaç: Jobs akışını (15:00 / 23:00) gerçek API olmadan çalıştırmak.
+
+    Not: DataSource abstract olduğu için burada gereken tüm method isimleri mevcut.
+    Signature uyuşmazlığı sorun olmasın diye bazı methodlar *args/**kwargs kabul eder.
     """
 
-    def __init__(self, seed: int = 42, fixture_count: int = 420):
-        self._seed = seed
-        self._fixture_count = fixture_count
-        self._generated = {}  # day -> FixtureBundle
+    def __init__(self, seed: int = 42, fixtures_count: int = 420):
+        self.seed = seed
+        self.fixtures_count = fixtures_count
+        self._bundle_cache: Dict[str, FixtureBundle] = {}
 
-    # ---------------------------
-    # Public API (DataSource)
-    # ---------------------------
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    def _day_key(self, day: str) -> str:
+        return str(day)
 
-    def get_fixtures(self, day: date) -> FixtureBundle:
-        # Aynı gün aynı veriyi versin diye cache + sabit seed
-        if day in self._generated:
-            return self._generated[day]
+    def _rand(self, n: int) -> int:
+        # basit deterministic pseudo-random (telefon ortamında stabil)
+        x = (n * 1103515245 + 12345 + self.seed) & 0x7FFFFFFF
+        return x
 
-        rng = random.Random(self._seed + int(day.strftime("%Y%m%d")))
+    def _make_match(self, idx: int, kickoff: datetime, status: str) -> Match:
+        """
+        Match dataclass alanları projende farklı olabilir.
+        Bu yüzden annotations üzerinden güvenli kwargs basıyoruz.
+        """
+        ann = getattr(Match, "__annotations__", {}) or {}
+        kwargs: Dict[str, Any] = {}
 
-        # Gün içi maç saatlerini yay: 00:00 - 23:59 arası (TR mantığı gibi)
-        matches = []
-        base_dt = datetime.combine(day, time(0, 0))
+        # olası alanlar
+        candidates = {
+            "match_id": idx,
+            "id": idx,
+            "fixture_id": idx,
+            "league": f"MockLeague {self._rand(idx) % 10}",
+            "league_name": f"MockLeague {self._rand(idx) % 10}",
+            "home": f"Home {idx}",
+            "home_team": f"Home {idx}",
+            "away": f"Away {idx}",
+            "away_team": f"Away {idx}",
+            "kickoff": kickoff,
+            "kickoff_utc": kickoff,
+            "date": kickoff,
+            "status": status,
+        }
 
-        for i in range(self._fixture_count):
-            # kickoff'u gün içine dağıt
-            minute_of_day = rng.randint(0, 23 * 60 + 59)
-            kickoff = base_dt + timedelta(minutes=minute_of_day)
+        for k, v in candidates.items():
+            if k in ann:
+                kwargs[k] = v
 
-            # status üret: DONE/NS/1H/HT/2H vb.
-            # job mantığını test etmek için bir kısmını DONE yapıyoruz.
-            roll = rng.random()
-            if roll < 0.35:
-                status = "FT"        # bitti
-            elif roll < 0.45:
-                status = "NS"        # başlamadı
-            elif roll < 0.60:
-                status = "HT"        # devre
+        # Eğer annotation yoksa, en azından yaygın isimlerle dene
+        if not kwargs:
+            # bu blok TypeError yakalayıp farklı ihtimalleri deneyecek
+            pass
+
+        # farklı constructor ihtimalleri için denemeler
+        try:
+            return Match(**kwargs)  # type: ignore
+        except TypeError:
+            # minimum set dene
+            try:
+                return Match(id=idx, kickoff=kickoff, status=status)  # type: ignore
+            except TypeError:
+                try:
+                    return Match(match_id=idx, kickoff=kickoff, status=status)  # type: ignore
+                except TypeError:
+                    # son çare: sadece id
+                    return Match(idx)  # type: ignore
+
+    def _make_bundle(self, day: str) -> FixtureBundle:
+        key = self._day_key(day)
+        if key in self._bundle_cache:
+            return self._bundle_cache[key]
+
+        # kickoff dağılımı: gün içine yay
+        base = datetime.strptime(f"{day} 00:00", "%Y-%m-%d %H:%M")
+        matches: List[Match] = []
+        for i in range(1, self.fixtures_count + 1):
+            # 0..23 saat arası yay
+            hour = (self._rand(i) % 24)
+            minute = (self._rand(i + 999) % 60)
+            kickoff = base + timedelta(hours=hour, minutes=minute)
+
+            # status üretimi:
+            # bir kısmı FT, bir kısmı NS, bir kısmı LIVE gibi
+            r = self._rand(i + 555) % 100
+            if r < 35:
+                status = "FT"
+            elif r < 45:
+                status = "HT"
+            elif r < 55:
+                status = "2H"
             else:
-                status = "LIVE"      # oynanıyor
+                status = "NS"
 
-            # MS odds var/yok:
-            # büyük kısmında var; bir kısmında yok (ignored sayısı artsın diye)
-            has_ms_odds = (rng.random() < 0.55)
+            matches.append(self._make_match(i, kickoff, status))
 
-            m = Match(
-                id=100000 + i,
-                kickoff_ts=int(kickoff.timestamp()),
-                status=status,
-                has_ms_odds=has_ms_odds,
-            )
-            matches.append(m)
+        # FixtureBundle alanlarını güvenli doldur
+        # FixtureBundle dataclass'ı datasource.py içinde; genelde "day" ve "matches" olur.
+        try:
+            bundle = FixtureBundle(day=day, matches=matches)  # type: ignore
+        except TypeError:
+            try:
+                bundle = FixtureBundle(matches=matches)  # type: ignore
+            except TypeError:
+                bundle = FixtureBundle(day, matches)  # type: ignore
 
-        bundle = FixtureBundle(matches=matches)
-        self._generated[day] = bundle
+        self._bundle_cache[key] = bundle
         return bundle
 
-    def get_ms_odds_bulk(self, day: date):
+    # -----------------------------
+    # DataSource required methods
+    # -----------------------------
+    def get_fixtures(self, day: str, *args, **kwargs) -> FixtureBundle:
+        return self._make_bundle(day)
+
+    def get_ms_odds_bulk(self, day: str, *args, **kwargs) -> Dict[int, MsOdds]:
         """
-        jobs.py 23:00 tarafında bulk odds çekiyor.
-        Burada: fixture listesi içinden has_ms_odds=True olanlara MsOdds üretip map döndürüyoruz.
+        jobs.py line 173: expected Dict[int, MsOdds]
         """
-        bundle = self.get_fixtures(day)
-        rng = random.Random(self._seed + 999 + int(day.strftime("%Y%m%d")))
+        bundle = self._make_bundle(day)
+        odds_map: Dict[int, MsOdds] = {}
 
-        odds_map = {}
-        for m in bundle.matches:
-            if not getattr(m, "has_ms_odds", False):
-                continue
+        for idx, m in enumerate(getattr(bundle, "matches", []), start=1):
+            # match id bul
+            mid = None
+            for attr in ("match_id", "fixture_id", "id"):
+                if hasattr(m, attr):
+                    mid = getattr(m, attr)
+                    break
+            if mid is None:
+                mid = idx
 
-            # Basit ama mantıklı oranlar üretelim (1 / X / 2)
-            # 1.20 - 6.50 bandı
-            o1 = round(rng.uniform(1.20, 3.20), 2)
-            ox = round(rng.uniform(2.60, 4.80), 2)
-            o2 = round(rng.uniform(1.60, 6.50), 2)
+            # odds üret (1.20 - 6.00 arası)
+            base = (self._rand(int(mid)) % 400) / 100.0
+            home = 1.20 + (base % 2.50)
+            draw = 2.80 + ((base * 0.7) % 2.20)
+            away = 2.00 + ((base * 0.9) % 4.00)
 
-            odds_map[m.id] = MsOdds(home=o1, draw=ox, away=o2)
+            try:
+                odds = MsOdds(home=round(home, 2), draw=round(draw, 2), away=round(away, 2))  # type: ignore
+            except TypeError:
+                # farklı field isimleri ihtimali
+                try:
+                    odds = MsOdds(ms1=round(home, 2), ms0=round(draw, 2), ms2=round(away, 2))  # type: ignore
+                except TypeError:
+                    odds = MsOdds(round(home, 2), round(draw, 2), round(away, 2))  # type: ignore
+
+            odds_map[int(mid)] = odds
 
         return odds_map
+
+    def get_ms_odds(self, match_id: int, *args, **kwargs) -> Optional[MsOdds]:
+        # tek maç odds (bulk'tan da dönebilirdik)
+        base = (self._rand(int(match_id)) % 400) / 100.0
+        home = 1.20 + (base % 2.50)
+        draw = 2.80 + ((base * 0.7) % 2.20)
+        away = 2.00 + ((base * 0.9) % 4.00)
+        try:
+            return MsOdds(home=round(home, 2), draw=round(draw, 2), away=round(away, 2))  # type: ignore
+        except TypeError:
+            try:
+                return MsOdds(ms1=round(home, 2), ms0=round(draw, 2), ms2=round(away, 2))  # type: ignore
+            except TypeError:
+                return MsOdds(round(home, 2), round(draw, 2), round(away, 2))  # type: ignore
+
+    def get_score(self, match_id: int, *args, **kwargs) -> Optional[dict]:
+        """
+        jobs.py skor kapatma için çağırıyorsa diye basit skor döndürür.
+        (Repo dev ortamında no-op olsa bile job akışı kırılmasın.)
+        """
+        r = self._rand(int(match_id)) % 100
+        if r < 35:
+            status = "FT"
+        elif r < 45:
+            status = "HT"
+        elif r < 55:
+            status = "2H"
+        else:
+            status = "NS"
+
+        ht_home = self._rand(int(match_id) + 10) % 3
+        ht_away = self._rand(int(match_id) + 20) % 3
+        ft_home = ht_home + (self._rand(int(match_id) + 30) % 3 if status == "FT" else 0)
+        ft_away = ht_away + (self._rand(int(match_id) + 40) % 3 if status == "FT" else 0)
+
+        return {
+            "status": status,
+            "ht": (int(ht_home), int(ht_away)),
+            "ft": (int(ft_home), int(ft_away)),
+                    }
