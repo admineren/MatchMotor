@@ -15,19 +15,18 @@ class FixtureBundle:
 
 
 class MockSource(DataSource):
-    """
-    DEV/TEST için sahte datasource.
-    Amaç: Jobs akışını (15:00 / 23:00) API çağırmadan test etmek.
 
-    Match dataclass imzası:
-      match_id, league_id, kickoff_utc(datetime), home_team_id, away_team_id, status
-      is_done / is_ignored opsiyonel
-    """
-
-    def __init__(self, seed: int = 42, fixtures_count: int = 420):
+    def __init__(
+        self,
+        seed: int = 42,
+        fixtures_count: int = 420,
+        ms_odds_ratio: float = 1.0,
+    ):
         self.seed = seed
         self.fixtures_count = fixtures_count
-        self._bundle_cache: Dict[str, FixtureBundle] = {}
+        self.ms_odds_ratio = ms_odds_ratio
+
+        self._bundle_cache = {}
 
     # -----------------------------
     # Helpers (deterministic random)
