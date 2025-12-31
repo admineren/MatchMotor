@@ -76,9 +76,9 @@ class NoOpRepository(Repository):
         return
 
     def has_match(self, match_id: int) -> bool:
-    # Dev/test ortamında: match DB'ye yazılmadığı için
-    # odds update'in çalışabilmesi adına TRUE döndürüyoruz
-    return True
+        # Dev/test ortamında: match DB'ye yazılmadığı için
+        # odds update'in çalışabilmesi adına TRUE döndürüyoruz
+        return True
 
     def is_done(self, match_id: int) -> bool:
         return False
