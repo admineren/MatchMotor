@@ -36,11 +36,18 @@ class MockSource(DataSource):
         x = (n * 1103515245 + 12345 + self.seed) & 0x7FFFFFFF
         return x
 
-    def _day_base_utc(self, day: str) -> datetime:
-        # day format: "YYYY-MM-DD"
-        # UTC midnight
-        dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        return dt
+    def _day_base_utc(self, day):
+    # day: "YYYY-MM-DD" (str) veya datetime.date/datetime gelebilir
+        if isinstance(day, datetime):
+            d = day.date()
+        elif isinstance(day, date):
+            d = day
+        else:
+            # string veya başka bir şey gelirse stringe çevirip parse et
+            d = datetime.strptime(str(day), "%Y-%m-%d").date()
+            
+        # gün başlangıcı UTC
+        return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
 
     def _make_match(self, idx: int, kickoff_utc: datetime, status: str) -> Match:
         league_id = 1 + (idx % 40)
