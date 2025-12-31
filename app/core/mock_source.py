@@ -5,9 +5,8 @@ from __future__ import annotations
 import random
 from datetime import datetime, date, time, timedelta
 
-from .datasource import DataSource
-from .models import Match, FixtureBundle, MsOdds
-
+from .datasource import DataSource, FixtureBundle
+from .models import Match, MsOdds
 
 class MockSource(DataSource):
     """
