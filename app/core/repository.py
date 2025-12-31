@@ -1,83 +1,141 @@
+# app/core/repository.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Set, Tuple
+from typing import List
 
 from .models import Match, MsOdds, Score
-from .repository import Repository
 
 
-@dataclass
-class InMemoryRepository(Repository):
+class Repository(ABC):
     """
-    RAM üzerinde çalışan repository.
-    Dev/test için idealdir: job akışını gerçek gibi görürsün.
+    DB yazma/okuma katmanı.
+    Job motoru sadece bu arayüzü görür.
     """
-
-    # raw fixtures: day -> match_id -> Match
-    _raw: Dict[date, Dict[int, Match]] = field(default_factory=dict)
-
-    # selected matches: match_id -> Match (upsert_match)
-    _selected: Dict[int, Match] = field(default_factory=dict)
-
-    # odds/scores
-    _ms_odds: Dict[int, MsOdds] = field(default_factory=dict)
-    _scores: Dict[int, Score] = field(default_factory=dict)
-
-    # state
-    _done: Set[int] = field(default_factory=set)
-    _ignored: Dict[int, str] = field(default_factory=dict)
-
-    # bookkeeping (panel)
-    _day_added: Dict[date, Set[int]] = field(default_factory=dict)
 
     # ---------- RAW (STAGING) ----------
+    @abstractmethod
     def save_raw_fixture(self, match: Match) -> None:
-        day = match.kickoff_utc.date()  # kickoff UTC date
-        if day not in self._raw:
-            self._raw[day] = {}
-        # Raw her zaman overwrite edilebilir
-        self._raw[day][match.match_id] = match
+        """01:00 job: ham fixture havuzuna yazar."""
+        raise NotImplementedError
 
+    @abstractmethod
     def list_raw_fixtures(self, day: date) -> List[Match]:
-        return list(self._raw.get(day, {}).values())
+        """Günün ham fixtures listesini döner."""
+        raise NotImplementedError
 
     # ---------- SELECTED MATCHES ----------
+    @abstractmethod
     def upsert_match(self, match: Match) -> None:
-        # Selected içine giren her maç "DB'ye eklendi" kabul edilir
-        self._selected[match.match_id] = match
-        day = match.kickoff_utc.date()
-        if day not in self._day_added:
-            self._day_added[day] = set()
-        self._day_added[day].add(match.match_id)
+        """Seçilmiş maçı matches tablosuna yazar (idempotent)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_selected_matches(self, day: date) -> List[Match]:
+        """23:00 job: günün seçilmiş maçlarını döner."""
+        raise NotImplementedError
 
     # ---------- ODDS / SCORE ----------
+    @abstractmethod
     def save_ms_odds(self, match_id: int, odds: MsOdds) -> None:
-        self._ms_odds[match_id] = odds
+        """MS odds kaydeder."""
+        raise NotImplementedError
 
+    @abstractmethod
     def has_ms_odds(self, match_id: int) -> bool:
-        return match_id in self._ms_odds
+        """Bu maç için MS odds var mı?"""
+        raise NotImplementedError
 
+    @abstractmethod
     def save_score(self, match_id: int, score: Score) -> None:
-        self._scores[match_id] = score
+        """HT/FT skorlarını kademeli kaydeder."""
+        raise NotImplementedError
 
+    @abstractmethod
     def has_score(self, match_id: int) -> bool:
-        return match_id in self._scores
+        """Bu maç için skor var mı?"""
+        raise NotImplementedError
 
     # ---------- STATE ----------
+    @abstractmethod
     def mark_done(self, match_id: int) -> None:
-        self._done.add(match_id)
+        """Maçı DONE yapar (kilit)."""
+        raise NotImplementedError
 
+    @abstractmethod
     def is_done(self, match_id: int) -> bool:
-        return match_id in self._done
+        """Maç DONE mı? DONE ise dokunma."""
+        raise NotImplementedError
 
+    @abstractmethod
     def mark_ignored(self, match_id: int, reason: str) -> None:
-        self._ignored[match_id] = reason
+        """PST/CANC vb. durumlarda ignore işaretler."""
+        raise NotImplementedError
 
     # ---------- PANEL ----------
+    @abstractmethod
     def today_added_count(self, day: date) -> int:
-        return len(self._day_added.get(day, set()))
+        """Panel: Bugün DB'ye eklenen maç sayısı."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def total_matches_count(self) -> int:
+        """Panel: DB toplam maç sayısı."""
+        raise NotImplementedError
+
+
+# -------------------------------------------------
+# DEV / TEST REPOSITORY (NO-OP)
+# -------------------------------------------------
+@dataclass
+class NoOpRepository(Repository):
+    """
+    Dev/test ortamı: DB yazmaz.
+    Job akışını güvenle çalıştırmak için.
+    """
+
+    # RAW
+    def save_raw_fixture(self, match: Match) -> None:
+        return
+
+    def list_raw_fixtures(self, day: date) -> list[Match]:
+        return []
+
+    # SELECTED
+    def upsert_match(self, match: Match) -> None:
+        return
+
+    def list_selected_matches(self, day: date) -> list[Match]:
+        return []
+
+    # ODDS / SCORE
+    def save_ms_odds(self, match_id: int, odds: MsOdds) -> None:
+        return
+
+    def has_ms_odds(self, match_id: int) -> bool:
+        return False
+
+    def save_score(self, match_id: int, score: Score) -> None:
+        return
+
+    def has_score(self, match_id: int) -> bool:
+        return False
+
+    # STATE
+    def mark_done(self, match_id: int) -> None:
+        return
+
+    def is_done(self, match_id: int) -> bool:
+        return False
+
+    def mark_ignored(self, match_id: int, reason: str) -> None:
+        return
+
+    # PANEL
+    def today_added_count(self, day: date) -> int:
+        return 0
 
     def total_matches_count(self) -> int:
-        return len(self._selected)
+        return 0
