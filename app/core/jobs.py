@@ -1,3 +1,4 @@
+# app/core/jobs.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -49,8 +50,9 @@ def _refresh_status_map(ds: DataSource, day: date) -> Dict[int, str]:
 
 def _apply_status(matches: List[Match], status_map: Dict[int, str]) -> List[Match]:
     for m in matches:
-        if m.match_id in status_map:
-            m.status = status_map[m.match_id]
+        s = status_map.get(m.match_id)
+        if s is not None:
+            m.status = s
     return matches
 
 
@@ -68,25 +70,14 @@ def run_job_0100(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
     fixtures = _sort_by_kickoff(bundle.matches)
 
     processed = ignored = 0
-
     for m in fixtures:
         processed += 1
         repo.save_raw_fixture(m)
-
         if _should_ignore_status(m.status):
             repo.mark_ignored(m.match_id, m.status)
             ignored += 1
 
-    return JobResult(
-        day=day,
-        job_name="01:00",
-        fixtures_count=len(fixtures),
-        processed_count=processed,
-        selected_count=0,
-        ignored_count=ignored,
-        done_count=0,
-        requests_used=budget.used,
-    )
+    return JobResult(day, "01:00", len(fixtures), processed, 0, ignored, 0, budget.used)
 
 
 # -------------------------------------------------
@@ -97,11 +88,10 @@ def run_job_1500(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
 
     raw = _sort_by_kickoff(repo.list_raw_fixtures(day))
 
-    # 1 request: status refresh (tek sefer)
+    # 1 request: status refresh
     if budget.can_consume(1):
         budget.consume(1)
-        status_map = _refresh_status_map(ds, day)
-        raw = _apply_status(raw, status_map)
+        raw = _apply_status(raw, _refresh_status_map(ds, day))
 
     processed = selected = ignored = done = 0
 
@@ -119,7 +109,7 @@ def run_job_1500(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
 
         processed += 1
 
-        # FT: MS odds şart, varsa score al
+        # FT: MS odds şart; varsa score al; score gelirse done
         if _is_ft(m.status):
             if not budget.can_consume(1):
                 break
@@ -135,7 +125,6 @@ def run_job_1500(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
             repo.save_ms_odds(m.match_id, odds)
             selected += 1
 
-            # score
             if budget.can_consume(1):
                 budget.consume(1)
                 score = ds.get_score(m.match_id)
@@ -146,7 +135,7 @@ def run_job_1500(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
 
             continue
 
-        # NS: MS odds varsa seç
+        # NS: MS odds varsa seç (snapshot)
         if _is_ns(m.status):
             if not budget.can_consume(1):
                 break
@@ -162,38 +151,29 @@ def run_job_1500(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
             selected += 1
             continue
 
-        # LIVE/HT vb: 23:00 finalize'a kalsın
+        # LIVE/HT vb: 23:00 finalize
         continue
 
-    return JobResult(
-        day=day,
-        job_name="15:00",
-        fixtures_count=len(raw),
-        processed_count=processed,
-        selected_count=selected,
-        ignored_count=ignored,
-        done_count=done,
-        requests_used=budget.used,
-    )
+    return JobResult(day, "15:00", len(raw), processed, selected, ignored, done, budget.used)
 
 
 # -------------------------------------------------
-# 23:00 JOB – FINALIZE + EKSİK TAMAMLAMA
+# 23:00 JOB – FINALIZE + EKSİK TAMAMLAMA (GERÇEK)
 # -------------------------------------------------
 def run_job_2300(cfg: Config, ds: DataSource, repo: Repository, day: date) -> JobResult:
     budget = BudgetTracker(limit=cfg.max_daily_requests)
 
-    raw = _sort_by_kickoff(repo.list_raw_fixtures(day))
+    selected_matches = _sort_by_kickoff(repo.list_selected_matches(day))
 
-    # 1 request: status refresh
+    # 1 request: status refresh (seçilmişlerin status’unu güncelle)
     if budget.can_consume(1):
         budget.consume(1)
         status_map = _refresh_status_map(ds, day)
-        raw = _apply_status(raw, status_map)
+        selected_matches = _apply_status(selected_matches, status_map)
 
     processed = ignored = done = 0
 
-    for m in raw:
+    for m in selected_matches:
         if repo.is_done(m.match_id):
             continue
 
@@ -202,33 +182,9 @@ def run_job_2300(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
             ignored += 1
             continue
 
-        # 23:00 sadece "seçilmiş" maçlarla uğraşsın:
-        # Seçilmiş = 15:00'te MS odds yazılmış maçlar.
-        # Bu yüzden koşul: repo.has_ms_odds == True OR (odds eksik ama match selected ise)
-        # InMemory/DB repo'da selected state yoksa, pratikte MS odds olanlar selected sayılır.
-        # Biz burada "selected = ms_odds var" kabul ediyoruz (mimarinizle uyumlu).
-        if not repo.has_ms_odds(m.match_id):
-            # Eksik odds tamamlama istiyorsan burada SKIP etme: ama bu maç "selected" değil.
-            # Seçim kuralı 15:00'te odds yoksa ele dediği için 23:00'te bunu takip etmiyoruz.
-            continue
-
         processed += 1
 
-        # FT: skor tamamla + done
-        if _is_ft(m.status):
-            if not repo.has_score(m.match_id) and budget.can_consume(1):
-                budget.consume(1)
-                score = ds.get_score(m.match_id)
-                if score is not None:
-                    repo.save_score(m.match_id, score)
-
-            if repo.has_score(m.match_id):
-                repo.mark_done(m.match_id)
-                done += 1
-
-            continue
-
-        # Odds eksikse tamamla (genelde nadir; ama mimari gereği var)
+        # 1) Odds eksikse tamamla (KURAL: sadece eksikse)
         if not repo.has_ms_odds(m.match_id):
             if budget.can_consume(1):
                 budget.consume(1)
@@ -236,13 +192,17 @@ def run_job_2300(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
                 if odds is not None:
                     repo.save_ms_odds(m.match_id, odds)
 
-    return JobResult(
-        day=day,
-        job_name="23:00",
-        fixtures_count=len(raw),
-        processed_count=processed,
-        selected_count=0,
-        ignored_count=ignored,
-        done_count=done,
-        requests_used=budget.used,
-    )
+        # 2) FT ise skor eksikse tamamla, varsa DONE yap
+        if _is_ft(m.status):
+            if not repo.has_score(m.match_id):
+                if budget.can_consume(1):
+                    budget.consume(1)
+                    score = ds.get_score(m.match_id)
+                    if score is not None:
+                        repo.save_score(m.match_id, score)
+
+            if repo.has_score(m.match_id):
+                repo.mark_done(m.match_id)
+                done += 1
+
+    return JobResult(day, "23:00", len(selected_matches), processed, 0, ignored, done, budget.used)
