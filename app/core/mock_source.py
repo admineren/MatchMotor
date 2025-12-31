@@ -78,7 +78,7 @@ class MockSource(DataSource):
         """
         odds_map = {}
 
-        for m in self._fixtures.matches:
+        for m in self.fixtures.matches:
             if m.ms_odds is not None:
                 odds_map[m.match_id] = m.ms_odds
                 
