@@ -1,4 +1,3 @@
-# app/core/mock_source.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,16 +18,16 @@ class _MockDayCache:
 
 class MockSource(DataSource):
     """
-    Sıfırdan stabil Mock datasource.
+    Stabil Mock datasource (DataSource sözleşmesine %100 uyumlu).
 
     - get_fixtures(day): deterministik fixture listesi üretir (Match listesi)
     - get_ms_odds(match_id): odds varsa MsOdds döner, yoksa None
     - get_score(match_id): sadece FT olanlar için Score döner, yoksa None
 
     Notlar:
-    - day parametresi date tipidir (DataSource sözleşmesi).
+    - day parametresi date tipidir.
     - kickoff_utc timezone-aware (UTC) üretilir.
-    - ms_odds_ratio ile "odds varmış gibi davranma oranı" ayarlanabilir.
+    - MsOdds ve Score içinde match_id zorunlu alanı doldurulur.
     - Constructor **fazladan keyword** alsa bile patlamaz (**kwargs).
     """
 
@@ -54,14 +53,12 @@ class MockSource(DataSource):
     # Deterministic pseudo-rng
     # -------------------------
     def _rng(self, x: int) -> int:
-        # basit deterministik LCG
         return (x * 1103515245 + 12345 + self.seed) & 0x7FFFFFFF
 
     def _rand01(self, x: int) -> float:
         return (self._rng(x) % 10_000) / 10_000.0
 
     def _kickoff_for(self, d: date, i: int) -> datetime:
-        # gün içine dağıt: 00:00 - 23:59 UTC
         base = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
         hour = self._rng(i + 100) % 24
         minute = self._rng(i + 200) % 60
@@ -76,10 +73,10 @@ class MockSource(DataSource):
         odds_by_id: Dict[int, MsOdds] = {}
         score_by_id: Dict[int, Score] = {}
 
-        # Match ID'leri gün bazlı çakışmasın diye date'ten offset üret
-        # (yeterince deterministik ve stabil)
         day_key = int(d.strftime("%Y%m%d"))
-        base_id = (day_key % 1_000_000) * 10_000  # 20251231 -> 1231xxxx gibi
+        base_id = (day_key % 1_000_000) * 10_000
+
+        now = datetime.now(timezone.utc)
 
         for n in range(1, self.fixtures_count + 1):
             match_id = base_id + n
@@ -90,13 +87,10 @@ class MockSource(DataSource):
 
             r = self._rand01(match_id)
 
-            # ignore (PST/CANC)
             if r < self.ignore_ratio:
                 status = "PST" if (self._rng(match_id) % 2 == 0) else "CANC"
-            # FT
             elif r < self.ignore_ratio + self.ft_ratio:
                 status = "FT"
-            # default NS
             else:
                 status = "NS"
 
@@ -114,29 +108,30 @@ class MockSource(DataSource):
             status_by_id[match_id] = status
             self._day_by_match_id[match_id] = d
 
-            # Odds üretimi (oranı ms_odds_ratio kadar)
+            # Odds üretimi
             if status not in ("PST", "CANC"):
                 if self._rand01(match_id + 999) < self.ms_odds_ratio:
-                    # deterministik 1X2
                     a = 1.20 + (self._rng(match_id + 10) % 200) / 100.0
                     b = 2.40 + (self._rng(match_id + 20) % 200) / 100.0
                     c = 1.60 + (self._rng(match_id + 30) % 200) / 100.0
 
                     odds_by_id[match_id] = MsOdds(
+                        match_id=match_id,
                         home=round(a, 2),
                         draw=round(b, 2),
                         away=round(c, 2),
-                        taken_at=datetime.now(timezone.utc),
+                        taken_at=now,
                     )
 
             # Score üretimi (sadece FT)
             if status == "FT":
                 hg = self._rng(match_id + 500) % 5
                 ag = self._rng(match_id + 800) % 5
-                # HT basit türet
                 ht_h = min(int(hg), int(self._rng(match_id + 1500) % 3))
                 ht_a = min(int(ag), int(self._rng(match_id + 1800) % 3))
+
                 score_by_id[match_id] = Score(
+                    match_id=match_id,
                     ht_home=ht_h,
                     ht_away=ht_a,
                     ft_home=int(hg),
