@@ -127,9 +127,11 @@ class MockSource(DataSource):
             away = 1.60 + r3
 
             odds_map[m.match_id] = MsOdds(
+                match_id=m.match_id,
                 home=round(home, 2),
                 draw=round(draw, 2),
                 away=round(away, 2),
+                taken_at=datetime.now(timezone.utc),
             )
 
         return odds_map
