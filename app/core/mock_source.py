@@ -94,6 +94,9 @@ class MockSource(DataSource):
         # jobs.py FixtureBundle bekliyorsa bu isim aynı kalmalı.
         return self._make_bundle(day)
 
+    def get_ms_odds(self, match_id: int):
+        return None
+
     def get_ms_odds_bulk(self, day: str) -> Dict[int, MsOdds]:
         """
         15:00 job burayı çağırıyor.
