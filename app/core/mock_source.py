@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from datetime import date
 from typing import Dict, List, Optional
 
 from .datasource import DataSource
