@@ -71,15 +71,21 @@ class MockSource(DataSource):
             return None
 
     def get_ms_odds_bulk(self, day):
-        bundle = self.get_fixtures(day)  # FixtureBundle
+        bundle = self.get_fixtures(day)
         
         odds_map = {}
-        for m in bundle.matches:
-            if m.ms_odds is not None:
-                odds_map[m.match_id] = m.ms_odds
-                
-            return odds_map
 
+    for m in bundle.matches:
+        # mock ortamda: bazı maçlara odds var, bazılarına yok gibi davran
+        if m.match_id % 3 == 0:   # keyfi mock kural
+            odds_map[m.match_id] = MsOdds(
+                home=1.85,
+                draw=3.40,
+                away=4.20
+            )
+            
+            return odds_map
+       
         # Gerçekçi bir 1X2 odds üretimi (tam bilimsel değil, test için yeterli)
         home = round(rng.uniform(1.20, 4.50), 2)
         draw = round(rng.uniform(2.80, 5.50), 2)
