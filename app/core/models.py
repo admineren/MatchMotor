@@ -1,4 +1,3 @@
-# app/core/models.py
 from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime
@@ -25,6 +24,7 @@ class Match:
 # -----------------------
 @dataclass
 class MsOdds:
+    match_id: int
     home: float
     draw: float
     away: float
@@ -36,6 +36,8 @@ class MsOdds:
 # -----------------------
 @dataclass
 class Score:
+    match_id: int
+
     ht_home: Optional[int] = None
     ht_away: Optional[int] = None
     ft_home: Optional[int] = None
