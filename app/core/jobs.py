@@ -142,14 +142,15 @@ def run_job_1500(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
         requests_used=budget.used,
     )
 
-
 def run_job_2300(cfg: Config, ds: DataSource, repo: Repository, day: date) -> JobResult:
     """
     23:00 job:
     - fixtures al
-    - FT olanları kapat (İY+MS yaz, DONE)
-    - NS/oynananları elleme (ertesi güne kalır)
-    - Pro aşamada ek market YOK
+    - FT olanları kapat (skor yaz, DONE)
+    - HT ise İY yaz
+    - EK: Kapanışa yakın MS odds güncellemesi (SADECE NS maçlarda)
+      * Bulk odds desteği varsa: 1 request ile alınır
+      * Repo "has_match" destekliyorsa sadece seçilmiş maçların odds'u güncellenir
     """
     budget = BudgetTracker(limit=cfg.max_daily_requests)
 
@@ -163,6 +164,19 @@ def run_job_2300(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
 
     processed = selected = ignored = done = 0
 
+    # --- NEW: Bulk odds snapshot (optional) ---
+    bulk_odds = None
+    if hasattr(ds, "get_ms_odds_bulk"):
+        # 1 extra request for bulk odds
+        if budget.can_consume(1):
+            budget.consume(1)
+            bulk_odds = ds.get_ms_odds_bulk(day)  # expected: Dict[int, MsOdds]
+        else:
+            bulk_odds = None
+
+    # helper: repo'da maç var mı? (seçilmiş mi?) -> opsiyonel
+    has_match_fn = getattr(repo, "has_match", None)
+
     for m in fixtures:
         if processed >= cfg.max_matches_per_day:
             break
@@ -175,6 +189,7 @@ def run_job_2300(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
 
         processed += 1
 
+        # FT ise kapat
         if _is_ft(m.status):
             score = _extract_score_from_match(m)
             if score is not None:
@@ -183,13 +198,31 @@ def run_job_2300(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
             done += 1
             continue
 
+        # HT ise sadece İY
         if _is_ht(m.status):
             score = _extract_score_from_match(m)
             if score is not None:
                 repo.save_score(m.match_id, score)
             continue
 
-        # NS/1H/2H -> dokunma
+        # --- NEW: NS ise (maç başlamamışsa) MS odds güncelle (kapanışa yakın) ---
+        if _is_ns(m.status):
+            # Sadece DB'ye daha önce alınmış maçlarda update yapmak istiyoruz.
+            # Eğer repo.has_match yoksa bu aşamada güncellemeyi pas geçiyoruz.
+            if has_match_fn is None:
+                continue
+
+            if not has_match_fn(m.match_id):
+                continue
+
+            if bulk_odds is not None:
+                odds = bulk_odds.get(m.match_id)
+                if odds is not None:
+                    repo.save_ms_odds(m.match_id, odds)
+            # Bulk yoksa burada per-match odds çekmiyoruz (request patlamasın)
+            continue
+
+        # 1H/2H vb. -> dokunma
         continue
 
     return JobResult(
@@ -201,4 +234,4 @@ def run_job_2300(cfg: Config, ds: DataSource, repo: Repository, day: date) -> Jo
         ignored_count=ignored,
         done_count=done,
         requests_used=budget.used,
-  )
+        )
