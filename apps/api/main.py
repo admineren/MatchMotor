@@ -15,7 +15,7 @@ from typing import Optional
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import create_engine, text, func
+from sqlalchemy import create_engine, text, func, inspect
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import Column, Integer, String, Date, Float, DateTime
@@ -85,8 +85,39 @@ app = FastAPI(
 @app.on_event("startup")
 def run_migrations():
     logger.info("DB migration başlatılıyor...")
+
+    # tablo yoksa oluşturur
     Base.metadata.create_all(bind=engine)
-    logger.info("DB migration tamamlandı.")
+
+    # tablo varsa kolon eklemez -> manuel ALTER TABLE gerekir
+    insp = inspect(engine)
+    existing_cols = {c["name"] for c in insp.get_columns("matches")}
+
+    alter_stmts = []
+
+    # BTTS kolonları
+    if "btts_yes" not in existing_cols:
+        alter_stmts.append('ALTER TABLE matches ADD COLUMN IF NOT EXISTS btts_yes BOOLEAN')
+    if "btts_no" not in existing_cols:
+        alter_stmts.append('ALTER TABLE matches ADD COLUMN IF NOT EXISTS btts_no BOOLEAN')
+
+    # OU25 kolonları (daily-summary bunları da sayıyor olmalı)
+    if "ou25_over" not in existing_cols:
+        alter_stmts.append('ALTER TABLE matches ADD COLUMN IF NOT EXISTS ou25_over BOOLEAN')
+    if "ou25_under" not in existing_cols:
+        alter_stmts.append('ALTER TABLE matches ADD COLUMN IF NOT EXISTS ou25_under BOOLEAN')
+
+    # (İstersen burada MS 1X2 kolonlarını da ekleyebiliriz; ama önce hatayı kaldıralım)
+
+    if alter_stmts:
+        with engine.begin() as conn:
+            for stmt in alter_stmts:
+                conn.execute(text(stmt))
+        logger.info("Eksik kolonlar eklendi: %s", ", ".join([s.split()[6] for s in alter_stmts]))
+    else:
+        logger.info("Eksik kolon yok.")
+
+    logger.info("DB migration tamam.")
 
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
     admin_user = os.getenv("ADMIN_USER", "")
