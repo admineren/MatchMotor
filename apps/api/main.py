@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 import io
 from datetime import date
+from datetime import datetime, timedelta
+from sqlalchemy import func
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -517,6 +519,79 @@ def list_matches(
         # Render loglarında net görmek için stacktrace bas
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail="Server error while processing Excel")
+
+@app.get("/daily-summary")
+def daily_summary(
+    day: Optional[str] = None,  # "2026-01-01" gibi; boşsa bugün
+    user: str = Depends(authenticate),
+    db: Session = Depends(get_db),
+):
+    # day yoksa bugün (UTC) - istersen Istanbul'a göre de yaparız
+    if day:
+        try:
+            d = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="day format must be YYYY-MM-DD")
+    else:
+        d = datetime.utcnow().date()
+
+    start = datetime(d.year, d.month, d.day)
+    end = start + timedelta(days=1)
+
+    total = db.query(func.count(MatchRow.id)).scalar() or 0
+
+    added_today = (
+        db.query(func.count(MatchRow.id))
+        .filter(MatchRow.created_at >= start, MatchRow.created_at < end)
+        .scalar()
+        or 0
+    )
+
+    ms_ok = (
+        db.query(func.count(MatchRow.id))
+        .filter(
+            MatchRow.created_at >= start, MatchRow.created_at < end,
+            MatchRow.ms1.isnot(None),
+            MatchRow.ms0.isnot(None),
+            MatchRow.ms2.isnot(None),
+        )
+        .scalar()
+        or 0
+    )
+
+    btts_ok = (
+        db.query(func.count(MatchRow.id))
+        .filter(
+            MatchRow.created_at >= start, MatchRow.created_at < end,
+            MatchRow.btts_yes.isnot(None),
+            MatchRow.btts_no.isnot(None),
+        )
+        .scalar()
+        or 0
+    )
+
+    ou25_ok = (
+        db.query(func.count(MatchRow.id))
+        .filter(
+            MatchRow.created_at >= start, MatchRow.created_at < end,
+            MatchRow.over25.isnot(None),
+            MatchRow.under25.isnot(None),
+        )
+        .scalar()
+        or 0
+    )
+
+    return {
+        "day": d.isoformat(),
+        "total_matches": total,
+        "added_today": added_today,
+        "markets_today": {
+            "ms_1x2_ok": ms_ok,
+            "btts_ok": btts_ok,
+            "ou25_ok": ou25_ok,
+        },
+    }
+
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
     df = pd.read_excel(FILE_PATH)
