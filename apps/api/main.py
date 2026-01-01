@@ -1,43 +1,33 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi import HTTPException
-from fastapi import UploadFile, File, HTTPException
+
 import traceback
 import re
-from typing import Optional
-
 import os
 import secrets
 import pandas as pd
 import math
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
-import io
-from datetime import date
-from datetime import datetime, timedelta
-from sqlalchemy import func
+from typing import Optional
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import create_engine, text, func
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import Column, Integer, String, Date, Float, DateTime
+
+# -----------------------
+# DB setup
+# -----------------------
 DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env is missing")
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
-
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
     db = SessionLocal()
@@ -47,9 +37,6 @@ def get_db():
         db.close()
 
 Base = declarative_base()
-from sqlalchemy import Column, Integer, String, Date, Float, DateTime
-from datetime import datetime
-
 
 class Match(Base):
     __tablename__ = "matches"
@@ -77,41 +64,12 @@ class Match(Base):
     under25 = Column(Float)
     over25 = Column(Float)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)  # UTC naive
 
+# -----------------------
+# App + Auth
+# -----------------------
 security = HTTPBasic()
-
-# Excel dosyası: repo kökü/data/SadeOran.xlsx
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))  # apps/api/main.py -> repo root
-FILE_PATH = os.path.join(BASE_DIR, "data", "SadeOran.xlsx")
-FILE_PATH = os.path.abspath(FILE_PATH)
-print("Using file:", FILE_PATH)
-
-def _to_float_series(s: pd.Series) -> pd.Series:
-    """
-    Excel'den gelen oran sütunları bazen '1,25' gibi string/metin olur.
-    Hepsini güvenli şekilde float'a çevirir.
-    """
-    if s is None:
-        return s
-    # önce stringe çevir, virgülü noktaya çevir, boşları NaN yap
-    s2 = (
-        s.astype(str)
-         .str.replace(",", ".", regex=False)
-         .str.replace(" ", "", regex=False)
-    )
-    # 'nan', '' gibi şeyler NaN'a dönsün
-    s2 = s2.replace({"nan": None, "None": None, "": None})
-    return pd.to_numeric(s2, errors="coerce")
-
-def normalize_odds(df, cols):
-    for c in cols:
-        if c in df.columns:
-            s = df[c].astype(str).str.strip()
-            s = s.str.replace(",", ".", regex=False)
-            s = s.replace({"": None, "nan": None, "None": None, "-": None})
-            df[c] = pd.to_numeric(s, errors="coerce")
-    return df
 
 # Swagger'ı otomatik kapatıyoruz (biz kendimiz /docs açacağız)
 app = FastAPI(
@@ -138,7 +96,90 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
+# Excel dosyası: repo kökü/data/SadeOran.xlsx
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))  # apps/api/main.py -> repo root
+FILE_PATH = os.path.abspath(os.path.join(BASE_DIR, "data", "SadeOran.xlsx"))
+print("Using file:", FILE_PATH)
 
+# -----------------------
+# Helpers
+# -----------------------
+def normalize_odds(df: pd.DataFrame, cols):
+    for c in cols:
+        if c in df.columns:
+            s = df[c].astype(str).str.strip()
+            s = s.str.replace(",", ".", regex=False)
+            s = s.replace({"": None, "nan": None, "None": None, "-": None})
+            df[c] = pd.to_numeric(s, errors="coerce")
+    return df
+
+def parse_score_home_away(score):
+    """'4-2' / '4 : 2' gibi skor metninden (ev, dep) tuple döndürür."""
+    if score is None or (isinstance(score, float) and math.isnan(score)):
+        return (None, None)
+    s = str(score).strip()
+    m = re.match(r"^\s*(\d+)\s*[-:]\s*(\d+)\s*$", s)
+    if not m:
+        return (None, None)
+    return (int(m.group(1)), int(m.group(2)))
+
+def parse_score_total_goals(x):
+    """MS Skor'dan toplam gol (int) döndürür."""
+    h, a = parse_score_home_away(x)
+    if h is None or a is None:
+        return None
+    return int(h + a)
+
+def parse_score_1x2(x):
+    """Skor -> 1/0/2 (ev/beraber/deplasman)"""
+    h, a = parse_score_home_away(x)
+    if h is None or a is None:
+        return None
+    if h > a:
+        return 1
+    if h == a:
+        return 0
+    return 2
+
+def parse_kg_result_from_score(x):
+    """BTTS sonucu: 'var' / 'yok'"""
+    h, a = parse_score_home_away(x)
+    if h is None or a is None:
+        return None
+    return "var" if (h > 0 and a > 0) else "yok"
+
+def build_iy_ms_key(iy_score, ms_score):
+    """İY ve MS sonucunu birleştir: örn '1/0' gibi"""
+    iy_res = parse_score_1x2(iy_score)
+    ms_res = parse_score_1x2(ms_score)
+    if iy_res is None or ms_res is None:
+        return None
+    return f"{iy_res}/{ms_res}"
+
+def to_float(v):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def raise_500_with_trace(e: Exception):
+    tb = traceback.format_exc()
+    raise HTTPException(
+        status_code=500,
+        detail={"error": str(e), "traceback": tb},
+    )
+
+# -----------------------
+# Endpoints
+# -----------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -169,7 +210,7 @@ def insert_test_match(
         return {"inserted": True, "id": m.id}
     except Exception as e:
         db.rollback()
-        return {"inserted": False, "error": str(e)}
+        raise_500_with_trace(e)
 
 @app.get("/db-health")
 def db_health():
@@ -180,62 +221,14 @@ def db_health():
     except Exception as e:
         return {"db": "error", "detail": str(e)}
 
-def parse_score_home_away(score):
-    """'4 - 2' gibi skor metninden (ev, dep) tuple döndürür."""
-    if score is None:
-        return (None, None)
-    s = str(score).strip()
-    # bazı dosyalarda '4-2' ya da '4 : 2' gibi gelebilir
-    m = re.match(r"^\s*(\d+)\s*[-:]\s*(\d+)\s*$", s)
-    if not m:
-        return (None, None)
-    try:
-        return (int(m.group(1)), int(m.group(2)))
-    except Exception:
-        return (None, None)
-
-def parse_score_total_goals(x):
-    # örnek: "2-1" / "2 - 1" / "2:1"
-    if x is None or pd.isna(x):
-        return None
-    s = str(x).strip()
-    if not s:
-        return None
-
-def _to_float(v):
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip()
-    if not s:
-        return None
-    # maçkolik kopyalarında virgül oluyor
-    s = s.replace(",", ".")
-    try:
-        return float(s)
-    except:
-        return None
-
-
-def _col(df, *names):
-    """df'de isimlerden ilk bulunan kolonu döndür."""
-    for n in names:
-        if n in df.columns:
-            return n
-    return None
-
-
 @app.post("/import/file")
-def import_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
+def import_file(file: UploadFile = File(...), db: Session = Depends(get_db), user: str = Depends(authenticate)):
     """
-    Excel dosyasını (xlsx) okuyup Match tablosuna toplu şekilde yazar.
-    Not: Satır satır 'var mı' sorgusu yapmadığımız için çok daha hızlıdır.
+    Excel dosyasını (xlsx/xls) okuyup Match tablosuna toplu şekilde yazar.
     """
     if not file.filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="Sadece Excel (.xlsx/.xls) dosyası destekleniyor")
 
-    # Dosyayı diske yaz (Render'da /tmp güvenli)
     tmp_path = f"/tmp/{file.filename}"
     try:
         with open(tmp_path, "wb") as f:
@@ -251,10 +244,8 @@ def import_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
     if df.empty:
         return {"inserted": 0, "message": "Dosya boş"}
 
-    # Sütun isimlerini normalize et
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Beklenen minimum alanlar (sende SadeOran.xlsx için)
     required = ["Saat", "Lig", "Ev", "Deplasman", "İY Skor", "MS Skor"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -263,24 +254,13 @@ def import_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
             detail=f"Eksik sütun(lar): {missing}. Mevcut sütunlar: {list(df.columns)}",
         )
 
-    def to_float(v):
-        if v is None or (isinstance(v, float) and math.isnan(v)):
-            return None
-        s = str(v).strip().replace(",", ".")
-        try:
-            return float(s)
-        except Exception:
-            return None
-
     inserted = 0
     failed_rows = 0
-
     batch = []
-    BATCH_SIZE = 1000  # istersen 500 de yapabilirsin
+    BATCH_SIZE = 1000
 
     try:
         for row in df.itertuples(index=False):
-            # Tuple'dan alanları güvenli al (kolon sırası değişse bile çalışsın)
             r = row._asdict() if hasattr(row, "_asdict") else dict(zip(df.columns, row))
 
             m = Match(
@@ -310,7 +290,6 @@ def import_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
                 inserted += len(batch)
                 batch.clear()
 
-        # kalanlar
         if batch:
             db.bulk_save_objects(batch)
             db.commit()
@@ -322,11 +301,9 @@ def import_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"DB yazma hatası: {e}")
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Import sırasında hata: {e}")
+        raise_500_with_trace(e)
 
     return {"inserted": inserted, "failed_rows": failed_rows}
-
-
 
 @app.get("/matches")
 def list_matches(
@@ -336,35 +313,29 @@ def list_matches(
     limit: int = 20,
     tg_filter: Optional[str] = None,  # "0-1", "2-3", "4-5", "6+"
     kg: Optional[str] = None,  # "var" / "yok"
-
-    # tek-kutu KG oranları (min/max)
     kg_var_min: Optional[float] = None,
     kg_var_max: Optional[float] = None,
     kg_yok_min: Optional[float] = None,
     kg_yok_max: Optional[float] = None,
-
-    # MS oran aralıkları
     ms1_min: Optional[float] = None,
     ms1_max: Optional[float] = None,
     ms0_min: Optional[float] = None,
     ms0_max: Optional[float] = None,
     ms2_min: Optional[float] = None,
     ms2_max: Optional[float] = None,
-
-    # İY oran aralıkları
     iy1_min: Optional[float] = None,
     iy1_max: Optional[float] = None,
     iy0_min: Optional[float] = None,
     iy0_max: Optional[float] = None,
     iy2_min: Optional[float] = None,
     iy2_max: Optional[float] = None,
-
-    # skor filtresi (İY ve/veya MS sonucu: 1/0/2)
     iy: Optional[int] = None,
     ms: Optional[int] = None,
 ):
+    # ✅ Senin Render hatanın asıl sebebi şuydu:
+    # Bu endpointte "try:" vardı ama "except/finally" yoktu.
+    # Python dosyayı parse edemeyip, sonraki decorator'da "expected except or finally block" diye patlıyordu.
     try:
-        # güvenlik: limit 1..500
         if limit < 1:
             limit = 1
         if limit > 500:
@@ -372,7 +343,6 @@ def list_matches(
 
         df = pd.read_excel(FILE_PATH)
 
-        # kolon adlarını normalize et (boşluk, Türkçe I/İ karışıklığı vs.)
         df.columns = (
             df.columns.astype(str)
             .str.strip()
@@ -380,19 +350,15 @@ def list_matches(
             .str.replace("ı", "i", regex=False)
         )
 
-        # 1) oranları sayıya çevir
         df = normalize_odds(df, ["MS1", "MS0", "MS2", "IY 1", "IY 0", "IY 2", "KG Var", "KG Yok"])
 
-        # MS Skor'dan toplam gol
         if "MS Skor" in df.columns:
             df["_tg"] = df["MS Skor"].apply(parse_score_total_goals)
-            # MS Skor'dan KG sonucu (var/yok)
             df["_kg_res"] = df["MS Skor"].apply(parse_kg_result_from_score)
         else:
             df["_tg"] = None
             df["_kg_res"] = None
 
-        # 1.4) Toplam gol aralığı filtresi
         if tg_filter and "_tg" in df.columns:
             s = str(tg_filter).strip()
             if s == "0-1":
@@ -404,33 +370,19 @@ def list_matches(
             elif s in ("6+", "6"):
                 df = df[df["_tg"] >= 6]
 
-        # İY / MS sonucu (1/1, 1/0, 0/2...)
         if "IY Skor" in df.columns and "MS Skor" in df.columns:
-            df["_iy_ms"] = df.apply(
-                lambda r: build_iy_ms_key(r["IY Skor"], r["MS Skor"]),
-                axis=1
-            )
+            df["_iy_ms"] = df.apply(lambda r: build_iy_ms_key(r["IY Skor"], r["MS Skor"]), axis=1)
         else:
             df["_iy_ms"] = None
-        
-        # 1.5) İY / MS skor filtresi (iy ve/veya ms girilirse)
+
         if iy is not None or ms is not None:
-            if "IY Skor" in df.columns:
-                df["_iy_res"] = df["IY Skor"].apply(parse_score_1x2)
-            else:
-                df["_iy_res"] = None
-
-            if "MS Skor" in df.columns:
-                df["_ms_res"] = df["MS Skor"].apply(parse_score_1x2)
-            else:
-                df["_ms_res"] = None
-
+            df["_iy_res"] = df["IY Skor"].apply(parse_score_1x2) if "IY Skor" in df.columns else None
+            df["_ms_res"] = df["MS Skor"].apply(parse_score_1x2) if "MS Skor" in df.columns else None
             if iy is not None:
                 df = df[df["_iy_res"] == int(iy)]
             if ms is not None:
                 df = df[df["_ms_res"] == int(ms)]
 
-        # 2) lig filtresi (lig veya ligs)
         if lig and "Lig" in df.columns:
             df = df[df["Lig"].astype(str) == str(lig)]
         elif ligs and "Lig" in df.columns:
@@ -438,7 +390,6 @@ def list_matches(
             if lig_list:
                 df = df[df["Lig"].astype(str).isin(lig_list)]
 
-        # 3) oran filtreleri (dolu olanları uygula)
         def apply_range(col: str, vmin: Optional[float], vmax: Optional[float]) -> None:
             nonlocal df
             if col not in df.columns:
@@ -459,49 +410,27 @@ def list_matches(
         apply_range("KG Var", kg_var_min, kg_var_max)
         apply_range("KG Yok", kg_yok_min, kg_yok_max)
 
-        # KG Var / KG Yok (tek kutu – skor bazlı)
         if kg:
             kg_s = str(kg).strip().lower()
-            
             if kg_s in ("var", "yok"):
-                
-                if "_kg_res" not in df.columns:
-                    
-                    if "MS Skor" in df.columns:
-                        df["_kg_res"] = df["MS Skor"].apply(parse_kg_result_from_score)
-                    else:
-                        df["_kg_res"] = None
-                        
-                df = df[df["_kg_res"] == kg_s]     
-        
-        # Gol dağılımı (0-1, 2-3, 4-5, 6+)
-        if "_tg" in df.columns:
-            tg_series = df["_tg"].dropna()
-            gol_dist = {
-                "0-1": int(((tg_series >= 0) & (tg_series <= 1)).sum()),
-                "2-3": int(((tg_series >= 2) & (tg_series <= 3)).sum()),
-                "4-5": int(((tg_series >= 4) & (tg_series <= 5)).sum()),
-                "6+": int((tg_series >= 6).sum()),
-            }
-        else:
-            gol_dist = {}
-        
-        # KG Var / KG Yok dağılımı (sonuçtan)
-        if "_kg_res" in df.columns:
-            kg_dist = {
-                "var": int((df["_kg_res"] == "var").sum()),
-                "yok": int((df["_kg_res"] == "yok").sum()),
-            }
-        else:
-            kg_dist = {"var": 0, "yok": 0}
+                if "_kg_res" not in df.columns and "MS Skor" in df.columns:
+                    df["_kg_res"] = df["MS Skor"].apply(parse_kg_result_from_score)
+                df = df[df["_kg_res"] == kg_s]
 
-        # İY / MS dağılımı
-        iy_ms_dist = (
-            df["_iy_ms"]
-            .dropna()
-            .value_counts()
-            .to_dict()
-        )
+        tg_series = df["_tg"].dropna() if "_tg" in df.columns else pd.Series([], dtype=float)
+        gol_dist = {
+            "0-1": int(((tg_series >= 0) & (tg_series <= 1)).sum()),
+            "2-3": int(((tg_series >= 2) & (tg_series <= 3)).sum()),
+            "4-5": int(((tg_series >= 4) & (tg_series <= 5)).sum()),
+            "6+": int((tg_series >= 6).sum()),
+        } if len(tg_series) else {}
+
+        kg_dist = {
+            "var": int((df["_kg_res"] == "var").sum()) if "_kg_res" in df.columns else 0,
+            "yok": int((df["_kg_res"] == "yok").sum()) if "_kg_res" in df.columns else 0,
+        }
+
+        iy_ms_dist = df["_iy_ms"].dropna().value_counts().to_dict() if "_iy_ms" in df.columns else {}
 
         total = int(len(df))
         rows = df.head(limit).to_dict(orient="records")
@@ -517,6 +446,11 @@ def list_matches(
             "matches": rows,
         }
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise_500_with_trace(e)
+
 @app.get("/daily-summary")
 def daily_summary(
     day: Optional[str] = None,  # "2026-01-01" formatında; boşsa bugün (TR)
@@ -524,7 +458,6 @@ def daily_summary(
     db: Session = Depends(get_db),
 ):
     try:
-        # Türkiye saatiyle "hangi gün" hesapla
         tz_tr = ZoneInfo("Europe/Istanbul")
         tz_utc = ZoneInfo("UTC")
 
@@ -536,7 +469,6 @@ def daily_summary(
         else:
             d = datetime.now(tz_tr).date()
 
-        # TR gün başlangıcı -> UTC'ye çevir -> DB (UTC naive) ile sorgula
         start_tr = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz_tr)
         end_tr = start_tr + timedelta(days=1)
 
@@ -588,41 +520,22 @@ def daily_summary(
 
         return {
             "day_tr": d.isoformat(),
-            "range_tr": {
-                "start": start_tr.isoformat(),
-                "end": end_tr.isoformat(),
-            },
-            "range_utc_used_in_db": {
-                "start": start_utc.isoformat() + "Z",
-                "end": end_utc.isoformat() + "Z",
-            },
+            "range_tr": {"start": start_tr.isoformat(), "end": end_tr.isoformat()},
+            "range_utc_used_in_db": {"start": start_utc.isoformat() + "Z", "end": end_utc.isoformat() + "Z"},
             "total_matches": total,
             "added_today": added_today,
-            "markets_today": {
-                "ms_1x2_ok": ms_ok,
-                "btts_ok": btts_ok,
-                "ou25_ok": ou25_ok,
-            },
+            "markets_today": {"ms_1x2_ok": ms_ok, "btts_ok": btts_ok, "ou25_ok": ou25_ok},
         }
+
     except HTTPException:
-        # format hatası gibi durumlarda aynen geçir
         raise
     except Exception as e:
-        # Swagger'da hatayı detaylı gör: traceback + mesaj
-        tb = traceback.format_exc()
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": str(e),
-                "traceback": tb,
-            },
-        )
+        raise_500_with_trace(e)
 
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
     df = pd.read_excel(FILE_PATH)
-    
-    return {"rows": len(df), "columns": list(df.columns)}
+    return {"rows": int(len(df)), "columns": list(df.columns)}
 
 # Korumalı OpenAPI json
 @app.get("/openapi.json")
@@ -635,11 +548,10 @@ def openapi_json(user: str = Depends(authenticate)):
         )
     )
 
-
 # Korumalı Swagger UI
 @app.get("/docs", response_class=HTMLResponse)
 def docs(user: str = Depends(authenticate)):
     return get_swagger_ui_html(
         openapi_url="/openapi.json",
         title="MatchMotor API - Docs",
-)
+    )
