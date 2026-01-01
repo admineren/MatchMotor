@@ -32,20 +32,12 @@ if not DATABASE_URL:
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-Base = declarative_base()
-
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-@app.on_event("startup")
-def run_migrations():
-    logger.info("DB migration başlatılıyor...")
-    Base.metadata.create_all(bind=engine)
-    logger.info("DB migration tamamlandı.")
     
 Base = declarative_base()
 
@@ -90,7 +82,11 @@ app = FastAPI(
     openapi_url=None,
 )
 
-Base.metadata.create_all(bind=engine)
+@app.on_event("startup")
+def run_migrations():
+    logger.info("DB migration başlatılıyor...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("DB migration tamamlandı.")
 
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
     admin_user = os.getenv("ADMIN_USER", "")
