@@ -10,17 +10,14 @@ import os
 import secrets
 import pandas as pd
 import math
-import logging
 from typing import Optional
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import create_engine, text, func, inspect
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, create_engine, text, func, inspect
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import Column, Integer, String, Date, Float, DateTime
-
-logger = logging.getLogger(__name__)
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, create_engine, text, func, inspect
 
 # -----------------------
 # DB setup
@@ -38,7 +35,7 @@ def get_db():
         yield db
     finally:
         db.close()
-    
+
 Base = declarative_base()
 
 class Match(Base):
@@ -82,42 +79,55 @@ app = FastAPI(
     openapi_url=None,
 )
 
-@app.on_event("startup")
-def run_migrations():
-    logger.info("DB migration başlatılıyor...")
+# ---------------------------
+# DB schema auto-fix (Render Postgres)
+# ---------------------------
 
-    # tablo yoksa oluşturur
+def ensure_db_schema():
+    """Create tables if missing and add new columns safely (no Alembic)."""
+    # create table if it doesn't exist
     Base.metadata.create_all(bind=engine)
 
-    # tablo varsa kolon eklemez -> manuel ALTER TABLE gerekir
-    insp = inspect(engine)
-    existing_cols = {c["name"] for c in insp.get_columns("matches")}
+    try:
+        insp = inspect(engine)
+        if "matches" not in insp.get_table_names():
+            return
 
-    alter_stmts = []
+        cols = {c["name"] for c in insp.get_columns("matches")}
 
-    # BTTS kolonları
-    if "btts_yes" not in existing_cols:
-        alter_stmts.append('ALTER TABLE matches ADD COLUMN IF NOT EXISTS btts_yes BOOLEAN')
-    if "btts_no" not in existing_cols:
-        alter_stmts.append('ALTER TABLE matches ADD COLUMN IF NOT EXISTS btts_no BOOLEAN')
+        alter_statements = []
+        # odds columns
+        if "btts_yes" not in cols:
+            alter_statements.append("ALTER TABLE matches ADD COLUMN IF NOT EXISTS btts_yes DOUBLE PRECISION")
+        if "btts_no" not in cols:
+            alter_statements.append("ALTER TABLE matches ADD COLUMN IF NOT EXISTS btts_no DOUBLE PRECISION")
+        if "under25" not in cols:
+            alter_statements.append("ALTER TABLE matches ADD COLUMN IF NOT EXISTS under25 DOUBLE PRECISION")
+        if "over25" not in cols:
+            alter_statements.append("ALTER TABLE matches ADD COLUMN IF NOT EXISTS over25 DOUBLE PRECISION")
+        # created_at for daily tracking
+        if "created_at" not in cols:
+            alter_statements.append("ALTER TABLE matches ADD COLUMN IF NOT EXISTS created_at TIMESTAMP")
 
-    # OU25 kolonları (daily-summary bunları da sayıyor olmalı)
-    if "ou25_over" not in existing_cols:
-        alter_stmts.append('ALTER TABLE matches ADD COLUMN IF NOT EXISTS ou25_over BOOLEAN')
-    if "ou25_under" not in existing_cols:
-        alter_stmts.append('ALTER TABLE matches ADD COLUMN IF NOT EXISTS ou25_under BOOLEAN')
+        if alter_statements:
+            with engine.begin() as conn:
+                for stmt in alter_statements:
+                    conn.execute(text(stmt))
+            logger.info("DB schema updated: %s", "; ".join(alter_statements))
+        else:
+            logger.info("DB schema OK (no changes).")
 
-    # (İstersen burada MS 1X2 kolonlarını da ekleyebiliriz; ama önce hatayı kaldıralım)
+    except Exception as e:
+        # Don't crash app on startup; daily-summary will surface issues if any.
+        logger.exception("DB schema ensure failed: %s", e)
 
-    if alter_stmts:
-        with engine.begin() as conn:
-            for stmt in alter_stmts:
-                conn.execute(text(stmt))
-        logger.info("Eksik kolonlar eklendi: %s", ", ".join([s.split()[6] for s in alter_stmts]))
-    else:
-        logger.info("Eksik kolon yok.")
 
-    logger.info("DB migration tamam.")
+@app.on_event("startup")
+def run_migrations():
+    # Render'da eski DB'ye yeni sütunlar eklendiğinde app patlamasın diye
+    ensure_db_schema()
+
+
 
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
     admin_user = os.getenv("ADMIN_USER", "")
