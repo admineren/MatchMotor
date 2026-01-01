@@ -24,6 +24,7 @@ import io
 from datetime import date
 from datetime import datetime, timedelta
 from sqlalchemy import func
+from zoneinfo import ZoneInfo
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -515,82 +516,108 @@ def list_matches(
             "iy_ms_dist": iy_ms_dist,
             "matches": rows,
         }
-    except Exception:
-        # Render loglarında net görmek için stacktrace bas
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Server error while processing Excel")
 
 @app.get("/daily-summary")
 def daily_summary(
-    day: Optional[str] = None,  # "2026-01-01" gibi; boşsa bugün
+    day: Optional[str] = None,  # "2026-01-01" formatında; boşsa bugün (TR)
     user: str = Depends(authenticate),
     db: Session = Depends(get_db),
 ):
-    # day yoksa bugün (UTC) - istersen Istanbul'a göre de yaparız
-    if day:
-        try:
-            d = datetime.strptime(day, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="day format must be YYYY-MM-DD")
-    else:
-        d = datetime.utcnow().date()
+    try:
+        # Türkiye saatiyle "hangi gün" hesapla
+        tz_tr = ZoneInfo("Europe/Istanbul")
+        tz_utc = ZoneInfo("UTC")
 
-    start = datetime(d.year, d.month, d.day)
-    end = start + timedelta(days=1)
+        if day:
+            try:
+                d = datetime.strptime(day, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="day format must be YYYY-MM-DD")
+        else:
+            d = datetime.now(tz_tr).date()
 
-    total = db.query(func.count(MatchRow.id)).scalar() or 0
+        # TR gün başlangıcı -> UTC'ye çevir -> DB (UTC naive) ile sorgula
+        start_tr = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz_tr)
+        end_tr = start_tr + timedelta(days=1)
 
-    added_today = (
-        db.query(func.count(MatchRow.id))
-        .filter(MatchRow.created_at >= start, MatchRow.created_at < end)
-        .scalar()
-        or 0
-    )
+        start_utc = start_tr.astimezone(tz_utc).replace(tzinfo=None)
+        end_utc = end_tr.astimezone(tz_utc).replace(tzinfo=None)
 
-    ms_ok = (
-        db.query(func.count(MatchRow.id))
-        .filter(
-            MatchRow.created_at >= start, MatchRow.created_at < end,
-            MatchRow.ms1.isnot(None),
-            MatchRow.ms0.isnot(None),
-            MatchRow.ms2.isnot(None),
+        total = db.query(func.count(Match.id)).scalar() or 0
+
+        added_today = (
+            db.query(func.count(Match.id))
+            .filter(Match.created_at >= start_utc, Match.created_at < end_utc)
+            .scalar()
+            or 0
         )
-        .scalar()
-        or 0
-    )
 
-    btts_ok = (
-        db.query(func.count(MatchRow.id))
-        .filter(
-            MatchRow.created_at >= start, MatchRow.created_at < end,
-            MatchRow.btts_yes.isnot(None),
-            MatchRow.btts_no.isnot(None),
+        ms_ok = (
+            db.query(func.count(Match.id))
+            .filter(
+                Match.created_at >= start_utc, Match.created_at < end_utc,
+                Match.ms1.isnot(None),
+                Match.ms0.isnot(None),
+                Match.ms2.isnot(None),
+            )
+            .scalar()
+            or 0
         )
-        .scalar()
-        or 0
-    )
 
-    ou25_ok = (
-        db.query(func.count(MatchRow.id))
-        .filter(
-            MatchRow.created_at >= start, MatchRow.created_at < end,
-            MatchRow.over25.isnot(None),
-            MatchRow.under25.isnot(None),
+        btts_ok = (
+            db.query(func.count(Match.id))
+            .filter(
+                Match.created_at >= start_utc, Match.created_at < end_utc,
+                Match.btts_yes.isnot(None),
+                Match.btts_no.isnot(None),
+            )
+            .scalar()
+            or 0
         )
-        .scalar()
-        or 0
-    )
 
-    return {
-        "day": d.isoformat(),
-        "total_matches": total,
-        "added_today": added_today,
-        "markets_today": {
-            "ms_1x2_ok": ms_ok,
-            "btts_ok": btts_ok,
-            "ou25_ok": ou25_ok,
-        },
-    }
+        ou25_ok = (
+            db.query(func.count(Match.id))
+            .filter(
+                Match.created_at >= start_utc, Match.created_at < end_utc,
+                Match.over25.isnot(None),
+                Match.under25.isnot(None),
+            )
+            .scalar()
+            or 0
+        )
+
+        return {
+            "day_tr": d.isoformat(),
+            "range_tr": {
+                "start": start_tr.isoformat(),
+                "end": end_tr.isoformat(),
+            },
+            "range_utc_used_in_db": {
+                "start": start_utc.isoformat() + "Z",
+                "end": end_utc.isoformat() + "Z",
+            },
+            "total_matches": total,
+            "added_today": added_today,
+            "markets_today": {
+                "ms_1x2_ok": ms_ok,
+                "btts_ok": btts_ok,
+                "ou25_ok": ou25_ok,
+            },
+        }
+
+    except HTTPException:
+        # format hatası gibi durumlarda aynen geçir
+        raise
+    except Exception as e:
+        # Swagger'da hatayı detaylı gör: traceback + mesaj
+        tb = traceback.format_exc()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(e),
+                "traceback": tb,
+            },
+        )
 
 @app.get("/test-excel")
 def test_excel(user: str = Depends(authenticate)):
