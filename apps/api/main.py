@@ -604,7 +604,6 @@ def daily_summary(
                 "ou25_ok": ou25_ok,
             },
         }
-
     except HTTPException:
         # format hatası gibi durumlarda aynen geçir
         raise
