@@ -10,6 +10,7 @@ import os
 import secrets
 import pandas as pd
 import math
+import logging
 from typing import Optional
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -18,6 +19,8 @@ from sqlalchemy import create_engine, text, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import Column, Integer, String, Date, Float, DateTime
+
+logger = logging.getLogger(__name__)
 
 # -----------------------
 # DB setup
@@ -29,6 +32,8 @@ if not DATABASE_URL:
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+Base = declarative_base()
+
 def get_db():
     db = SessionLocal()
     try:
@@ -36,6 +41,12 @@ def get_db():
     finally:
         db.close()
 
+@app.on_event("startup")
+def run_migrations():
+    logger.info("DB migration başlatılıyor...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("DB migration tamamlandı.")
+    
 Base = declarative_base()
 
 class Match(Base):
