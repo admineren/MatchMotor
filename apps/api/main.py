@@ -133,7 +133,7 @@ def ensure_schema():
               updated_at TIMESTAMP DEFAULT NOW()
             );
         """))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_datetime ON matches(datetime);"))
+        
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_league ON matches(league);"))
 
         conn.execute(text("""
