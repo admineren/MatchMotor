@@ -31,6 +31,10 @@ ADMIN_PASS = os.getenv("ADMIN_PASS", "").strip()
 NOSY_API_KEY = os.getenv("NOSY_API_KEY", "").strip()
 NOSY_BASE_URL = os.getenv("NOSY_BASE_URL", "https://www.nosyapi.com/apiv2/service").strip().rstrip("/")
 
+# Bazı kullanıcılar env'e yanlışlıkla "Bearer xxx" yapıştırabiliyor.
+if NOSY_API_KEY.lower().startswith("bearer "):
+    NOSY_API_KEY = NOSY_API_KEY.split(" ", 1)[1].strip()
+
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
@@ -91,15 +95,36 @@ def to_dt(date_str: str, time_str: str) -> datetime:
     # Nosy: "2024-01-31" + "19:00:00"
     return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
 
-def nosy_headers() -> Dict[str, str]:
+def nosy_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not NOSY_API_KEY:
         raise HTTPException(status_code=500, detail="NOSY_API_KEY env missing")
-    return {"Authorization": f"Bearer {NOSY_API_KEY}"}
 
-def nosy_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     url = f"{NOSY_BASE_URL}/{path.lstrip('/')}"
+    params = params or {}
+
+    # 1) Authorization: Bearer <key>  (senin curl örneğin gibi)
     try:
-        r = requests.get(url, headers=nosy_headers(), params=params or {}, timeout=30)
+        r = requests.get(url, headers={"Authorization": f"Bearer {NOSY_API_KEY}"}, params=params, timeout=30)
+        if r.status_code != 401:
+            r.raise_for_status()
+            return r.json()
+    except requests.RequestException:
+        pass
+
+    # 2) X-NSYP: <key>  (bazı Nosy servislerinde çalışıyor)
+    try:
+        r = requests.get(url, headers={"X-NSYP": NOSY_API_KEY}, params=params, timeout=30)
+        if r.status_code != 401:
+            r.raise_for_status()
+            return r.json()
+    except requests.RequestException:
+        pass
+
+    # 3) Query param fallback: ?apiKey=<key>  (en “inatçı” çözüm)
+    try:
+        params2 = dict(params)
+        params2["apiKey"] = NOSY_API_KEY
+        r = requests.get(url, params=params2, timeout=30)
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
