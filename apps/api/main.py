@@ -160,14 +160,11 @@ def ensure_schema() -> None:
         conn.execute(text(f"""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_match_id
         ON match_odds(match_id);
-        
+        """))
+        conn.execute(text(f"""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_match_id
         ON match_results(match_id);
-        );
         """))
-        
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_odds_match_id ON match_odds(match_id);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_results_match_id ON match_results(match_id);"))
         
 ensure_schema()
 
