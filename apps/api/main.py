@@ -113,7 +113,6 @@ def init_db():
     # Indexler (idempotent). Postgres'te IF NOT EXISTS destekli.
     with engine.begin() as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_league ON matches(league);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_datetime ON matches(datetime);"))
 
 
 # -----------------------------
