@@ -80,19 +80,30 @@ def nosy_call(endpoint: str, *, params: Optional[Dict[str, Any]] = None, api_kin
     """
     if not NOSY_API_KEY:
         raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
+
+    # Bazı servisler apiID istiyor, bazıları istemeyebilir:
     api_id = _pick_api_id(api_kind)
-    if not api_id:
-        raise HTTPException(status_code=500, detail="NOSY_ODDS_API_ID veya NOSY_RESULTS_API_ID env eksik / yanlış.")
+
+    # Endpoint normalize
+    ep = endpoint.lstrip("/")
 
     # Check endpointi root base ister, diğerleri service base ister
-    is_check = endpoint.lstrip("/").startswith("nosy-service/check")
+    is_check = ep.startswith("nosy-service/check")
+
+    # Service çağrılarında endpoint yanlışlıkla "service/..." gelirse temizle
+    if (not is_check) and ep.startswith("service/"):
+        ep = ep[len("service/"):]
+
     base = NOSY_ROOT_BASE_URL if is_check else NOSY_SERVICE_BASE_URL
-    url = _join_url(base, endpoint)
+    # Env yanlışlıkla /service/service gelirse düzelt
+    base = base.replace("/service/service", "/service")
+    url = _join_url(base, ep)
 
     q = dict(params or {})
     # Nosy dokümanında param adları: apiKey + apiID
     q["apiKey"] = NOSY_API_KEY
-    q["apiID"] = api_id
+    if api_id:
+        q["apiID"] = api_id
 
     try:
         r = requests.get(url, params=q, timeout=30)
@@ -111,11 +122,6 @@ def nosy_call(endpoint: str, *, params: Optional[Dict[str, Any]] = None, api_kin
         return r.json()
     except Exception:
         raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
-
-# -----------------------------------------------------------------------------
-# DB init (cross-db schema: SQLite + Postgres)
-# -----------------------------------------------------------------------------
-engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 def ensure_schema() -> None:
     dialect = engine.dialect.name  # "sqlite" | "postgresql" | ...
@@ -262,49 +268,58 @@ def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
     return {"ok": True, "date": date, "upserted": upserted, "nosy": payload}
 
 @app.get("/nosy-opening-odds")
-def nosy_opening_odds(match_id: int = Query(...)):
+def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
     payload = nosy_call(
-        "service/bettable-matches/opening-odds",
+        "bettable-matches/opening-odds",
         params={"matchID": match_id},
         api_kind="odds",
     )
 
-    data = payload.get("data") or []
-    has_opening = len(data) > 0 or (payload.get("rowCount") or 0) > 0
-
-    if not has_opening:
-        return {
-            "ok": True,
-            "match_id": match_id,
-            "has_opening_odds": False,
-            "nosy": payload
-        }
-
-    # varsa DB'ye upsert
     now = dt.datetime.utcnow().isoformat()
+
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO match_odds (match_id, fetched_at, raw_json)
             VALUES (:match_id, :fetched_at, :raw_json)
             ON CONFLICT (match_id)
-            DO UPDATE SET fetched_at=EXCLUDED.fetched_at, raw_json=EXCLUDED.raw_json
-        """), {"match_id": match_id, "fetched_at": now, "raw_json": _dump_json(payload)})
+            DO UPDATE SET fetched_at = EXCLUDED.fetched_at,
+                          raw_json  = EXCLUDED.raw_json
+        """), {
+            "match_id": match_id,
+            "fetched_at": now,
+            "raw_json": _dump_json(payload),
+        })
 
     return {
         "ok": True,
         "match_id": match_id,
-        "has_opening_odds": True,
+        "saved": True,
         "nosy": payload
     }
 
-@app.get("/opening-odds-exists")
-def opening_odds_exists(match_id: int = Query(...)):
-    with engine.begin() as conn:
-        row = conn.execute(text("""
-            SELECT 1 FROM match_odds WHERE match_id = :match_id LIMIT 1
-        """), {"match_id": match_id}).fetchone()
+@app.get("/opening-odds-exists-nosy")
+def opening_odds_exists_nosy(match_id: int = Query(..., description="Nosy MatchID")):
+    """
+    DB'ye yazmadan, Nosy tarafında opening odds var mı diye kontrol eder.
+    Not: Bu çağrı da kredi harcar (endpoint'e istek atıldığı için).
+    """
+    payload = nosy_call(
+        "bettable-matches/opening-odds",
+        params={"matchID": match_id},
+        api_kind="odds",
+    )
 
-    return {"match_id": match_id, "exists_in_db": row is not None}
+    data = payload.get("data") or []
+    exists = (payload.get("status") == "success") and (len(data) > 0)
+
+    return {
+        "match_id": match_id,
+        "exists_in_nosy": exists,
+        "status": payload.get("status"),
+        "rowCount": payload.get("rowCount"),
+        "endpoint": payload.get("endpoint"),
+    }
+
 
 @app.get("/nosy-results")
 def nosy_results(match_id: int = Query(..., description="Nosy MatchID")):
@@ -318,6 +333,10 @@ def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID")):
         conn.execute(text("""
             INSERT INTO match_results(match_id, fetched_at, raw_json)
             VALUES(:match_id, :fetched_at, :raw_json)
+            ON CONFLICT (match_id)
+            DO UPDATE SET
+                fetched_at = EXCLUDED.fetched_at,
+                raw_json   = EXCLUDED.raw_json
         """), {
             "match_id": match_id,
             "fetched_at": dt.datetime.utcnow().isoformat(),
