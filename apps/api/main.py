@@ -1,293 +1,262 @@
 import os
-import json
-from typing import Optional, Dict, Any
+import datetime as dt
+from typing import Any, Dict, Optional
 
 import requests
-from fastapi import FastAPI, Depends, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.engine import Engine
 
-# ------------------------------------------------------------
-# ENV
-# ------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./matches.db")
-
+# -----------------------------------------------------------------------------
+# Config (ENV)
+# -----------------------------------------------------------------------------
+# NosyAPI
 NOSY_API_KEY = os.getenv("NOSY_API_KEY", "").strip()
-NOSY_BASE_URL = os.getenv("NOSY_BASE_URL", "https://www.nosyapi.com/apiv2").strip()
 
-# Ayrı apiID'ler
-NOSY_ODDS_API_ID = os.getenv("NOSY_ODDS_API_ID", "1881134").strip()      # odds / matches api
-NOSY_RESULTS_API_ID = os.getenv("NOSY_RESULTS_API_ID", "1881149").strip()  # results api
+# Nosy panelinde görünen Base URL zaten "/apiv2/service/" ile geliyor.
+# Buraya hem ".../service" hem ".../service/" yazsan da otomatik düzeltiyoruz.
+NOSY_BASE_URL = os.getenv("NOSY_BASE_URL", "https://www.nosyapi.com/apiv2/service/").strip()
 
-# Basit admin koruması (istersen kullan)
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+# İKİ ayrı API ID:
+# - ORAN / PROGRAM API (bettable-matches/* + nosy-service/check)
+# - SONUÇ API (bettable-result/* + nosy-service/check)
+NOSY_ODDS_API_ID = os.getenv("NOSY_ODDS_API_ID", "").strip()
+NOSY_RESULTS_API_ID = os.getenv("NOSY_RESULTS_API_ID", "").strip()
 
-# ------------------------------------------------------------
-# APP + DB
-# ------------------------------------------------------------
-app = FastAPI(title="MatchMotor API - Docs", version="0.1.0")
+# DB
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db").strip()
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    future=True,
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
+# Render Postgres bazen "postgres://" döner, SQLAlchemy "postgresql://" ister.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _normalize_base_url(base: str) -> str:
+    base = base.strip()
+    if not base:
+        return "https://www.nosyapi.com/apiv2/service/"
+    if not base.startswith("http"):
+        base = "https://" + base.lstrip("/")
+    if not base.endswith("/"):
+        base += "/"
+    return base
 
-def get_db() -> Session:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+NOSY_BASE_URL = _normalize_base_url(NOSY_BASE_URL)
 
+def _join_url(base: str, endpoint: str) -> str:
+    endpoint = endpoint.lstrip("/")
+    return base + endpoint
 
-def _safe_exec(conn, sql: str):
-    """Startup'ta DB yüzünden uygulama çökmesin diye."""
-    try:
-        conn.execute(text(sql))
-    except Exception as e:
-        # sadece log gibi davranalım; render loglarında görürsün
-        print(f"[WARN] SQL failed: {sql} -> {e}")
-
-
-@app.on_event("startup")
-def startup():
-    # Basit şema (senin yapına göre)
-    with engine.begin() as conn:
-        _safe_exec(
-            conn,
-            """
-            CREATE TABLE IF NOT EXISTS matches (
-                match_id INTEGER PRIMARY KEY,
-                date TEXT,
-                time TEXT,
-                datetime TEXT,
-                league TEXT,
-                country TEXT,
-                teams TEXT,
-                team1 TEXT,
-                team2 TEXT,
-                live_status INTEGER,
-                raw_json TEXT
-            );
-            """,
-        )
-
-        _safe_exec(
-            conn,
-            """
-            CREATE TABLE IF NOT EXISTS match_odds (
-                match_id INTEGER PRIMARY KEY,
-                opening_odds_json TEXT
-            );
-            """,
-        )
-
-        _safe_exec(
-            conn,
-            """
-            CREATE TABLE IF NOT EXISTS match_results (
-                match_id INTEGER PRIMARY KEY,
-                result_json TEXT
-            );
-            """,
-        )
-
-        # Indexler (hata verirse uygulama kapanmasın)
-        _safe_exec(conn, "CREATE INDEX IF NOT EXISTS idx_matches_league ON matches(league);")
-        _safe_exec(conn, "CREATE INDEX IF NOT EXISTS idx_results_match_id ON match_results(match_id);")
-
-
-# ------------------------------------------------------------
-# NOSY HELPERS
-# ------------------------------------------------------------
-def _normalize_nosy_base(base: str) -> str:
+def _pick_api_id(api_kind: str) -> str:
     """
-    NOSY_BASE_URL:
-      - https://www.nosyapi.com/apiv2        -> https://www.nosyapi.com/apiv2/service
-      - https://www.nosyapi.com/apiv2/service -> aynı kalır
+    api_kind:
+      - "odds"    -> NOSY_ODDS_API_ID
+      - "results" -> NOSY_RESULTS_API_ID
+      - "check"   -> odds yoksa results'a düşer
     """
-    b = base.rstrip("/")
-    if b.endswith("/service"):
-        return b
-    return b + "/service"
+    if api_kind == "odds":
+        return NOSY_ODDS_API_ID or NOSY_RESULTS_API_ID
+    if api_kind == "results":
+        return NOSY_RESULTS_API_ID or NOSY_ODDS_API_ID
+    return NOSY_ODDS_API_ID or NOSY_RESULTS_API_ID
 
-
-def nosy_get(path: str, api_id: Optional[str] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def nosy_call(endpoint: str, *, params: Optional[Dict[str, Any]] = None, api_kind: str = "odds") -> Dict[str, Any]:
+    """
+    NosyAPI'ye çağrı yapar.
+    - endpoint: 'nosy-service/check' gibi (base URL'e göre)
+    - api_kind: odds/results/check => doğru apiID seçimi
+    """
     if not NOSY_API_KEY:
-        raise HTTPException(status_code=500, detail="NOSY_API_KEY env boş.")
+        raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
+    api_id = _pick_api_id(api_kind)
+    if not api_id:
+        raise HTTPException(status_code=500, detail="NOSY_ODDS_API_ID / NOSY_RESULTS_API_ID env eksik.")
 
-    base = _normalize_nosy_base(NOSY_BASE_URL)
-    url = f"{base}/{path.lstrip('/')}"
+    url = _join_url(NOSY_BASE_URL, endpoint)
 
     q = dict(params or {})
     q["apiKey"] = NOSY_API_KEY
-    if api_id:
-        q["apiID"] = api_id
+    q["apiID"] = api_id
 
     try:
         r = requests.get(url, params=q, timeout=30)
-        r.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"NosyAPI bağlantı hatası: {e}")
+
+    # Nosy bazen 200 dönüp status=failure verir. O yüzden raise_for_status YAPMIYORUZ.
+    # Eğer gerçekten 4xx/5xx gelirse, onu aynen geri döndürelim:
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
+
+    try:
         return r.json()
-    except requests.HTTPError as e:
-        # Nosyapi çoğu zaman 404/401'i burada verir
-        raise HTTPException(status_code=502, detail=f"NosyAPI HTTP error: {e} for url: {r.url}")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"NosyAPI request failed: {e}")
+    except Exception:
+        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
 
+# -----------------------------------------------------------------------------
+# DB init (very simple schema)
+# -----------------------------------------------------------------------------
+engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-# ------------------------------------------------------------
-# BASIC ENDPOINTS
-# ------------------------------------------------------------
+def ensure_schema() -> None:
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS matches (
+            match_id      INTEGER PRIMARY KEY,
+            date          TEXT,
+            time          TEXT,
+            datetime      TEXT,
+            league        TEXT,
+            country       TEXT,
+            team1         TEXT,
+            team2         TEXT,
+            raw_json      TEXT
+        );
+        """))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS match_odds (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id      INTEGER,
+            fetched_at    TEXT,
+            raw_json      TEXT
+        );
+        """))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS match_results (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id      INTEGER,
+            fetched_at    TEXT,
+            raw_json      TEXT
+        );
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_datetime ON matches(datetime);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_odds_match_id ON match_odds(match_id);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_results_match_id ON match_results(match_id);"))
+
+ensure_schema()
+
+# -----------------------------------------------------------------------------
+# FastAPI
+# -----------------------------------------------------------------------------
+app = FastAPI(title="MatchMotor API", version="0.2.0")
+
 @app.get("/health")
 def health():
-    return {"ok": True}
-
+    return {"ok": True, "time": dt.datetime.utcnow().isoformat()}
 
 @app.get("/matches")
-def list_matches(limit: int = 50, db: Session = Depends(get_db)):
-    rows = db.execute(
-        text("SELECT match_id, datetime, league, teams, live_status FROM matches ORDER BY datetime DESC LIMIT :l"),
-        {"l": limit},
-    ).mappings().all()
+def list_matches(limit: int = 50):
+    limit = max(1, min(500, limit))
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT match_id, datetime, league, team1, team2
+            FROM matches
+            ORDER BY datetime DESC NULLS LAST
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
     return {"count": len(rows), "data": list(rows)}
 
-
 @app.post("/admin/matches/clear")
-def clear_matches(x_admin_token: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
-    if ADMIN_TOKEN and x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized (ADMIN_TOKEN).")
+def clear_matches():
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM match_odds;"))
+        conn.execute(text("DELETE FROM match_results;"))
+        conn.execute(text("DELETE FROM matches;"))
+    return {"ok": True}
 
-    db.execute(text("DELETE FROM match_results"))
-    db.execute(text("DELETE FROM match_odds"))
-    db.execute(text("DELETE FROM matches"))
-    db.commit()
-    return {"ok": True, "message": "Cleared."}
-
-
-# ------------------------------------------------------------
-# NOSY ENDPOINTS
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Nosy passthrough endpoints
+# -----------------------------------------------------------------------------
 @app.get("/nosy-check")
 def nosy_check():
-    """
-    Nosy servis durumu / API key kontrolü.
-    Not: check endpointi bazı paketlerde farklı davranabiliyor.
-    Bu yüzden önce RESULTS apiID ile dener, olmazsa ODDS apiID ile dener.
-    """
-    last_err = None
-
-    for api_id in [NOSY_RESULTS_API_ID, NOSY_ODDS_API_ID]:
-        try:
-            return nosy_get("/nosy-service/check", api_id=api_id)
-        except HTTPException as e:
-            last_err = e.detail
-
-    raise HTTPException(status_code=502, detail=f"Nosy check failed for both apiIDs. Last error: {last_err}")
-
+    return nosy_call("nosy-service/check", api_kind="check")
 
 @app.get("/nosy-matches-by-date")
-def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD"), db: Session = Depends(get_db)):
-    """
-    Endpoint: bettable-matches/date
-    Bu endpointten gelen maçları DB'ye upsert ederiz.
-    """
-    payload = nosy_get("/bettable-matches/date", api_id=NOSY_ODDS_API_ID, params={"date": date})
-
-    # beklenen format: {"status": "...", "data": [ {MatchID...}, ... ] } gibi
+def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
+    payload = nosy_call("bettable-matches/date", params={"date": date}, api_kind="odds")
     data = payload.get("data") or []
     upserted = 0
 
-    for item in data:
-        # Nosy bazen MatchID, bazen match_id döndürebilir
-        match_id = item.get("MatchID") or item.get("match_id") or item.get("matchId")
-        if not match_id:
-            continue
+    with engine.begin() as conn:
+        for item in data:
+            try:
+                match_id = int(item.get("MatchID") or item.get("match_id") or item.get("matchId"))
+            except Exception:
+                continue
 
-        dt = item.get("DateTime") or item.get("datetime") or item.get("Date")  # yedek
-        league = item.get("League")
-        country = item.get("Country")
-        teams = item.get("Teams")
-        team1 = item.get("Team1")
-        team2 = item.get("Team2")
-        live_status = item.get("LiveStatus")
+            dt_val = item.get("DateTime") or item.get("datetime") or item.get("Date") or ""
+            time_val = item.get("Time") or item.get("time") or ""
+            date_val = item.get("Date") or item.get("date") or ""
+            league = item.get("League") or item.get("league") or ""
+            country = item.get("Country") or item.get("country") or ""
+            team1 = item.get("Team1") or item.get("team1") or ""
+            team2 = item.get("Team2") or item.get("team2") or ""
 
-        db.execute(
-            text(
-                """
-                INSERT INTO matches (match_id, date, time, datetime, league, country, teams, team1, team2, live_status, raw_json)
-                VALUES (:match_id, :date, :time, :datetime, :league, :country, :teams, :team1, :team2, :live_status, :raw_json)
+            conn.execute(text("""
+                INSERT INTO matches(match_id, date, time, datetime, league, country, team1, team2, raw_json)
+                VALUES(:match_id, :date, :time, :datetime, :league, :country, :team1, :team2, :raw_json)
                 ON CONFLICT(match_id) DO UPDATE SET
+                    date=excluded.date,
+                    time=excluded.time,
                     datetime=excluded.datetime,
                     league=excluded.league,
                     country=excluded.country,
-                    teams=excluded.teams,
                     team1=excluded.team1,
                     team2=excluded.team2,
-                    live_status=excluded.live_status,
                     raw_json=excluded.raw_json
-                """
-            ),
-            {
-                "match_id": int(match_id),
-                "date": item.get("Date"),
-                "time": item.get("Time"),
-                "datetime": dt,
-                "league": league,
-                "country": country,
-                "teams": teams,
-                "team1": team1,
-                "team2": team2,
-                "live_status": live_status if live_status is None else int(live_status),
-                "raw_json": json.dumps(item, ensure_ascii=False),
-            },
-        )
-        upserted += 1
+            """), {
+                "match_id": match_id,
+                "date": str(date_val),
+                "time": str(time_val),
+                "datetime": str(dt_val),
+                "league": str(league),
+                "country": str(country),
+                "team1": str(team1),
+                "team2": str(team2),
+                "raw_json": str(item),
+            })
+            upserted += 1
 
-    db.commit()
-    return {"ok": True, "date": date, "upserted": upserted, "nosy": payload.get("status") or payload.get("message")}
-
+    return {"ok": True, "date": date, "upserted": upserted, "nosy": payload}
 
 @app.get("/nosy-opening-odds")
-def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID (ör: 151738)"), db: Session = Depends(get_db)):
-    """
-    Endpoint: bettable-matches/opening-odds
-    """
-    payload = nosy_get("/bettable-matches/opening-odds", api_id=NOSY_ODDS_API_ID, params={"match_id": match_id})
+def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
+    payload = nosy_call("bettable-matches/opening-odds", params={"match_id": match_id}, api_kind="odds")
 
-    # DB'ye yaz
-    db.execute(
-        text(
-            """
-            INSERT INTO match_odds (match_id, opening_odds_json)
-            VALUES (:match_id, :j)
-            ON CONFLICT(match_id) DO UPDATE SET opening_odds_json=excluded.opening_odds_json
-            """
-        ),
-        {"match_id": match_id, "j": json.dumps(payload, ensure_ascii=False)},
-    )
-    db.commit()
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO match_odds(match_id, fetched_at, raw_json)
+            VALUES(:match_id, :fetched_at, :raw_json)
+        """), {
+            "match_id": match_id,
+            "fetched_at": dt.datetime.utcnow().isoformat(),
+            "raw_json": str(payload),
+        })
+
     return payload
-
 
 @app.get("/nosy-result-details")
-def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID (ör: 151738)"), db: Session = Depends(get_db)):
-    """
-    Endpoint: bettable-result/details
-    """
-    payload = nosy_get("/bettable-result/details", api_id=NOSY_RESULTS_API_ID, params={"match_id": match_id})
+def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID")):
+    payload = nosy_call("bettable-result/details", params={"match_id": match_id}, api_kind="results")
 
-    db.execute(
-        text(
-            """
-            INSERT INTO match_results (match_id, result_json)
-            VALUES (:match_id, :j)
-            ON CONFLICT(match_id) DO UPDATE SET result_json=excluded.result_json
-            """
-        ),
-        {"match_id": match_id, "j": json.dumps(payload, ensure_ascii=False)},
-    )
-    db.commit()
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO match_results(match_id, fetched_at, raw_json)
+            VALUES(:match_id, :fetched_at, :raw_json)
+        """), {
+            "match_id": match_id,
+            "fetched_at": dt.datetime.utcnow().isoformat(),
+            "raw_json": str(payload),
+        })
+
     return payload
+
+@app.get("/nosy-results")
+def nosy_results(match_id: int = Query(..., description="Nosy MatchID")):
+    return nosy_call("bettable-result", params={"match_id": match_id}, api_kind="results")
