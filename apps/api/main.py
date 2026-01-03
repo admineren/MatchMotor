@@ -127,11 +127,6 @@ def init_db() -> None:
         except Exception as e:
             logger.warning("idx_matches_league create failed: %s", e)
 
-        try:
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_datetime ON matches(datetime);"))
-        except Exception as e:
-            logger.warning("idx_matches_datetime create failed: %s", e)
-
 
 @app.on_event("startup")
 def _startup():
