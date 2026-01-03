@@ -259,19 +259,34 @@ def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
 
 @app.get("/nosy-opening-odds")
 def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
-    payload = nosy_call("bettable-matches/opening-odds", params={"matchID": match_id}, api_kind="odds")
+    payload = nosy_call(
+        "bettable-matches/opening-odds",
+        params={"matchID": match_id},
+        api_kind="odds",
+    )
+
+    now = dt.datetime.utcnow().isoformat()
 
     with engine.begin() as conn:
         conn.execute(text("""
-            INSERT INTO match_odds(match_id, fetched_at, raw_json)
-            VALUES(:match_id, :fetched_at, :raw_json)
+            INSERT INTO match_odds (match_id, fetched_at, raw_json)
+            VALUES (:match_id, :fetched_at, :raw_json)
+            ON CONFLICT (match_id)
+            DO UPDATE SET fetched_at = EXCLUDED.fetched_at,
+                          raw_json  = EXCLUDED.raw_json
         """), {
             "match_id": match_id,
-            "fetched_at": dt.datetime.utcnow().isoformat(),
+            "fetched_at": now,
             "raw_json": _dump_json(payload),
         })
 
-    return payload
+    return {
+        "ok": True,
+        "match_id": match_id,
+        "saved": True,
+        "nosy": payload
+    }
+
 
 @app.get("/nosy-results")
 def nosy_results(match_id: int = Query(..., description="Nosy MatchID")):
