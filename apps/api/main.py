@@ -158,9 +158,11 @@ def ensure_schema() -> None:
         );
         """))
         conn.execute(text("DROP INDEX IF EXISTS idx_odds_match_id;"))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_match_id ON match_odds(match_id);"))
+        conn.execute(text("DROP INDEX IF EXISTS uq_match_odds_match_id;"))
+        conn.execute(text("CREATE UNIQUE INDEX uq_match_odds_match_id ON match_odds(match_id);"))
         conn.execute(text("DROP INDEX IF EXISTS idx_results_match_id;"))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_match_id ON match_results(match_id);"))
+        conn.execute(text("DROP INDEX IF EXISTS uq_match_results_match_id;"))
+        conn.execute(text("CREATE UNIQUE INDEX uq_match_results_match_id ON match_results(match_id);"))
 ensure_schema()
 
 # -----------------------------------------------------------------------------
@@ -260,35 +262,49 @@ def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
     return {"ok": True, "date": date, "upserted": upserted, "nosy": payload}
 
 @app.get("/nosy-opening-odds")
-def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
+def nosy_opening_odds(match_id: int = Query(...)):
     payload = nosy_call(
-        "bettable-matches/opening-odds",
+        "service/bettable-matches/opening-odds",
         params={"matchID": match_id},
         api_kind="odds",
     )
 
-    now = dt.datetime.utcnow().isoformat()
+    data = payload.get("data") or []
+    has_opening = len(data) > 0 or (payload.get("rowCount") or 0) > 0
 
+    if not has_opening:
+        return {
+            "ok": True,
+            "match_id": match_id,
+            "has_opening_odds": False,
+            "nosy": payload
+        }
+
+    # varsa DB'ye upsert
+    now = dt.datetime.utcnow().isoformat()
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO match_odds (match_id, fetched_at, raw_json)
             VALUES (:match_id, :fetched_at, :raw_json)
             ON CONFLICT (match_id)
-            DO UPDATE SET fetched_at = EXCLUDED.fetched_at,
-                          raw_json  = EXCLUDED.raw_json
-        """), {
-            "match_id": match_id,
-            "fetched_at": now,
-            "raw_json": _dump_json(payload),
-        })
+            DO UPDATE SET fetched_at=EXCLUDED.fetched_at, raw_json=EXCLUDED.raw_json
+        """), {"match_id": match_id, "fetched_at": now, "raw_json": _dump_json(payload)})
 
     return {
         "ok": True,
         "match_id": match_id,
-        "saved": True,
+        "has_opening_odds": True,
         "nosy": payload
     }
 
+@app.get("/opening-odds-exists")
+def opening_odds_exists(match_id: int = Query(...)):
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT 1 FROM match_odds WHERE match_id = :match_id LIMIT 1
+        """), {"match_id": match_id}).fetchone()
+
+    return {"match_id": match_id, "exists_in_db": row is not None}
 
 @app.get("/nosy-results")
 def nosy_results(match_id: int = Query(..., description="Nosy MatchID")):
@@ -309,4 +325,3 @@ def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID")):
         })
 
     return payload
-    
