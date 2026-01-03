@@ -493,6 +493,19 @@ def sync_results(
         "creditUsed": payload.get("creditUsed"),
     }
 
+@app.get("/nosy-check")
+def nosy_check():
+    # Dokümanda gördüğün endpoint:
+    # /nosy-service/check
+    return nosy_get("/nosy-service/check")
+
+
+@app.get("/nosy-opening-odds")
+def nosy_opening_odds():
+    # Senin kullandığın endpoint:
+    # /bettable-matches/opening-odds
+    return nosy_get("/bettable-matches/opening-odds")
+
 # ------------------------
 # Protected OpenAPI + Docs
 # ------------------------
