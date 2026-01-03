@@ -169,12 +169,15 @@ def ensure_schema() -> None:
         conn.execute(text("DROP INDEX IF EXISTS idx_results_match_id;"))
         conn.execute(text("DROP INDEX IF EXISTS uq_match_results_match_id;"))
         conn.execute(text("CREATE UNIQUE INDEX uq_match_results_match_id ON match_results(match_id);"))
-ensure_schema()
 
 # -----------------------------------------------------------------------------
 # FastAPI
 # -----------------------------------------------------------------------------
 app = FastAPI(title="MatchMotor API", version="0.3.0")
+
+@app.on_event("startup")
+def startup():
+    ensure_schema()
 
 @app.get("/health")
 def health():
