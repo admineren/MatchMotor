@@ -1,60 +1,102 @@
 import os
+import json
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Any, Dict, Optional, List
 
-import json
-import urllib.parse
-import urllib.request
-import urllib.error
-
-from fastapi import FastAPI, Depends, HTTPException
+import requests
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.engine import Engine
+from starlette.status import HTTP_401_UNAUTHORIZED
+
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    Float,
+    Text,
+    text,
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 
-# ------------------
+# -----------------------------
 # LOGGING
-# ------------------
+# -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("matchmotor")
 
 
-# ------------------
+# -----------------------------
 # ENV
-# ------------------
+# -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-ADMIN_USER = os.getenv("ADMIN_USER", "").strip()
-ADMIN_PASS = os.getenv("ADMIN_PASS", "").strip()
+ADMIN_USER = os.getenv("ADMIN_USER", "admin").strip()
+ADMIN_PASS = os.getenv("ADMIN_PASS", "admin").strip()
 
 NOSY_API_KEY = os.getenv("NOSY_API_KEY", "").strip()
-NOSY_BASE_URL = os.getenv("NOSY_BASE_URL", "https://www.nosyapi.com/apiv2").strip()
-NOSY_ODDS_API_ID = os.getenv("NOSY_ODDS_API_ID", "").strip()
-NOSY_RESULTS_API_ID = os.getenv("NOSY_RESULTS_API_ID", "").strip()
+NOSY_BASE_URL = os.getenv("NOSY_BASE_URL", "https://www.nosyapi.com/apiv2/service").strip()
 
-# NOSY_BASE_URL varsayilan olarak: https://www.nosyapi.com/apiv2
-# Servis endpointleri icin otomatik olarak /service ekliyoruz.
-NOSY_ROOT_BASE_URL = NOSY_BASE_URL.rstrip("/")
-NOSY_SERVICE_BASE_URL = os.getenv(
-    "NOSY_SERVICE_BASE_URL",
-    f"{NOSY_ROOT_BASE_URL}/service"
-).strip().rstrip("/")
+NOSY_ODDS_API_ID = os.getenv("NOSY_ODDS_API_ID", "").strip()      # örn: 1881134
+NOSY_RESULTS_API_ID = os.getenv("NOSY_RESULTS_API_ID", "").strip()  # örn: 1881149
+
+# Bazı kullanıcılar yanlışlıkla "Bearer xxx" yapıştırabiliyor:
+if NOSY_API_KEY.lower().startswith("bearer "):
+    NOSY_API_KEY = NOSY_API_KEY.split(" ", 1)[1].strip()
+
+# base url normalize
+NOSY_BASE_URL = NOSY_BASE_URL.rstrip("/")
+# kullanıcı bazen https://www.nosyapi.com/apiv2 yazarsa düzeltelim:
+if NOSY_BASE_URL.endswith("/apiv2"):
+    NOSY_BASE_URL = NOSY_BASE_URL + "/service"
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
+if not NOSY_API_KEY:
+    logger.warning("NOSY_API_KEY is empty. Nosy endpoints will fail until you set it.")
 
-# ------------------
+if not NOSY_ODDS_API_ID:
+    logger.warning("NOSY_ODDS_API_ID is empty. Odds endpoints will fail until you set it.")
+
+if not NOSY_RESULTS_API_ID:
+    logger.warning("NOSY_RESULTS_API_ID is empty. Results endpoints will fail until you set it.")
+
+
+# -----------------------------
 # DB
-# ------------------
-engine: Engine = create_engine(
+# -----------------------------
+engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
 )
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Match(Base):
+    __tablename__ = "matches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    match_id = Column(Integer, unique=True, index=True, nullable=False)  # Nosy MatchID
+    datetime = Column(DateTime, index=True, nullable=True)
+
+    league = Column(String(255), index=True, nullable=True)
+    country = Column(String(255), nullable=True)
+
+    team1 = Column(String(255), nullable=True)
+    team2 = Column(String(255), nullable=True)
+
+    home_win = Column(Float, nullable=True)
+    draw = Column(Float, nullable=True)
+    away_win = Column(Float, nullable=True)
+
+    under25 = Column(Float, nullable=True)
+    over25 = Column(Float, nullable=True)
+
+    raw_json = Column(Text, nullable=True)
 
 
 def get_db():
@@ -65,233 +107,257 @@ def get_db():
         db.close()
 
 
-# ------------------
+def init_db():
+    Base.metadata.create_all(bind=engine)
+
+    # Indexler (idempotent). Postgres'te IF NOT EXISTS destekli.
+    with engine.begin() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_league ON matches(league);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_datetime ON matches(datetime);"))
+
+
+# -----------------------------
 # AUTH
-# ------------------
+# -----------------------------
 security = HTTPBasic()
 
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    if not ADMIN_USER or not ADMIN_PASS:
-        raise HTTPException(status_code=500, detail="ADMIN_USER/ADMIN_PASS not set")
-    if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    ok = (credentials.username == ADMIN_USER and credentials.password == ADMIN_PASS)
+    if not ok:
+        raise HTTPException(
+            status_code=HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
     return True
 
 
-# ------------------
+# -----------------------------
+# NOSY HELPERS
+# -----------------------------
+class NosyError(Exception):
+    pass
+
+
+def nosy_request(api_id: str, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Nosy formatı:  GET {BASE}/{endpoint}?apiKey=...&apiID=...&...
+    endpoint örn: "nosy-service/check" veya "bettable-matches/opening-odds"
+    """
+    if not api_id:
+        raise NosyError("api_id is empty")
+    if not NOSY_API_KEY:
+        raise NosyError("NOSY_API_KEY is empty")
+
+    endpoint = endpoint.lstrip("/")
+    url = f"{NOSY_BASE_URL}/{endpoint}"
+
+    q = {}
+    if params:
+        q.update(params)
+
+    # Nosy dokümanındaki query paramlar:
+    q["apiKey"] = NOSY_API_KEY
+    q["apiID"] = api_id
+
+    logger.info(f"Nosy GET {url} params={ {k:v for k,v in q.items() if k.lower()!='apikey'} }")
+
+    r = requests.get(url, params=q, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    # Bazı endpointler status=failure dönebiliyor ama HTTP 200
+    return data
+
+
+def nosy_request_with_matchid_fallback(api_id: str, endpoint: str, match_id: int) -> Dict[str, Any]:
+    """
+    Bazı Nosy endpointleri match param adını farklı bekliyor:
+    - matchID
+    - MatchID
+    - matchId (nadiren)
+    Bu yüzden sırayla deneriz.
+    """
+    tried = []
+    for key in ("matchID", "MatchID", "matchId", "match_id"):
+        tried.append(key)
+        data = nosy_request(api_id, endpoint, params={key: match_id})
+        msg = (data.get("message") or "").lower()
+        msgtr = (data.get("messageTR") or "").lower()
+
+        # "Match ID not found" geldiyse diğer key'i dene
+        if "match id not found" in msg or "match id bulunamadı" in msgtr:
+            continue
+        return data
+
+    # Hepsi aynı hatayı verdiyse son datayı döndür
+    return data  # type: ignore
+
+
+# -----------------------------
 # APP
-# ------------------
-app = FastAPI(title="MatchMotor API", version="0.1.0")
-
-
-# ------------------
-# SCHEMA / INIT
-# ------------------
-def ensure_schema():
-    """
-    Basit schema: matches tablosu.
-    Not: Daha once 'datetime' index hatasi almistin.
-    Bu versiyonda datetime index zorunlu degil; varsa kendin ekleyebilirsin.
-    """
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS matches (
-                    id SERIAL PRIMARY KEY,
-                    league TEXT,
-                    home TEXT,
-                    away TEXT,
-                    ht_score TEXT,
-                    ft_score TEXT,
-                    ms1 NUMERIC,
-                    ms0 NUMERIC,
-                    ms2 NUMERIC,
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
-                """
-            )
-        )
-
-        # Sadece lig indexi (sende bu kalacak demistin)
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_league ON matches(league);"))
+# -----------------------------
+app = FastAPI(openapi_url="/openapi.json", title="MatchMotor API - Docs")
 
 
 @app.on_event("startup")
 def on_startup():
-    ensure_schema()
-    logger.info("Startup complete")
+    init_db()
+    logger.info("DB initialized")
 
 
-# ------------------
-# HEALTH
-# ------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": datetime.utcnow().isoformat()}
-
-
-# ------------------
-# MATCHES (DB)
-# ------------------
-@app.get("/matches")
-def list_matches(limit: int = 50, offset: int = 0):
-    with engine.begin() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT id, league, home, away, ht_score, ft_score, ms1, ms0, ms2, created_at
-                FROM matches
-                ORDER BY id DESC
-                LIMIT :limit OFFSET :offset
-                """
-            ),
-            {"limit": limit, "offset": offset},
-        ).mappings().all()
-    return {"count": len(rows), "data": list(rows)}
-
-
-@app.post("/admin/matches/clear")
-def clear_matches(_: bool = Depends(require_admin)):
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE matches RESTART IDENTITY;"))
     return {"ok": True}
 
 
-# ------------------
-# NOSY HELPERS
-# ------------------
-def _nosy_build_url(path: str, *, use_service: bool) -> str:
-    """
-    NosyAPI iki farkli base kullaniyor:
-      - Root:   https://www.nosyapi.com/apiv2            (or: /nosy-service/check)
-      - Service:https://www.nosyapi.com/apiv2/service    (or: /bettable-matches/..., /bettable-result/...)
-    """
-    base = NOSY_SERVICE_BASE_URL if use_service else NOSY_ROOT_BASE_URL
-    p = path.strip()
-    if not p.startswith("/"):
-        p = "/" + p
-    return f"{base}{p}"
+@app.get("/matches")
+def list_matches(limit: int = 50, db: Session = Depends(get_db)):
+    rows: List[Match] = db.query(Match).order_by(Match.datetime.desc().nullslast()).limit(limit).all()
+    return [
+        {
+            "match_id": r.match_id,
+            "datetime": r.datetime.isoformat() if r.datetime else None,
+            "league": r.league,
+            "country": r.country,
+            "team1": r.team1,
+            "team2": r.team2,
+            "home_win": r.home_win,
+            "draw": r.draw,
+            "away_win": r.away_win,
+            "under25": r.under25,
+            "over25": r.over25,
+        }
+        for r in rows
+    ]
 
 
-def _http_get_json(url: str, *, headers: Dict[str, str], timeout: int) -> Tuple[int, Dict[str, Any]]:
-    req = urllib.request.Request(url, headers=headers, method="GET")
+@app.post("/admin/matches/clear")
+def clear_matches(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    db.query(Match).delete()
+    db.commit()
+    return {"ok": True}
+
+
+# -----------------------------
+# NOSY ENDPOINTS
+# -----------------------------
+@app.get("/nosy-check")
+def nosy_check():
+    """
+    Nosy servis durumu / API key kontrolü.
+    Dokümandaki endpoint: /nosy-service/check (service altında).
+    """
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = getattr(resp, "status", 200)
-            raw = resp.read().decode("utf-8", errors="replace")
-            return status, json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        status = e.code
-        raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
-        try:
-            data = json.loads(raw) if raw else {}
-        except Exception:
-            data = {"error": raw or str(e)}
-        return status, data
+        return nosy_request(NOSY_ODDS_API_ID or NOSY_RESULTS_API_ID, "nosy-service/check")
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"NosyAPI HTTP error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"NosyAPI error: {e}")
 
 
-def nosy_get(
-    path: str,
-    *,
-    api_id: str = "",
-    use_service: bool = True,
-    params: Optional[Dict[str, Any]] = None,
-    timeout: int = 20,
-) -> Dict[str, Any]:
+@app.get("/nosy-opening-odds")
+def nosy_opening_odds(
+    match_id: int = Query(..., description="Nosy MatchID (ör: 151738)"),
+):
     """
-    NosyAPI request helper.
-
-    Notlar:
-    - Bazi endpointler apiKey + apiID query param bekliyor.
-    - Bazi orneklerde Bearer ile de calisabiliyor. Biz 401 olursa fallback yapiyoruz.
+    Açılış oranları:
+    Nosy endpoint: /bettable-matches/opening-odds
+    ÖNEMLİ: Parametre adı Nosy tarafında genelde MatchID / matchID.
     """
-    if not NOSY_API_KEY:
-        raise RuntimeError("NOSY_API_KEY is not set")
+    try:
+        return nosy_request_with_matchid_fallback(NOSY_ODDS_API_ID, "bettable-matches/opening-odds", match_id)
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"NosyAPI HTTP error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"NosyAPI error: {e}")
 
-    base_url = _nosy_build_url(path, use_service=use_service)
 
-    q = dict(params or {})
-    q.setdefault("apiKey", NOSY_API_KEY)
-    if api_id:
-        q.setdefault("apiID", api_id)
+@app.get("/nosy-result-details")
+def nosy_result_details(
+    match_id: int = Query(..., description="Nosy MatchID (ör: 151738)"),
+):
+    """
+    Maç sonucu detayları (result API):
+    Dokümanda: /bettable-result/details
+    """
+    try:
+        return nosy_request_with_matchid_fallback(NOSY_RESULTS_API_ID, "bettable-result/details", match_id)
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"NosyAPI HTTP error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"NosyAPI error: {e}")
 
-    url = f"{base_url}?{urllib.parse.urlencode(q)}" if q else base_url
 
-    # 1) Once query-param ile dene
-    status, data = _http_get_json(url, headers={"accept": "application/json"}, timeout=timeout)
+@app.get("/nosy-matches-by-date")
+def nosy_matches_by_date(
+    date: str = Query(..., description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    """
+    Tarihe göre maç listesi:
+    Dokümanda: /bettable-matches/date
+    Bu endpoint'ten gelen MatchID'leri DB'ye upsert ederiz.
+    """
+    try:
+        # Nosy bazı endpointlerde parametre adı "date" ya da "Date" olabiliyor.
+        data = nosy_request(NOSY_ODDS_API_ID, "bettable-matches/date", params={"date": date})
+    except Exception:
+        # fallback dene
+        data = nosy_request(NOSY_ODDS_API_ID, "bettable-matches/date", params={"Date": date})
 
-    # 2) 401 ise Bearer dene
-    if status == 401:
-        status, data = _http_get_json(
-            url,
-            headers={"accept": "application/json", "Authorization": f"Bearer {NOSY_API_KEY}"},
-            timeout=timeout,
-        )
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        items = data["data"]
+        upserted = 0
+        for it in items:
+            mid = it.get("MatchID") or it.get("matchID") or it.get("matchId")
+            if not mid:
+                continue
 
-    # 3) Hala 401 ise X-API-Key
-    if status == 401:
-        status, data = _http_get_json(
-            url,
-            headers={"accept": "application/json", "X-API-Key": NOSY_API_KEY},
-            timeout=timeout,
-        )
+            # datetime parse
+            dt = None
+            dt_str = it.get("DateTime") or it.get("datetime") or it.get("DateTimeStr")
+            if isinstance(dt_str, str) and dt_str.strip():
+                # ör: "2024-02-01 23:00:00"
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        dt = datetime.strptime(dt_str.strip(), fmt)
+                        break
+                    except ValueError:
+                        pass
 
-    if status >= 400:
-        raise HTTPException(status_code=502, detail=f"NosyAPI request failed: HTTP {status} - {data}")
+            row = db.query(Match).filter(Match.match_id == int(mid)).one_or_none()
+            if row is None:
+                row = Match(match_id=int(mid))
+                db.add(row)
+
+            row.datetime = dt
+            row.league = it.get("League")
+            row.country = it.get("Country")
+            row.team1 = it.get("Team1")
+            row.team2 = it.get("Team2")
+
+            # bazı listelerde odds alanları direkt geliyor
+            row.home_win = _to_float(it.get("HomeWin"))
+            row.draw = _to_float(it.get("Draw"))
+            row.away_win = _to_float(it.get("AwayWin"))
+            row.under25 = _to_float(it.get("Under25"))
+            row.over25 = _to_float(it.get("Over25"))
+
+            row.raw_json = json.dumps(it, ensure_ascii=False)
+            upserted += 1
+
+        db.commit()
+        return {"ok": True, "date": date, "count": len(items), "upserted": upserted, "nosy": data}
 
     return data
 
 
-# ------------------
-# NOSY ENDPOINTS
-# ------------------
-@app.get("/nosy-check")
-def nosy_check():
-    """
-    Nosy servis durumu / API key kontrolu.
-    Dokumandaki endpoint root altinda:
-      /nosy-service/check
-    """
-    api_id = NOSY_RESULTS_API_ID or NOSY_ODDS_API_ID
-    return nosy_get("/nosy-service/check", api_id=api_id, use_service=False)
-
-
-@app.get("/nosy-opening-odds")
-def nosy_opening_odds(match_id: Optional[int] = None):
-    """
-    Acilis oranlari.
-    Endpoint (service altinda):
-      /bettable-matches/opening-odds
-
-    "Match ID not found" alirsan => match_id gondermen lazim.
-    """
-    params: Dict[str, Any] = {}
-    if match_id is not None:
-        params["matchID"] = match_id
-
-    return nosy_get(
-        "/bettable-matches/opening-odds",
-        api_id=NOSY_ODDS_API_ID,
-        use_service=True,
-        params=params or None,
-    )
-
-
-@app.get("/nosy-result")
-def nosy_result(match_id: Optional[int] = None):
-    """
-    Mac sonucu endpointi (sende 1881149 RESULTS API ID).
-    Endpoint ismi dokumana gore degisebilir; burada en temel "bettable-result"i koyduk.
-    """
-    params: Dict[str, Any] = {}
-    if match_id is not None:
-        params["matchID"] = match_id
-
-    return nosy_get(
-        "/bettable-result",
-        api_id=NOSY_RESULTS_API_ID,
-        use_service=True,
-        params=params or None,
-    )
+def _to_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
