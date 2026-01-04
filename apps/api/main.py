@@ -326,32 +326,41 @@ def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
     )
 
     now = dt.datetime.utcnow().isoformat()
+    raw = _dump_json(payload)
 
     with engine.begin() as conn:
         try:
-            conn.execute(text("""
-            INSERT INTO match_odds (match_id, fetched_at, raw_json)
-            VALUES (:match_id, :fetched_at, :raw_json)
-            ON CONFLICT (match_id)
-            DO UPDATE SET fetched_at = EXCLUDED.fetched_at,
-                          raw_json  = EXCLUDED.raw_json
-        """), {
-            "match_id": match_id,
-            "fetched_at": now,
-            "raw_json": _dump_json(payload),
-        })
+            conn.execute(
+                text("""
+                    INSERT INTO match_odds (match_id, fetched_at, raw_json, payload)
+                    VALUES (%(match_id)s, %(fetched_at)s, %(raw_json)s, %(payload)s)
+                    ON CONFLICT (match_id)
+                    DO UPDATE SET
+                        fetched_at = EXCLUDED.fetched_at,
+                        raw_json   = EXCLUDED.raw_json,
+                        payload    = EXCLUDED.payload
+                """),
+                {
+                    "match_id": match_id,
+                    "fetched_at": now,
+                    "raw_json": raw,
+                    "payload": raw,
+                },
+            )
         except Exception as e:
-            raise HTTPException(status_code=500, detail={
-                "where": "db_upsert_match_odds",
-                "error": str(e),
-            })
-
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "where": "db_upsert_match_odds",
+                    "error": str(e),
+                },
+            )
 
     return {
         "ok": True,
         "match_id": match_id,
         "saved": True,
-        "nosy": payload
+        "nosy": payload,
     }
 
 @app.get("/opening-odds-exists-nosy")
