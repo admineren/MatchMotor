@@ -171,6 +171,37 @@ def ensure_schema() -> None:
             raw_json      TEXT
         );
         """))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS matches (
+            id BIGSERIAL PRIMARY KEY,
+
+            nosy_match_id BIGINT NOT NULL UNIQUE,
+
+            datetime TIMESTAMP NOT NULL,
+            league TEXT NOT NULL,
+            team1 TEXT NOT NULL,
+            team2 TEXT NOT NULL,
+
+            ms1 NUMERIC,
+            ms0 NUMERIC,
+            ms2 NUMERIC,
+            alt25 NUMERIC,
+            ust25 NUMERIC,
+
+            ht_home INT,
+            ht_away INT,
+            ft_home INT,
+            ft_away INT,
+
+            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """))
+
+            conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_matches_datetime
+            ON matches(datetime);
+            """))
         
         # match_id için upsert (ON CONFLICT) çalışsın diye UNIQUE index
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_match_id ON match_odds(match_id);"))
