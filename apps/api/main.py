@@ -259,10 +259,11 @@ def health():
 @app.get("/matches")
 def list_matches(limit: int = 50):
     limit = max(1, min(500, limit))
+
     with engine.begin() as conn:
         rows = conn.execute(text("""
             SELECT
-                match_id,
+                id,
                 match_datetime,
                 league,
                 team1,
