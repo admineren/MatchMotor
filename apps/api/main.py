@@ -261,12 +261,21 @@ def list_matches(limit: int = 50):
     limit = max(1, min(500, limit))
     with engine.begin() as conn:
         rows = conn.execute(text("""
-            SELECT match_id, datetime, league, team1, team2
+            SELECT
+                match_id,
+                match_datetime,
+                league,
+                team1,
+                team2
             FROM matches
-            ORDER BY datetime DESC NULLS LAST
+            ORDER BY match_datetime DESC NULLS LAST
             LIMIT :limit
         """), {"limit": limit}).mappings().all()
-    return {"count": len(rows), "data": list(rows)}
+
+    return {
+        "count": len(rows),
+        "data": list(rows)
+    }
 
 @app.post("/admin/matches/clear")
 def clear_matches():
