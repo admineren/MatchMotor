@@ -1,43 +1,30 @@
 import os
 import json
 import datetime as dt
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
 
 # -----------------------------------------------------------------------------
 # Config (ENV)
 # -----------------------------------------------------------------------------
-# NosyAPI
 NOSY_API_KEY = os.getenv("NOSY_API_KEY", "").strip()
 
-# Nosy panelinde görünen "Base URL" iki farklı kök içeriyor:
-# - Service endpointleri:  https://www.nosyapi.com/apiv2/service/...
-# - Check endpointi:       https://www.nosyapi.com/apiv2/nosy-service/check
-#
-# Bu yüzden iki base tanımlıyoruz.
+# Base URL'ler
 NOSY_SERVICE_BASE_URL = os.getenv("NOSY_SERVICE_BASE_URL", "https://www.nosyapi.com/apiv2/service/").strip()
 NOSY_ROOT_BASE_URL = os.getenv("NOSY_ROOT_BASE_URL", "https://www.nosyapi.com/apiv2/").strip()
 
-# İKİ ayrı API ID:
-# - ORAN / PROGRAM API (bettable-matches/* + nosy-service/check)
-# - SONUÇ API (bettable-result/* + nosy-service/check)
-NOSY_ODDS_API_ID = os.getenv("NOSY_ODDS_API_ID", "").strip()       # ör: 1881134
-NOSY_RESULTS_API_ID = os.getenv("NOSY_RESULTS_API_ID", "").strip() # ör: 1881149
+# İki ayrı API ID (odds/results)
+NOSY_ODDS_API_ID = os.getenv("NOSY_ODDS_API_ID", "").strip()
+NOSY_RESULTS_API_ID = os.getenv("NOSY_RESULTS_API_ID", "").strip()
 
 # DB
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db").strip()
-
-# Render Postgres bazen "postgres://" döner, SQLAlchemy "postgresql://" ister.
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-
-# SQLAlchemy engine (global)
-# SQLite için check_same_thread kapatıyoruz (FastAPI threadpool uyumu için)
 if DATABASE_URL.startswith("sqlite:"):
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, future=True)
 else:
@@ -56,19 +43,11 @@ def _normalize_base_url(base: str) -> str:
         base += "/"
     return base
 
-NOSY_SERVICE_BASE_URL = _normalize_base_url(NOSY_SERVICE_BASE_URL) or "https://www.nosyapi.com/apiv2/service/"
-NOSY_ROOT_BASE_URL = _normalize_base_url(NOSY_ROOT_BASE_URL) or "https://www.nosyapi.com/apiv2/"
-
 def _join_url(base: str, endpoint: str) -> str:
     endpoint = endpoint.lstrip("/")
     return base + endpoint
 
 def _pick_api_id(api_kind: str) -> str:
-    """
-    api_kind:
-      - "odds"    -> NOSY_ODDS_API_ID
-      - "results" -> NOSY_RESULTS_API_ID
-    """
     if api_kind == "odds":
         return NOSY_ODDS_API_ID
     if api_kind == "results":
@@ -76,26 +55,22 @@ def _pick_api_id(api_kind: str) -> str:
     return ""
 
 def _dump_json(obj: Any) -> str:
-    # DB'de düzgün JSON saklamak için
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+NOSY_SERVICE_BASE_URL = _normalize_base_url(NOSY_SERVICE_BASE_URL) or "https://www.nosyapi.com/apiv2/service/"
+NOSY_ROOT_BASE_URL = _normalize_base_url(NOSY_ROOT_BASE_URL) or "https://www.nosyapi.com/apiv2/"
 
 def nosy_call(endpoint: str, *, params: Optional[Dict[str, Any]] = None, api_kind: str = "odds") -> Dict[str, Any]:
     """
-    NosyAPI'ye çağrı yapar.
-    - endpoint: 'bettable-matches/date' gibi
-    - api_kind: odds/results
-    Not: 'nosy-service/check' endpointi /service altında değil, ROOT base ile çağrılır.
+    endpoint: 'bettable-matches/date' gibi
+    api_kind: 'odds' | 'results'
     """
     if not NOSY_API_KEY:
         raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
 
-    # Bazı servisler apiID istiyor, bazıları istemeyebilir:
     api_id = _pick_api_id(api_kind)
-
-    # Endpoint normalize
     ep = endpoint.lstrip("/")
 
-    # Check endpointi root base ister, diğerleri service base ister
     is_check = ep.startswith("nosy-service/check")
 
     # Service çağrılarında endpoint yanlışlıkla "service/..." gelirse temizle
@@ -103,12 +78,10 @@ def nosy_call(endpoint: str, *, params: Optional[Dict[str, Any]] = None, api_kin
         ep = ep[len("service/"):]
 
     base = NOSY_ROOT_BASE_URL if is_check else NOSY_SERVICE_BASE_URL
-    # Env yanlışlıkla /service/service gelirse düzelt
     base = base.replace("/service/service", "/service")
     url = _join_url(base, ep)
 
     q = dict(params or {})
-    # Nosy dokümanında param adları: apiKey + apiID
     q["apiKey"] = NOSY_API_KEY
     if api_id:
         q["apiID"] = api_id
@@ -118,7 +91,6 @@ def nosy_call(endpoint: str, *, params: Optional[Dict[str, Any]] = None, api_kin
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"NosyAPI bağlantı hatası: {e}")
 
-    # Nosy bazen 200 dönüp status=failure verir. O yüzden raise_for_status yapmıyoruz.
     if r.status_code >= 400:
         try:
             body = r.json()
@@ -131,122 +103,181 @@ def nosy_call(endpoint: str, *, params: Optional[Dict[str, Any]] = None, api_kin
     except Exception:
         raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
 
+def _extract_main_odds(opening_payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    opening-odds payload'ından ana oranları çıkar:
+    - ms1/ms0/ms2  (HomeWin/Draw/AwayWin)
+    - alt25/ust25  (Under25/Over25)
+    """
+    try:
+        data = opening_payload.get("data") or []
+        if not data:
+            return None, None, None, None, None
+        item = data[0]
+        ms1 = item.get("HomeWin")
+        ms0 = item.get("Draw")
+        ms2 = item.get("AwayWin")
+        alt25 = item.get("Under25")
+        ust25 = item.get("Over25")
+        def f(x):
+            if x is None or x == "":
+                return None
+            try:
+                return float(x)
+            except Exception:
+                return None
+        return f(ms1), f(ms0), f(ms2), f(alt25), f(ust25)
+    except Exception:
+        return None, None, None, None, None
+
 def ensure_schema() -> None:
-    dialect = engine.dialect.name  # "sqlite" | "postgresql" | ...
+    dialect = engine.dialect.name
     is_sqlite = dialect == "sqlite"
 
-    # Postgres'ta AUTOINCREMENT yok -> Render logundaki hatanın sebebi bu.
-    # - SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
-    # - Postgres: BIGSERIAL (veya GENERATED ... IDENTITY)
-    odds_id_col = "INTEGER PRIMARY KEY AUTOINCREMENT" if is_sqlite else "BIGSERIAL PRIMARY KEY"
-    res_id_col = "INTEGER PRIMARY KEY AUTOINCREMENT" if is_sqlite else "BIGSERIAL PRIMARY KEY"
+    pk_ai = "INTEGER PRIMARY KEY AUTOINCREMENT" if is_sqlite else "BIGSERIAL PRIMARY KEY"
 
     with engine.begin() as conn:
-        conn.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS matches (
-            match_id      BIGINT PRIMARY KEY,
-            date          TEXT,
-            time          TEXT,
-            datetime      TEXT,
-            league        TEXT,
-            country       TEXT,
-            team1         TEXT,
-            team2         TEXT,
-            raw_json      TEXT
+        # 1) Tüm Nosy maçları burada birikir
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS nosy_matches (
+            nosy_match_id  BIGINT PRIMARY KEY,
+            date           TEXT,
+            time           TEXT,
+            match_datetime TEXT,
+            league         TEXT,
+            country        TEXT,
+            team1          TEXT,
+            team2          TEXT,
+            raw_json       TEXT
         );
         """))
+
+        # 2) Filtreyi geçen maçlar (panelde göstereceğin "Matches")
+        conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS matches (
+            id             {pk_ai},
+            nosy_match_id  BIGINT NOT NULL UNIQUE,
+            match_datetime TEXT,
+            league         TEXT,
+            team1          TEXT,
+            team2          TEXT,
+
+            ms1            NUMERIC,
+            ms0            NUMERIC,
+            ms2            NUMERIC,
+            alt25          NUMERIC,
+            ust25          NUMERIC,
+
+            ht_home        INT,
+            ht_away        INT,
+            ft_home        INT,
+            ft_away        INT,
+
+            created_at     TEXT,
+            updated_at     TEXT
+        );
+        """))
+
+        # 3) Odds/Results ham JSON
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS match_odds (
-            id            {odds_id_col},
-            match_id      BIGINT UNIQUE,
+            id            {pk_ai},
+            nosy_match_id BIGINT UNIQUE,
             fetched_at    TEXT,
-            raw_json      TEXT
+            raw_json      TEXT,
+            payload       TEXT
         );
         """))
+
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS match_results (
-            id            {res_id_col},
-            match_id      BIGINT UNIQUE,
+            id            {pk_ai},
+            nosy_match_id BIGINT UNIQUE,
             fetched_at    TEXT,
-            raw_json      TEXT
+            raw_json      TEXT,
+            payload       TEXT
         );
         """))
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS matches (
-            id BIGSERIAL PRIMARY KEY,
 
-            nosy_match_id BIGINT NOT NULL UNIQUE,
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_nosy_matches_dt ON nosy_matches(match_datetime);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_dt ON matches(match_datetime);"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_nosy_match_id ON match_odds(nosy_match_id);"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_nosy_match_id ON match_results(nosy_match_id);"))
 
-            datetime TIMESTAMP NOT NULL,
-            league TEXT NOT NULL,
-            team1 TEXT NOT NULL,
-            team2 TEXT NOT NULL,
-
-            ms1 NUMERIC,
-            ms0 NUMERIC,
-            ms2 NUMERIC,
-            alt25 NUMERIC,
-            ust25 NUMERIC,
-
-            ht_home INT,
-            ht_away INT,
-            ft_home INT,
-            ft_away INT,
-
-            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-        """))
-        
-        # match_id için upsert (ON CONFLICT) çalışsın diye UNIQUE index
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_match_id ON match_odds(match_id);"))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_match_id ON match_results(match_id);"))
-
-        # ✅ Eski tablo kaldıysa kolonları sonradan ekle (Postgres)
         if not is_sqlite:
-            conn.execute(text("ALTER TABLE match_odds ADD COLUMN IF NOT EXISTS fetched_at TEXT;"))
-            conn.execute(text("ALTER TABLE match_odds ADD COLUMN IF NOT EXISTS raw_json TEXT;"))
+            conn.execute(text("ALTER TABLE match_odds ADD COLUMN IF NOT EXISTS payload TEXT;"))
+            conn.execute(text("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS payload TEXT;"))
+            conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS nosy_match_id BIGINT;"))
 
-            conn.execute(text("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS fetched_at TEXT;"))
-            conn.execute(text("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS raw_json TEXT;"))
+def _upsert_filtered_match_from_odds(conn, nosy_match_id: int, opening_payload: Dict[str, Any]) -> bool:
+    ms1, ms0, ms2, alt25, ust25 = _extract_main_odds(opening_payload)
 
+    # Filtre: 1X2 oranları yoksa "matches"e alma.
+    if ms1 is None or ms0 is None or ms2 is None:
+        return False
+
+    row = conn.execute(
+        text("""
+            SELECT match_datetime, league, team1, team2
+            FROM nosy_matches
+            WHERE nosy_match_id = :mid
+        """),
+        {"mid": nosy_match_id},
+    ).mappings().first()
+
+    match_datetime = (row or {}).get("match_datetime") if row else None
+    league = (row or {}).get("league") if row else None
+    team1 = (row or {}).get("team1") if row else None
+    team2 = (row or {}).get("team2") if row else None
+
+    now = dt.datetime.utcnow().isoformat()
+
+    conn.execute(
+        text("""
+            INSERT INTO matches(
+                nosy_match_id, match_datetime, league, team1, team2,
+                ms1, ms0, ms2, alt25, ust25,
+                created_at, updated_at
+            )
+            VALUES(
+                :nosy_match_id, :match_datetime, :league, :team1, :team2,
+                :ms1, :ms0, :ms2, :alt25, :ust25,
+                :created_at, :updated_at
+            )
+            ON CONFLICT (nosy_match_id)
+            DO UPDATE SET
+                match_datetime = EXCLUDED.match_datetime,
+                league         = EXCLUDED.league,
+                team1          = EXCLUDED.team1,
+                team2          = EXCLUDED.team2,
+                ms1            = EXCLUDED.ms1,
+                ms0            = EXCLUDED.ms0,
+                ms2            = EXCLUDED.ms2,
+                alt25          = EXCLUDED.alt25,
+                ust25          = EXCLUDED.ust25,
+                updated_at     = EXCLUDED.updated_at
+        """),
+        {
+            "nosy_match_id": nosy_match_id,
+            "match_datetime": match_datetime,
+            "league": league,
+            "team1": team1,
+            "team2": team2,
+            "ms1": ms1,
+            "ms0": ms0,
+            "ms2": ms2,
+            "alt25": alt25,
+            "ust25": ust25,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    return True
 
 # -----------------------------------------------------------------------------
 # FastAPI
 # -----------------------------------------------------------------------------
-def _db_indexes() -> Dict[str, Any]:
-    """Aktif DB'de match_odds/match_results indexlerini döndürür (debug)."""
-    dialect = engine.dialect.name
-    out: Dict[str, Any] = {"dialect": dialect, "match_odds": [], "match_results": []}
-
-    with engine.begin() as conn:
-        if dialect == "sqlite":
-            for tbl in ("match_odds", "match_results"):
-                rows = conn.execute(text(f"PRAGMA index_list({tbl});")).fetchall()
-                for r in rows:
-                    # (seq, name, unique, origin, partial)
-                    out[tbl].append({"name": r[1], "unique": bool(r[2])})
-        else:
-            # Postgres / diğerleri
-            q = text("""
-                SELECT tablename, indexname, indexdef
-                FROM pg_indexes
-                WHERE schemaname = current_schema()
-                  AND tablename IN ('match_odds', 'match_results')
-                ORDER BY tablename, indexname
-            """)
-            rows = conn.execute(q).fetchall()
-            for tablename, indexname, indexdef in rows:
-                out[tablename].append({"name": indexname, "def": indexdef})
-    return out
-
-
-app = FastAPI(title="MatchMotor API", version="0.3.0")
-@app.get("/db-indexes")
-def db_indexes():
-    return _db_indexes()
-
-
+app = FastAPI(title="MatchMotor API", version="0.4.0")
 
 @app.on_event("startup")
 def startup():
@@ -256,34 +287,60 @@ def startup():
 def health():
     return {"ok": True, "time": dt.datetime.utcnow().isoformat()}
 
+# --------------------
+# Matches (filtrelenenler)
+# --------------------
 @app.get("/matches")
 def list_matches(limit: int = 50):
     limit = max(1, min(500, limit))
-
     with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT
-                id,
-                match_datetime,
-                league,
-                team1,
-                team2
-            FROM matches
-            ORDER BY match_datetime DESC NULLS LAST
-            LIMIT :limit
-        """), {"limit": limit}).mappings().all()
+        rows = conn.execute(
+            text("""
+                SELECT
+                    id,
+                    nosy_match_id,
+                    match_datetime,
+                    league,
+                    team1,
+                    team2,
+                    ms1, ms0, ms2,
+                    alt25, ust25
+                FROM matches
+                ORDER BY match_datetime DESC NULLS LAST
+                LIMIT :limit
+            """),
+            {"limit": limit},
+        ).mappings().all()
+    return {"count": len(rows), "data": list(rows)}
 
-    return {
-        "count": len(rows),
-        "data": list(rows)
-    }
+# Havuz (Nosy matches)
+@app.get("/nosy-matches")
+def list_nosy_matches(limit: int = 50):
+    limit = max(1, min(500, limit))
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT
+                    nosy_match_id,
+                    match_datetime,
+                    league,
+                    team1,
+                    team2
+                FROM nosy_matches
+                ORDER BY match_datetime DESC NULLS LAST
+                LIMIT :limit
+            """),
+            {"limit": limit},
+        ).mappings().all()
+    return {"count": len(rows), "data": list(rows)}
 
-@app.post("/admin/matches/clear")
-def clear_matches():
+@app.post("/admin/clear")
+def clear_all():
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM match_odds;"))
         conn.execute(text("DELETE FROM match_results;"))
         conn.execute(text("DELETE FROM matches;"))
+        conn.execute(text("DELETE FROM nosy_matches;"))
     return {"ok": True}
 
 # -----------------------------------------------------------------------------
@@ -297,7 +354,6 @@ def nosy_check_odds():
 def nosy_check_results():
     return nosy_call("nosy-service/check", api_kind="results")
 
-# Eski endpoint kalsın: varsayılan odds check döner
 @app.get("/nosy-check")
 def nosy_check():
     return nosy_call("nosy-service/check", api_kind="odds")
@@ -326,29 +382,34 @@ def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
             team1 = item.get("Team1") or item.get("team1") or ""
             team2 = item.get("Team2") or item.get("team2") or ""
 
-            conn.execute(text("""
-                INSERT INTO matches(match_id, date, time, datetime, league, country, team1, team2, raw_json)
-                VALUES(:match_id, :date, :time, :datetime, :league, :country, :team1, :team2, :raw_json)
-                ON CONFLICT(match_id) DO UPDATE SET
-                    date=excluded.date,
-                    time=excluded.time,
-                    datetime=excluded.datetime,
-                    league=excluded.league,
-                    country=excluded.country,
-                    team1=excluded.team1,
-                    team2=excluded.team2,
-                    raw_json=excluded.raw_json
-            """), {
-                "match_id": match_id,
-                "date": str(date_val),
-                "time": str(time_val),
-                "datetime": str(dt_val),
-                "league": str(league),
-                "country": str(country),
-                "team1": str(team1),
-                "team2": str(team2),
-                "raw_json": _dump_json(item),
-            })
+            conn.execute(
+                text("""
+                    INSERT INTO nosy_matches(
+                        nosy_match_id, date, time, match_datetime, league, country, team1, team2, raw_json
+                    )
+                    VALUES(:mid, :date, :time, :dt, :league, :country, :team1, :team2, :raw_json)
+                    ON CONFLICT(nosy_match_id) DO UPDATE SET
+                        date=excluded.date,
+                        time=excluded.time,
+                        match_datetime=excluded.match_datetime,
+                        league=excluded.league,
+                        country=excluded.country,
+                        team1=excluded.team1,
+                        team2=excluded.team2,
+                        raw_json=excluded.raw_json
+                """),
+                {
+                    "mid": match_id,
+                    "date": str(date_val),
+                    "time": str(time_val),
+                    "dt": str(dt_val),
+                    "league": str(league),
+                    "country": str(country),
+                    "team1": str(team1),
+                    "team2": str(team2),
+                    "raw_json": _dump_json(item),
+                },
+            )
             upserted += 1
 
     return {"ok": True, "date": date, "upserted": upserted, "nosy": payload}
@@ -368,45 +429,34 @@ def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
         try:
             conn.execute(
                 text("""
-                    INSERT INTO match_odds (match_id, fetched_at, raw_json, payload)
-                    VALUES (:match_id, :fetched_at, :raw_json, :payload)
-                    ON CONFLICT (match_id)
+                    INSERT INTO match_odds (nosy_match_id, fetched_at, raw_json, payload)
+                    VALUES (:mid, :fetched_at, :raw_json, :payload)
+                    ON CONFLICT (nosy_match_id)
                     DO UPDATE SET
                         fetched_at = EXCLUDED.fetched_at,
                         raw_json   = EXCLUDED.raw_json,
                         payload    = EXCLUDED.payload
                 """),
-                {
-                    "match_id": match_id,
-                    "fetched_at": now,
-                    "raw_json": raw,
-                    "payload": raw,
-                },
+                {"mid": match_id, "fetched_at": now, "raw_json": raw, "payload": raw},
             )
+
+            # ✅ Otomatik filtre -> matches tablosuna ekle (şartları sağlıyorsa)
+            promoted = _upsert_filtered_match_from_odds(conn, match_id, payload)
+
         except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail={"where": "db_upsert_match_odds", "error": str(e)},
-            )
+            raise HTTPException(status_code=500, detail={"where": "db_upsert_match_odds", "error": str(e)})
 
-    return {"ok": True, "match_id": match_id, "saved": True, "nosy": payload}
-
+    return {"ok": True, "match_id": match_id, "saved": True, "promoted_to_matches": promoted, "nosy": payload}
 
 @app.get("/opening-odds-exists-nosy")
 def opening_odds_exists_nosy(match_id: int = Query(..., description="Nosy MatchID")):
-    """
-    DB'ye yazmadan, Nosy tarafında opening odds var mı diye kontrol eder.
-    Not: Bu çağrı da kredi harcar (endpoint'e istek atıldığı için).
-    """
     payload = nosy_call(
         "bettable-matches/opening-odds",
         params={"matchID": match_id},
         api_kind="odds",
     )
-
     data = payload.get("data") or []
     exists = (payload.get("status") == "success") and (len(data) > 0)
-
     return {
         "match_id": match_id,
         "exists_in_nosy": exists,
@@ -414,7 +464,6 @@ def opening_odds_exists_nosy(match_id: int = Query(..., description="Nosy MatchI
         "rowCount": payload.get("rowCount"),
         "endpoint": payload.get("endpoint"),
     }
-
 
 @app.get("/nosy-results")
 def nosy_results(match_id: int = Query(..., description="Nosy MatchID")):
@@ -424,25 +473,25 @@ def nosy_results(match_id: int = Query(..., description="Nosy MatchID")):
 def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID")):
     payload = nosy_call("bettable-result/details", params={"matchID": match_id}, api_kind="results")
 
+    now = dt.datetime.utcnow().isoformat()
+    raw = _dump_json(payload)
+
     with engine.begin() as conn:
         try:
-            conn.execute(text("""
-            INSERT INTO match_results(match_id, fetched_at, raw_json)
-            VALUES(:match_id, :fetched_at, :raw_json)
-            ON CONFLICT (match_id)
-            DO UPDATE SET
-                fetched_at = EXCLUDED.fetched_at,
-                raw_json   = EXCLUDED.raw_json
-        """), {
-            "match_id": match_id,
-            "fetched_at": dt.datetime.utcnow().isoformat(),
-            "raw_json": _dump_json(payload),
-        })
+            conn.execute(
+                text("""
+                    INSERT INTO match_results(nosy_match_id, fetched_at, raw_json, payload)
+                    VALUES(:mid, :fetched_at, :raw_json, :payload)
+                    ON CONFLICT (nosy_match_id)
+                    DO UPDATE SET
+                        fetched_at = EXCLUDED.fetched_at,
+                        raw_json   = EXCLUDED.raw_json,
+                        payload    = EXCLUDED.payload
+                """),
+                {"mid": match_id, "fetched_at": now, "raw_json": raw, "payload": raw},
+            )
         except Exception as e:
-            raise HTTPException(status_code=500, detail={
-                "where": "db_upsert_match_results",
-                "error": str(e),
-            })
-
+            raise HTTPException(status_code=500, detail={"where": "db_upsert_match_results", "error": str(e)})
 
     return payload
+    
