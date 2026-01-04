@@ -400,7 +400,6 @@ def list_matches(limit: int = 50):
         """), {"limit": limit}).mappings().all()
     return {"count": len(rows), "data": list(rows)}
 
-
 @app.get("/nosy-matches")
 def list_nosy_matches(limit: int = 50):
     """
@@ -425,7 +424,7 @@ def list_nosy_matches(limit: int = 50):
             LIMIT :limit
         """), {"limit": limit}).mappings().all()
     
-    return {"count": len(rows), "data": list(rows)}@app.get("/nosy-matches")
+    return {"count": len(rows), "data": list(rows)}
 
 @app.post("/admin/clear")
 def clear_all():
