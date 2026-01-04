@@ -200,7 +200,7 @@ def ensure_schema() -> None:
         """))
 
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_nosy_matches_dt ON nosy_matches(match_datetime);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_dt ON matches(match_datetime);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_dt ON matches(datetime);"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_nosy_match_id ON match_odds(nosy_match_id);"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_nosy_match_id ON match_results(nosy_match_id);"))
 
@@ -299,7 +299,7 @@ def list_matches(limit: int = 50):
                 SELECT
                     id,
                     nosy_match_id,
-                    match_datetime,
+                    datetime,
                     league,
                     team1,
                     team2,
