@@ -199,10 +199,43 @@ def ensure_schema() -> None:
         );
         """))
 
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_nosy_matches_dt ON nosy_matches(match_datetime);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_matches_dt ON matches(datetime);"))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_nosy_match_id ON match_odds(nosy_match_id);"))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_nosy_match_id ON match_results(nosy_match_id);"))
+        # ✅ Migration: eski şemalarda "datetime" kolonu vardı; şimdi "match_datetime" kullanıyoruz
+        if not is_sqlite:
+            # matches
+            try:
+                cols = {r[0] for r in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='matches'
+                """)).all()}
+                if "match_datetime" not in cols and "datetime" in cols:
+                    conn.execute(text('ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_datetime TEXT;'))
+                    conn.execute(text('UPDATE matches SET match_datetime = "datetime" WHERE match_datetime IS NULL;'))
+            except Exception:
+                pass
+            # nosy_matches
+            try:
+                cols = {r[0] for r in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='nosy_matches'
+                """)).all()}
+                if "match_datetime" not in cols and "datetime" in cols:
+                    conn.execute(text('ALTER TABLE nosy_matches ADD COLUMN IF NOT EXISTS match_datetime TEXT;'))
+                    conn.execute(text('UPDATE nosy_matches SET match_datetime = "datetime" WHERE match_datetime IS NULL;'))
+            except Exception:
+                pass
+
+
+        # Indexler (kolon yoksa uygulama çökmesin diye güvenli)
+        for stmt in [
+            "CREATE INDEX IF NOT EXISTS idx_nosy_matches_dt ON nosy_matches(match_datetime);",
+            "CREATE INDEX IF NOT EXISTS idx_matches_dt ON matches(match_datetime);",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_nosy_match_id ON match_odds(nosy_match_id);",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_nosy_match_id ON match_results(nosy_match_id);",
+        ]:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass
 
         if not is_sqlite:
             conn.execute(text("ALTER TABLE match_odds ADD COLUMN IF NOT EXISTS payload TEXT;"))
@@ -299,7 +332,7 @@ def list_matches(limit: int = 50):
                 SELECT
                     id,
                     nosy_match_id,
-                    datetime,
+                    match_datetime,
                     league,
                     team1,
                     team2,
@@ -494,4 +527,3 @@ def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID")):
             raise HTTPException(status_code=500, detail={"where": "db_upsert_match_results", "error": str(e)})
 
     return payload
-    
