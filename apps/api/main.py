@@ -292,7 +292,7 @@ def ensure_schema() -> None:
                 conn.execute(text(stmt))
             except Exception:
                 # index hatası uygulamayı düşürmesin (özellikle eski kolon isimleri yüzünden)
-                pass)
+                pass
 
 def _upsert_filtered_match_from_odds(conn, nosy_match_id: int, opening_payload: Dict[str, Any]) -> bool:
     ms1, ms0, ms2, alt25, ust25 = _extract_main_odds(opening_payload)
