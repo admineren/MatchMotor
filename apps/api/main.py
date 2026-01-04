@@ -524,140 +524,36 @@ def nosy_check():
 # -----------------------------------------------------------------------------
 # Nosy endpoints
 # -----------------------------------------------------------------------------
-def _pick_match_id(item: dict):
-    # Nosy için genelde MatchID gelir ama sağlam dursun
-    for k in ["MatchID", "match_id", "matchId", "matchID", "MatchId", "id", "ID"]:
-        v = item.get(k)
-        if v is None:
-            continue
-        try:
-            return int(str(v).strip())
-        except Exception:
-            pass
-    return None
-
-def _to_tr_iso(dt_val: str) -> str:
+@app.get("/bettable-matches/date")
+def bettable_matches_date():
     """
-    DateTime stringini mümkünse parse eder ve TR saatine çevirir.
-    Parse edemezse olduğu gibi döndürür.
-    """
-    if not dt_val:
-        return ""
-    s = str(dt_val).strip()
-    try:
-        # "2026-01-04 20:47:21" -> "2026-01-04T20:47:21"
-        s2 = s.replace("Z", "+00:00").replace(" ", "T")
-        dt = datetime.fromisoformat(s2)
-        if dt.tzinfo is None:
-            # tz yoksa UTC varsayımı (Nosy zaman standardı net değil)
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(TR_TZ).isoformat()
-    except Exception:
-        return s
+    Nosy: bettable-matches/date
+    Sistemde kayıtlı oyunların lig bilgisini grup halinde vermektedir.
+    (Pratikte: Veri olan tarihleri listeler. Maç detayı / MatchID döndürmez.)
 
-@app.get("/nosy-matches-by-date")
-def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
-    payload = nosy_call("bettable-matches/date", params={"date": date}, api_kind="odds")
+    Örnek response:
+    {
+      "status": "success",
+      "rowCount": 3,
+      "data": [{"date":"2024-01-31"}, ...]
+    }
+    """
+    payload = nosy_call("bettable-matches/date", api_kind="odds")
+
     data = payload.get("data") or []
-    received = len(data)
-
-    processed = 0
-    skipped = 0
-    first_keys = list(data[0].keys()) if received > 0 and isinstance(data[0], dict) else []
-    fetched_at = datetime.now(TR_TZ).isoformat()
-
-    with engine.begin() as conn:
-        for item in data:
-            if not isinstance(item, dict):
-                skipped += 1
-                continue
-
-            match_id = _pick_match_id(item)
-            if not match_id:
-                skipped += 1
-                continue
-
-            # Ham alanlar
-            dt_raw = item.get("DateTime") or item.get("datetime") or ""
-            time_val = item.get("Time") or item.get("time") or ""
-            date_val = item.get("Date") or item.get("date") or ""
-
-            # Eğer DateTime yoksa date+time ile üret (ham)
-            if not dt_raw:
-                if date_val and time_val:
-                    dt_raw = f"{date_val} {time_val}"
-                elif date_val:
-                    dt_raw = str(date_val)
-                else:
-                    dt_raw = ""
-
-            dt_tr = _to_tr_iso(dt_raw)
-
-            league = item.get("League") or item.get("league") or ""
-            country = item.get("Country") or item.get("country") or ""
-            team1 = item.get("Team1") or item.get("team1") or ""
-            team2 = item.get("Team2") or item.get("team2") or ""
-
-            conn.execute(
-                text("""
-                    INSERT INTO nosy_matches(
-                        nosy_match_id,
-                        date, time,
-                        match_datetime,
-                        match_datetime_tr,
-                        league, country,
-                        team1, team2,
-                        raw_json,
-                        fetched_at
-                    )
-                    VALUES(
-                        :mid,
-                        :date, :time,
-                        :dt_raw,
-                        :dt_tr,
-                        :league, :country,
-                        :team1, :team2,
-                        :raw_json,
-                        :fetched_at
-                    )
-                    ON CONFLICT(nosy_match_id) DO UPDATE SET
-                        date=excluded.date,
-                        time=excluded.time,
-                        match_datetime=excluded.match_datetime,
-                        match_datetime_tr=excluded.match_datetime_tr,
-                        league=excluded.league,
-                        country=excluded.country,
-                        team1=excluded.team1,
-                        team2=excluded.team2,
-                        raw_json=excluded.raw_json,
-                        fetched_at=excluded.fetched_at
-                """),
-                {
-                    "mid": match_id,
-                    "date": str(date_val),
-                    "time": str(time_val),
-                    "dt_raw": str(dt_raw),
-                    "dt_tr": str(dt_tr),
-                    "league": str(league),
-                    "country": str(country),
-                    "team1": str(team1),
-                    "team2": str(team2),
-                    "raw_json": _dump_json(item),
-                    "fetched_at": fetched_at,
-                },
-            )
-
-            processed += 1
+    # güvenli normalizasyon: sadece date alanlarını döndürelim
+    dates = []
+    for x in data:
+        if isinstance(x, dict) and "date" in x:
+            dates.append(str(x.get("date")))
 
     return {
         "ok": True,
-        "date": date,
-        "received": received,
-        "processed": processed,
-        "skipped": skipped,
-        "first_keys": first_keys,
-        "fetched_at": fetched_at,
-            }
+        "endpoint": "bettable-matches/date",
+        "count": len(dates),
+        "dates": dates,
+        "nosy": payload,  # istersen bunu kaldırabiliriz, debug için iyi
+    }
 
 @app.get("/nosy-opening-odds")
 def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
