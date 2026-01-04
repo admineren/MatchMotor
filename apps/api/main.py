@@ -35,13 +35,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# SQLAlchemy engine
-if DATABASE_URL.startswith("sqlite"):
-    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, future=True)
-else:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-
-
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -157,7 +150,7 @@ def ensure_schema() -> None:
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS match_odds (
             id            {odds_id_col},
-            match_id      BIGINT,
+            match_id      BIGINT UNIQUE,
             fetched_at    TEXT,
             raw_json      TEXT
         );
@@ -165,21 +158,51 @@ def ensure_schema() -> None:
         conn.execute(text(f"""
         CREATE TABLE IF NOT EXISTS match_results (
             id            {res_id_col},
-            match_id      BIGINT,
+            match_id      BIGINT UNIQUE,
             fetched_at    TEXT,
             raw_json      TEXT
         );
         """))
-        conn.execute(text("DROP INDEX IF EXISTS idx_odds_match_id;"))
-        conn.execute(text("DROP INDEX IF EXISTS uq_match_odds_match_id;"))
-        conn.execute(text("CREATE UNIQUE INDEX uq_match_odds_match_id ON match_odds(match_id);"))
-        conn.execute(text("DROP INDEX IF EXISTS idx_results_match_id;"))
-        conn.execute(text("DROP INDEX IF EXISTS uq_match_results_match_id;"))
-        conn.execute(text("CREATE UNIQUE INDEX uq_match_results_match_id ON match_results(match_id);"))
+        
+        # match_id için upsert (ON CONFLICT) çalışsın diye UNIQUE index
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_match_id ON match_odds(match_id);"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_match_id ON match_results(match_id);"))
 
 # -----------------------------------------------------------------------------
 # FastAPI
 # -----------------------------------------------------------------------------
+def _db_indexes() -> Dict[str, Any]:
+    """Aktif DB'de match_odds/match_results indexlerini döndürür (debug)."""
+    dialect = engine.dialect.name
+    out: Dict[str, Any] = {"dialect": dialect, "match_odds": [], "match_results": []}
+
+    with engine.begin() as conn:
+        if dialect == "sqlite":
+            for tbl in ("match_odds", "match_results"):
+                rows = conn.execute(text(f"PRAGMA index_list({tbl});")).fetchall()
+                for r in rows:
+                    # (seq, name, unique, origin, partial)
+                    out[tbl].append({"name": r[1], "unique": bool(r[2])})
+        else:
+            # Postgres / diğerleri
+            q = text("""
+                SELECT tablename, indexname, indexdef
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND tablename IN ('match_odds', 'match_results')
+                ORDER BY tablename, indexname
+            """)
+            rows = conn.execute(q).fetchall()
+            for tablename, indexname, indexdef in rows:
+                out[tablename].append({"name": indexname, "def": indexdef})
+    return out
+
+
+@app.get("/db-indexes")
+def db_indexes():
+    return _db_indexes()
+
+
 app = FastAPI(title="MatchMotor API", version="0.3.0")
 
 @app.on_event("startup")
@@ -288,7 +311,8 @@ def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
     now = dt.datetime.utcnow().isoformat()
 
     with engine.begin() as conn:
-        conn.execute(text("""
+        try:
+            conn.execute(text("""
             INSERT INTO match_odds (match_id, fetched_at, raw_json)
             VALUES (:match_id, :fetched_at, :raw_json)
             ON CONFLICT (match_id)
@@ -299,6 +323,12 @@ def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
             "fetched_at": now,
             "raw_json": _dump_json(payload),
         })
+        except Exception as e:
+            raise HTTPException(status_code=500, detail={
+                "where": "db_upsert_match_odds",
+                "error": str(e),
+            })
+
 
     return {
         "ok": True,
@@ -340,7 +370,8 @@ def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID")):
     payload = nosy_call("bettable-result/details", params={"matchID": match_id}, api_kind="results")
 
     with engine.begin() as conn:
-        conn.execute(text("""
+        try:
+            conn.execute(text("""
             INSERT INTO match_results(match_id, fetched_at, raw_json)
             VALUES(:match_id, :fetched_at, :raw_json)
             ON CONFLICT (match_id)
@@ -352,6 +383,12 @@ def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID")):
             "fetched_at": dt.datetime.utcnow().isoformat(),
             "raw_json": _dump_json(payload),
         })
+        except Exception as e:
+            raise HTTPException(status_code=500, detail={
+                "where": "db_upsert_match_results",
+                "error": str(e),
+            })
+
 
     return payload
-        
+                
