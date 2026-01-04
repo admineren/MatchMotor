@@ -403,28 +403,51 @@ def list_matches(limit: int = 50):
 @app.get("/nosy-matches")
 def list_nosy_matches(limit: int = 50):
     """
-    Nosy'den gelen ham maçlar (nosy_matches tablosu)
+    Önümüzdeki maçların fikstürü + otomatik sistem durumu
+    (nosy_matches tablosu – ham havuz)
     """
     limit = max(1, min(500, limit))
+
     with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT
-                id,
-                nosy_match_id,
-                match_datetime,
-                date,
-                time,
-                league,
-                country,
-                team1,
-                team2,
-                fetched_at
-            FROM nosy_matches
-            ORDER BY match_datetime DESC NULLS LAST
-            LIMIT :limit
-        """), {"limit": limit}).mappings().all()
-    
-    return {"count": len(rows), "data": list(rows)}
+        rows = conn.execute(
+            text("""
+                SELECT
+                    nosy_match_id,
+                    match_datetime,
+                    league,
+                    country,
+                    team1,
+                    team2,
+
+                    -- temel oranlar
+                    ms1,
+                    ms0,
+                    ms2,
+                    u25,
+                    o25,
+
+                    -- piyasa bilgisi
+                    betcount,
+
+                    -- sistem durumu
+                    has_odds,
+                    is_tracked,
+                    reason,
+                    odds_fetch_status,
+                    odds_last_fetched_at,
+
+                    fetched_at
+                FROM nosy_matches
+                ORDER BY match_datetime ASC
+                LIMIT :limit
+            """),
+            {"limit": limit},
+        ).mappings().all()
+
+    return {
+        "count": len(rows),
+        "data": list(rows),
+    }
 
 @app.post("/admin/clear")
 def clear_all():
