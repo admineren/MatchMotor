@@ -333,7 +333,7 @@ def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
             conn.execute(
                 text("""
                     INSERT INTO match_odds (match_id, fetched_at, raw_json, payload)
-                    VALUES (%(match_id)s, %(fetched_at)s, %(raw_json)s, %(payload)s)
+                    VALUES (:match_id, :fetched_at, :raw_json, :payload)
                     ON CONFLICT (match_id)
                     DO UPDATE SET
                         fetched_at = EXCLUDED.fetched_at,
@@ -350,18 +350,11 @@ def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail={
-                    "where": "db_upsert_match_odds",
-                    "error": str(e),
-                },
+                detail={"where": "db_upsert_match_odds", "error": str(e)},
             )
 
-    return {
-        "ok": True,
-        "match_id": match_id,
-        "saved": True,
-        "nosy": payload,
-    }
+    return {"ok": True, "match_id": match_id, "saved": True, "nosy": payload}
+
 
 @app.get("/opening-odds-exists-nosy")
 def opening_odds_exists_nosy(match_id: int = Query(..., description="Nosy MatchID")):
