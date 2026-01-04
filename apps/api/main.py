@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
+from datetime import datetime
 from sqlalchemy import create_engine, text
 
 # -----------------------------------------------------------------------------
@@ -504,28 +505,80 @@ def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
     payload = nosy_call("bettable-matches/date", params={"date": date}, api_kind="odds")
     data = payload.get("data") or []
     upserted = 0
+    fetched_at = datetime.utcnow().isoformat()
+
+    def _to_float(v):
+        try:
+            if v is None:
+                return None
+            s = str(v).strip()
+            if not s:
+                return None
+            s = s.replace(",", ".")
+            return float(s)
+        except Exception:
+            return None
+
+    def _to_int(v):
+        try:
+            if v is None:
+                return None
+            s = str(v).strip()
+            if not s:
+                return None
+            return int(float(s))
+        except Exception:
+            return None
 
     with engine.begin() as conn:
         for item in data:
+            # Match ID
             try:
                 match_id = int(item.get("MatchID") or item.get("match_id") or item.get("matchId"))
             except Exception:
                 continue
 
+            # Date/Time fields
             dt_val = item.get("DateTime") or item.get("datetime") or ""
             time_val = item.get("Time") or item.get("time") or ""
             date_val = item.get("Date") or item.get("date") or ""
+
+            # Eğer DateTime yoksa date+time ile üret
+            if not dt_val:
+                if date_val and time_val:
+                    dt_val = f"{date_val} {time_val}"
+                elif date_val:
+                    dt_val = str(date_val)
+                else:
+                    dt_val = ""
+
             league = item.get("League") or item.get("league") or ""
             country = item.get("Country") or item.get("country") or ""
             team1 = item.get("Team1") or item.get("team1") or ""
             team2 = item.get("Team2") or item.get("team2") or ""
 
+            # Odds summary (farklı isim olasılıklarına tolerans)
+            ms1 = _to_float(item.get("ms1") or item.get("home_win") or item.get("HomeWin") or item.get("homeWin"))
+            ms0 = _to_float(item.get("ms0") or item.get("draw")     or item.get("Draw")    or item.get("drawOdd"))
+            ms2 = _to_float(item.get("ms2") or item.get("away_win") or item.get("AwayWin") or item.get("awayWin"))
+
+            under25 = _to_float(item.get("under25") or item.get("Under25") or item.get("under_25") or item.get("u25"))
+            over25  = _to_float(item.get("over25")  or item.get("Over25")  or item.get("over_25")  or item.get("o25"))
+
+            betcount = _to_int(item.get("betcount") or item.get("BetCount") or item.get("betCount") or item.get("markets"))
+
             conn.execute(
                 text("""
                     INSERT INTO nosy_matches(
-                        nosy_match_id, date, time, match_datetime, league, country, team1, team2, raw_json
+                        nosy_match_id, date, time, match_datetime, league, country, team1, team2,
+                        ms1, ms0, ms2, under25, over25, betcount,
+                        fetched_at, raw_json
                     )
-                    VALUES(:mid, :date, :time, :dt, :league, :country, :team1, :team2, :raw_json)
+                    VALUES(
+                        :mid, :date, :time, :dt, :league, :country, :team1, :team2,
+                        :ms1, :ms0, :ms2, :under25, :over25, :betcount,
+                        :fetched_at, :raw_json
+                    )
                     ON CONFLICT(nosy_match_id) DO UPDATE SET
                         date=excluded.date,
                         time=excluded.time,
@@ -534,6 +587,13 @@ def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
                         country=excluded.country,
                         team1=excluded.team1,
                         team2=excluded.team2,
+                        ms1=excluded.ms1,
+                        ms0=excluded.ms0,
+                        ms2=excluded.ms2,
+                        under25=excluded.under25,
+                        over25=excluded.over25,
+                        betcount=excluded.betcount,
+                        fetched_at=excluded.fetched_at,
                         raw_json=excluded.raw_json
                 """),
                 {
@@ -545,12 +605,26 @@ def nosy_matches_by_date(date: str = Query(..., description="YYYY-MM-DD")):
                     "country": str(country),
                     "team1": str(team1),
                     "team2": str(team2),
+                    "ms1": ms1,
+                    "ms0": ms0,
+                    "ms2": ms2,
+                    "under25": under25,
+                    "over25": over25,
+                    "betcount": betcount,
+                    "fetched_at": fetched_at,
                     "raw_json": _dump_json(item),
                 },
             )
             upserted += 1
 
-    return {"ok": True, "date": date, "upserted": upserted, "nosy": payload}
+    # payload komple dönmek ağır olabiliyor; özet döndürelim
+    return {
+        "ok": True,
+        "date": date,
+        "received": len(data),
+        "upserted": upserted,
+        "fetched_at": fetched_at,
+        }
 
 @app.get("/nosy-opening-odds")
 def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
