@@ -524,7 +524,7 @@ def nosy_check():
 # -----------------------------------------------------------------------------
 # Nosy endpoints
 # -----------------------------------------------------------------------------
-@app.get("/bettable-matches/date")
+@app.get("/nosy/dates")
 def bettable_matches_date():
     """
     Nosy: bettable-matches/date
@@ -553,36 +553,4 @@ def bettable_matches_date():
         "count": len(dates),
         "dates": dates,
         "nosy": payload,  # istersen bunu kaldırabiliriz, debug için iyi
-    }
-
-@app.get("/nosy-opening-odds")
-def nosy_opening_odds(match_id: int = Query(..., description="Nosy MatchID")):
-    payload = nosy_call(
-        "bettable-matches/opening-odds",
-        params={"matchID": match_id},
-        api_kind="odds",
-    )
-
-    now = dt.datetime.utcnow().isoformat()
-
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO match_odds (match_id, fetched_at, raw_json, payload)
-            VALUES (:match_id, :fetched_at, :raw_json, :payload)
-            ON CONFLICT (match_id)
-            DO UPDATE SET
-                fetched_at = EXCLUDED.fetched_at,
-                raw_json   = EXCLUDED.raw_json,
-                payload    = EXCLUDED.payload
-        """), {
-            "match_id": match_id,
-            "fetched_at": now,
-            "raw_json": _dump_json(payload),
-            "payload": _dump_json(payload),
-        })
-
-    return {
-        "ok": True,
-        "match_id": match_id,
-        "saved": True
     }
