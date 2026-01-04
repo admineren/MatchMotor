@@ -160,36 +160,36 @@ def ensure_schema() -> None:
         # --------- Tables (minimum columns used by code) --------------------
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS nosy_matches (
-            id            INTEGER PRIMARY KEY,
-            nosy_match_id BIGINT UNIQUE,
+            id             INTEGER PRIMARY KEY,
+            nosy_match_id  BIGINT UNIQUE,
             match_datetime TEXT,
-            date          TEXT,
-            time          TEXT,
-            league        TEXT,
-            country       TEXT,
-            team1         TEXT,
-            team2         TEXT,
-            fetched_at    TEXT,
-            raw_json      TEXT,
-            payload       TEXT
+            date           TEXT,
+            time           TEXT,
+            league         TEXT,
+            country        TEXT,
+            team1          TEXT,
+            team2          TEXT,
+            fetched_at     TEXT,
+            raw_json       TEXT,
+            payload        TEXT
         );
         """))
 
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS matches (
-            id            INTEGER PRIMARY KEY,
-            nosy_match_id BIGINT UNIQUE,
+            id             INTEGER PRIMARY KEY,
+            nosy_match_id  BIGINT UNIQUE,
             match_datetime TEXT,
-            league        TEXT,
-            team1         TEXT,
-            team2         TEXT,
-            ms1           DOUBLE PRECISION,
-            ms0           DOUBLE PRECISION,
-            ms2           DOUBLE PRECISION,
-            alt25         DOUBLE PRECISION,
-            ust25         DOUBLE PRECISION,
-            created_at    TEXT,
-            updated_at    TEXT
+            league         TEXT,
+            team1          TEXT,
+            team2          TEXT,
+            ms1            DOUBLE PRECISION,
+            ms0            DOUBLE PRECISION,
+            ms2            DOUBLE PRECISION,
+            alt25          DOUBLE PRECISION,
+            ust25          DOUBLE PRECISION,
+            created_at     TEXT,
+            updated_at     TEXT
         );
         """))
 
@@ -219,11 +219,19 @@ def ensure_schema() -> None:
 
         if "nosy_match_id" not in cols_matches and "match_id" in cols_matches:
             _add_col(conn, "matches", "nosy_match_id", "BIGINT")
-            conn.execute(text("UPDATE matches SET nosy_match_id = match_id WHERE nosy_match_id IS NULL;"))
+            conn.execute(text("""
+                UPDATE matches
+                SET nosy_match_id = match_id
+                WHERE nosy_match_id IS NULL;
+            """))
 
         if "match_datetime" not in cols_matches and "datetime" in cols_matches:
             _add_col(conn, "matches", "match_datetime", "TEXT")
-            conn.execute(text("UPDATE matches SET match_datetime = datetime WHERE match_datetime IS NULL;"))
+            conn.execute(text("""
+                UPDATE matches
+                SET match_datetime = datetime
+                WHERE match_datetime IS NULL;
+            """))
 
         # ensure all expected cols exist (safe add)
         for col, typ in [
@@ -247,12 +255,21 @@ def ensure_schema() -> None:
 
         if "nosy_match_id" not in cols_nosy and "match_id" in cols_nosy:
             _add_col(conn, "nosy_matches", "nosy_match_id", "BIGINT")
-            conn.execute(text("UPDATE nosy_matches SET nosy_match_id = match_id WHERE nosy_match_id IS NULL;"))
+            conn.execute(text("""
+                UPDATE nosy_matches
+                SET nosy_match_id = match_id
+                WHERE nosy_match_id IS NULL;
+            """))
 
         if "match_datetime" not in cols_nosy and "datetime" in cols_nosy:
             _add_col(conn, "nosy_matches", "match_datetime", "TEXT")
-            conn.execute(text("UPDATE nosy_matches SET match_datetime = datetime WHERE match_datetime IS NULL;"))
+            conn.execute(text("""
+                UPDATE nosy_matches
+                SET match_datetime = datetime
+                WHERE match_datetime IS NULL;
+            """))
 
+        # base cols for nosy_matches
         for col, typ in [
             ("nosy_match_id", "BIGINT"),
             ("match_datetime", "TEXT"),
@@ -268,9 +285,24 @@ def ensure_schema() -> None:
         ]:
             _add_col(conn, "nosy_matches", col, typ)
 
-        # match_odds / match_results legacy
+        # ✅ NEW: odds-summary columns in nosy_matches
+        for col, typ in [
+            ("ms1", "DOUBLE PRECISION"),
+            ("ms0", "DOUBLE PRECISION"),
+            ("ms2", "DOUBLE PRECISION"),
+            ("under25", "DOUBLE PRECISION"),
+            ("over25", "DOUBLE PRECISION"),
+            ("betcount", "INTEGER"),
+        ]:
+            _add_col(conn, "nosy_matches", col, typ)
+
+        # match_odds / match_results column sync
         for table in ["match_odds", "match_results"]:
-            for col, typ in [("payload", "TEXT"), ("raw_json", "TEXT"), ("fetched_at", "TEXT")]:
+            for col, typ in [
+                ("payload", "TEXT"),
+                ("raw_json", "TEXT"),
+                ("fetched_at", "TEXT"),
+            ]:
                 _add_col(conn, table, col, typ)
 
         # --------- Indexes (only if column exists) --------------------------
@@ -291,7 +323,7 @@ def ensure_schema() -> None:
             try:
                 conn.execute(text(stmt))
             except Exception:
-                # index hatası uygulamayı düşürmesin (özellikle eski kolon isimleri yüzünden)
+                # index hatası uygulamayı düşürmesin
                 pass
 
 def _upsert_filtered_match_from_odds(conn, nosy_match_id: int, opening_payload: Dict[str, Any]) -> bool:
@@ -403,8 +435,8 @@ def list_matches(limit: int = 50):
 @app.get("/nosy-matches")
 def list_nosy_matches(limit: int = 50):
     """
-    Önümüzdeki maçların fikstürü + otomatik sistem durumu
-    (nosy_matches tablosu – ham havuz)
+    Nosy'den gelen fikstür + özet oranlar (nosy_matches tablosu).
+    Bu tablo bitmiş maç mantığında değil; sadece ön izleme/fixture amaçlıdır.
     """
     limit = max(1, min(500, limit))
 
@@ -412,42 +444,33 @@ def list_nosy_matches(limit: int = 50):
         rows = conn.execute(
             text("""
                 SELECT
+                    id,
                     nosy_match_id,
                     match_datetime,
+                    date,
+                    time,
                     league,
                     country,
                     team1,
                     team2,
 
-                    -- temel oranlar
+                    -- Odds summary (nullable)
                     ms1,
                     ms0,
                     ms2,
-                    u25,
-                    o25,
-
-                    -- piyasa bilgisi
+                    under25,
+                    over25,
                     betcount,
-
-                    -- sistem durumu
-                    has_odds,
-                    is_tracked,
-                    reason,
-                    odds_fetch_status,
-                    odds_last_fetched_at,
 
                     fetched_at
                 FROM nosy_matches
-                ORDER BY match_datetime ASC
+                ORDER BY match_datetime DESC NULLS LAST
                 LIMIT :limit
             """),
             {"limit": limit},
         ).mappings().all()
 
-    return {
-        "count": len(rows),
-        "data": list(rows),
-    }
+    return {"count": len(rows), "data": list(rows)}
 
 @app.post("/admin/clear")
 def clear_all():
