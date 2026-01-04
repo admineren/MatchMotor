@@ -184,6 +184,18 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS fetched_at TEXT;"))
             conn.execute(text("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS raw_json TEXT;"))
 
+        # 🔧 Eski şemadan kalan payload NOT NULL sorununu düzelt
+        conn.execute(text("""
+        ALTER TABLE match_odds
+        ALTER COLUMN payload DROP NOT NULL
+        """))
+
+        # payload NULL olan eski kayıtları raw_json ile doldur
+        conn.execute(text("""
+        UPDATE match_odds
+        SET payload = raw_json
+        WHERE payload IS NULL
+        """))
 
 # -----------------------------------------------------------------------------
 # FastAPI
