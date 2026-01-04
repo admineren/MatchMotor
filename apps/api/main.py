@@ -176,6 +176,15 @@ def ensure_schema() -> None:
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_match_id ON match_odds(match_id);"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_results_match_id ON match_results(match_id);"))
 
+        # ✅ Eski tablo kaldıysa kolonları sonradan ekle (Postgres)
+        if not is_sqlite:
+            conn.execute(text("ALTER TABLE match_odds ADD COLUMN IF NOT EXISTS fetched_at TEXT;"))
+            conn.execute(text("ALTER TABLE match_odds ADD COLUMN IF NOT EXISTS raw_json TEXT;"))
+
+            conn.execute(text("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS fetched_at TEXT;"))
+            conn.execute(text("ALTER TABLE match_results ADD COLUMN IF NOT EXISTS raw_json TEXT;"))
+
+
 # -----------------------------------------------------------------------------
 # FastAPI
 # -----------------------------------------------------------------------------
