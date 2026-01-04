@@ -35,6 +35,14 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+
+# SQLAlchemy engine (global)
+# SQLite için check_same_thread kapatıyoruz (FastAPI threadpool uyumu için)
+if DATABASE_URL.startswith("sqlite:"):
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, future=True)
+else:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -198,12 +206,12 @@ def _db_indexes() -> Dict[str, Any]:
     return out
 
 
+app = FastAPI(title="MatchMotor API", version="0.3.0")
 @app.get("/db-indexes")
 def db_indexes():
     return _db_indexes()
 
 
-app = FastAPI(title="MatchMotor API", version="0.3.0")
 
 @app.on_event("startup")
 def startup():
@@ -391,4 +399,3 @@ def nosy_result_details(match_id: int = Query(..., description="Nosy MatchID")):
 
 
     return payload
-                
