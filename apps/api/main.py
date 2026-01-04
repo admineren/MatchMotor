@@ -197,11 +197,6 @@ def ensure_schema() -> None:
             updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """))
-
-        conn.execute(text("""
-        CREATE INDEX IF NOT EXISTS idx_matches_datetime
-        ON matches(datetime);
-        """))
         
         # match_id için upsert (ON CONFLICT) çalışsın diye UNIQUE index
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_match_odds_match_id ON match_odds(match_id);"))
