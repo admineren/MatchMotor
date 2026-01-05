@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 from sqlalchemy import create_engine, text
 
@@ -425,105 +426,6 @@ def sync_pool_bettable_matches():
         "creditUsed": payload.get("creditUsed"),
     }
 
-# --- Database SYNC ENDPOINT ---
-@app.post("/db/matches/sync")
-def sync_db_matches():
-    """
-    pool_matches -> matches
-    Havuzdaki maçları filtreleyip matches tablosuna upsert eder.
-    """
-    fetched_at_tr = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
-
-    selected = 0
-    upserted = 0
-    skipped = 0
-
-    with engine.begin() as conn:
-        # 1) Pool'dan adayları çek (minimum filtre)
-        rows = conn.execute(text("""
-            SELECT
-                nosy_match_id,
-                match_datetime, date, time,
-                league, country, team1, team2,
-                betcount,
-                ms1, ms0, ms2, alt25, ust25,
-                fetched_at_tr,
-                raw_json
-            FROM pool_matches
-            WHERE
-                nosy_match_id IS NOT NULL
-                AND ms1 IS NOT NULL AND ms0 IS NOT NULL AND ms2 IS NOT NULL
-        """)).mappings().all()
-
-        for r in rows:
-            selected += 1
-
-            # Ek (hafif) doğrulama
-            try:
-                mid = int(r["nosy_match_id"])
-            except Exception:
-                skipped += 1
-                continue
-
-            # İstersen burada daha sıkı filtre koyarsın:
-            # - betcount >= X
-            # - league whitelist
-            # - date/time dolu
-            # Şimdilik minimumda bıraktım.
-
-            conn.execute(
-                text("""
-                    INSERT INTO matches(
-                        nosy_match_id,
-                        match_datetime, date, time,
-                        league, country, team1, team2,
-                        betcount,
-                        ms1, ms0, ms2, alt25, ust25,
-                        source_fetched_at_tr,
-                        pool_raw_json,
-                        updated_at
-                    )
-                    VALUES(
-                        :mid,
-                        :match_datetime, :date, :time,
-                        :league, :country, :team1, :team2,
-                        :betcount,
-                        :ms1, :ms0, :ms2, :alt25, :ust25,
-                        :source_fetched_at_tr,
-                        :pool_raw_json,
-                        NOW()
-                    )
-                    ON CONFLICT(nosy_match_id) DO UPDATE SET
-                        match_datetime        = EXCLUDED.match_datetime,
-                        date                 = EXCLUDED.date,
-                        time                 = EXCLUDED.time,
-                        league               = EXCLUDED.league,
-                        country              = EXCLUDED.country,
-                        team1                = EXCLUDED.team1,
-                        team2                = EXCLUDED.team2,
-                        betcount             = EXCLUDED.betcount,
-                        ms1                  = EXCLUDED.ms1,
-                        ms0                  = EXCLUDED.ms0,
-                        ms2                  = EXCLUDED.ms2,
-                        alt25                = EXCLUDED.alt25,
-                        ust25                = EXCLUDED.ust25,
-                        source_fetched_at_tr = EXCLUDED.source_fetched_at_tr,
-                        pool_raw_json        = EXCLUDED.pool_raw_json,
-                        updated_at           = NOW()
-                """),
-                {
-                    "mid": mid,
-                    "match_datetime": r.get("match_datetime") or "",
-                    "date": r.get("date") or "",
-                    "time": r.get("time") or "",
-                    "league": r.get("league") or "",
-                    "country": r.get("country") or "",
-                    "team1": r.get("team1") or "",
-                    "team2": r.get("team2") or "",
-                    "betcount": r.get("betcount"),
-                    "ms1": r.get("ms1"),
-                    "ms0": r.get("ms0"),
-                    "ms2": r.get("ms2"),
                     "alt25": r.get("alt25"),
                     "ust25": r.get("ust25"),
                     "source_fetched_at_tr": r.get("fetched_at_tr") or fetched_at_tr,
@@ -540,29 +442,70 @@ def sync_db_matches():
         "synced_at_tr": fetched_at_tr
     }
 
-@app.get("/db/matches")
-def list_db_matches(limit: int = Query(50, ge=1, le=500)):
+@app.get("/pool/bettable-matches")
+def get_pool_bettable_matches(
+    day: Optional[str] = Query(None, description="YYYY-MM-DD. Boşsa en son bülten."),
+    which: str = Query("latest", description="latest | oldest"),
+    limit: int = Query(50, ge=1, le=500)
+):
     """
-    matches tablosundaki maçları listeler (DB matches paneli için).
-    Varsayılan: son eklenen 50 kayıt.
+    Pool'dan bülten listeler.
+    - day yoksa: en son kaydedilen bülten (MAX fetched_at_tr)
+    - day varsa: o günün en son bülteni (MAX fetched_at_tr WHERE fetched_at_tr LIKE 'YYYY-MM-DD%')
+    - which=oldest: MIN fetched_at_tr (veya gün içindeki MIN)
     """
     with engine.begin() as conn:
+        # 1) Hangi snapshot (fetched_at_tr) gösterilecek?
+        if day:
+            # Gün içindeki en son/en eski snapshot
+            if which == "oldest":
+                snap = conn.execute(text("""
+                    SELECT MIN(fetched_at_tr) AS snap
+                    FROM pool_matches
+                    WHERE fetched_at_tr LIKE :daypat
+                """), {"daypat": f"{day}%"}).mappings().first()
+            else:
+                snap = conn.execute(text("""
+                    SELECT MAX(fetched_at_tr) AS snap
+                    FROM pool_matches
+                    WHERE fetched_at_tr LIKE :daypat
+                """), {"daypat": f"{day}%"}).mappings().first()
+        else:
+            # Tüm zamanların en son/en eski snapshot
+            if which == "oldest":
+                snap = conn.execute(text("""
+                    SELECT MIN(fetched_at_tr) AS snap
+                    FROM pool_matches
+                """)).mappings().first()
+            else:
+                snap = conn.execute(text("""
+                    SELECT MAX(fetched_at_tr) AS snap
+                    FROM pool_matches
+                """)).mappings().first()
+
+        snap_val = (snap or {}).get("snap")
+        if not snap_val:
+            return {"ok": True, "snapshot": None, "count": 0, "items": []}
+
+        # 2) O snapshot'a ait maçları getir
         rows = conn.execute(text("""
             SELECT
                 nosy_match_id,
                 match_datetime, date, time,
                 league, country, team1, team2,
-                betcount,
-                ms1, ms0, ms2, alt25, ust25,
-                source_fetched_at_tr,
-                updated_at
-            FROM matches
-            ORDER BY updated_at DESC
+                betcount, ms1, ms0, ms2, alt25, ust25,
+                fetched_at_tr
+            FROM pool_matches
+            WHERE fetched_at_tr = :snap
+            ORDER BY league, time, team1
             LIMIT :limit
-        """), {"limit": limit}).mappings().all()
+        """), {"snap": snap_val, "limit": limit}).mappings().all()
 
     return {
         "ok": True,
+        "day": day,
+        "which": which,
+        "snapshot": snap_val,
         "count": len(rows),
         "items": [dict(r) for r in rows],
     }
