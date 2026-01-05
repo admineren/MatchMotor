@@ -378,14 +378,6 @@ def sync_pool_bettable_matches():
         "creditUsed": payload.get("creditUsed"),
     }
 
-                    "alt25": r.get("alt25"),
-                    "ust25": r.get("ust25"),
-                    "source_fetched_at_tr": r.get("fetched_at_tr") or fetched_at_tr,
-                    "pool_raw_json": r.get("raw_json") or "",
-                }
-            )
-            upserted += 1
-
     return {
         "ok": True,
         "selected_from_pool": selected,
