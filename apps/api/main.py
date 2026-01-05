@@ -211,6 +211,34 @@ def ensure_schema():
             ADD COLUMN IF NOT EXISTS raw_json TEXT;
         """))
 
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS matches (
+                id BIGSERIAL PRIMARY KEY,
+                nosy_match_id BIGINT NOT NULL UNIQUE,
+                match_datetime TEXT,
+                date TEXT,
+                time TEXT,
+                league TEXT,
+                country TEXT,
+                team1 TEXT,
+                team2 TEXT,
+                betcount INT,
+                ms1 DOUBLE PRECISION,
+                ms0 DOUBLE PRECISION,
+                ms2 DOUBLE PRECISION,
+                alt25 DOUBLE PRECISION,
+                ust25 DOUBLE PRECISION,
+                source_fetched_at_tr TEXT,
+                pool_raw_json TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """))
+        
+        # telefon/console yoksa güvenli schema patch
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS source_fetched_at_tr TEXT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS pool_raw_json TEXT;"""))
+        
 # ---------------------------
 # Nosy CHECK endpoints (root base)
 # ---------------------------
@@ -381,4 +409,119 @@ def sync_pool_bettable_matches():
         "fetched_at_tr": fetched_at_tr,
         "rowCount": payload.get("rowCount"),
         "creditUsed": payload.get("creditUsed"),
+    }
+
+# --- Database SYNC ENDPOINT ---
+@app.post("/db/matches/sync")
+def sync_db_matches():
+    """
+    pool_matches -> matches
+    Havuzdaki maçları filtreleyip matches tablosuna upsert eder.
+    """
+    fetched_at_tr = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
+
+    selected = 0
+    upserted = 0
+    skipped = 0
+
+    with engine.begin() as conn:
+        # 1) Pool'dan adayları çek (minimum filtre)
+        rows = conn.execute(text("""
+            SELECT
+                nosy_match_id,
+                match_datetime, date, time,
+                league, country, team1, team2,
+                betcount,
+                ms1, ms0, ms2, alt25, ust25,
+                fetched_at_tr,
+                raw_json
+            FROM pool_matches
+            WHERE
+                nosy_match_id IS NOT NULL
+                AND ms1 IS NOT NULL AND ms0 IS NOT NULL AND ms2 IS NOT NULL
+        """)).mappings().all()
+
+        for r in rows:
+            selected += 1
+
+            # Ek (hafif) doğrulama
+            try:
+                mid = int(r["nosy_match_id"])
+            except Exception:
+                skipped += 1
+                continue
+
+            # İstersen burada daha sıkı filtre koyarsın:
+            # - betcount >= X
+            # - league whitelist
+            # - date/time dolu
+            # Şimdilik minimumda bıraktım.
+
+            conn.execute(
+                text("""
+                    INSERT INTO matches(
+                        nosy_match_id,
+                        match_datetime, date, time,
+                        league, country, team1, team2,
+                        betcount,
+                        ms1, ms0, ms2, alt25, ust25,
+                        source_fetched_at_tr,
+                        pool_raw_json,
+                        updated_at
+                    )
+                    VALUES(
+                        :mid,
+                        :match_datetime, :date, :time,
+                        :league, :country, :team1, :team2,
+                        :betcount,
+                        :ms1, :ms0, :ms2, :alt25, :ust25,
+                        :source_fetched_at_tr,
+                        :pool_raw_json,
+                        NOW()
+                    )
+                    ON CONFLICT(nosy_match_id) DO UPDATE SET
+                        match_datetime        = EXCLUDED.match_datetime,
+                        date                 = EXCLUDED.date,
+                        time                 = EXCLUDED.time,
+                        league               = EXCLUDED.league,
+                        country              = EXCLUDED.country,
+                        team1                = EXCLUDED.team1,
+                        team2                = EXCLUDED.team2,
+                        betcount             = EXCLUDED.betcount,
+                        ms1                  = EXCLUDED.ms1,
+                        ms0                  = EXCLUDED.ms0,
+                        ms2                  = EXCLUDED.ms2,
+                        alt25                = EXCLUDED.alt25,
+                        ust25                = EXCLUDED.ust25,
+                        source_fetched_at_tr = EXCLUDED.source_fetched_at_tr,
+                        pool_raw_json        = EXCLUDED.pool_raw_json,
+                        updated_at           = NOW()
+                """),
+                {
+                    "mid": mid,
+                    "match_datetime": r.get("match_datetime") or "",
+                    "date": r.get("date") or "",
+                    "time": r.get("time") or "",
+                    "league": r.get("league") or "",
+                    "country": r.get("country") or "",
+                    "team1": r.get("team1") or "",
+                    "team2": r.get("team2") or "",
+                    "betcount": r.get("betcount"),
+                    "ms1": r.get("ms1"),
+                    "ms0": r.get("ms0"),
+                    "ms2": r.get("ms2"),
+                    "alt25": r.get("alt25"),
+                    "ust25": r.get("ust25"),
+                    "source_fetched_at_tr": r.get("fetched_at_tr") or fetched_at_tr,
+                    "pool_raw_json": r.get("raw_json") or "",
+                }
+            )
+            upserted += 1
+
+    return {
+        "ok": True,
+        "selected_from_pool": selected,
+        "upserted_into_matches": upserted,
+        "skipped": skipped,
+        "synced_at_tr": fetched_at_tr
     }
