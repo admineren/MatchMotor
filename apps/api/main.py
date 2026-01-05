@@ -238,7 +238,20 @@ def ensure_schema():
         # telefon/console yoksa güvenli schema patch
         conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS source_fetched_at_tr TEXT;"""))
         conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS pool_raw_json TEXT;"""))
-        
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ust25 DOUBLE PRECISION;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS alt25 DOUBLE PRECISION;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_datetime TEXT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS date TEXT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS time TEXT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS league TEXT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS country TEXT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS team1 TEXT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS team2 TEXT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS betcount INT;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms1 DOUBLE PRECISION;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms0 DOUBLE PRECISION;"""))
+        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms2 DOUBLE PRECISION;"""))
+
 # ---------------------------
 # Nosy CHECK endpoints (root base)
 # ---------------------------
