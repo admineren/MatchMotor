@@ -664,3 +664,34 @@ def list_finished_matches(limit: int = Query(50, ge=1, le=500)):
         """), {"limit": limit}).mappings().all()
 
     return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
+
+@app.get("/health/metrics")
+def health_metrics():
+    with engine.begin() as conn:
+        # pool totals + latest snapshot
+        pool_total = conn.execute(text("SELECT COUNT(*) AS c FROM pool_matches")).mappings().first()["c"]
+        pool_latest = conn.execute(text("SELECT MAX(fetched_at_tr) AS mx FROM pool_matches")).mappings().first()["mx"]
+
+        pool_latest_count = 0
+        if pool_latest:
+            pool_latest_count = conn.execute(
+                text("SELECT COUNT(*) AS c FROM pool_matches WHERE fetched_at_tr = :mx"),
+                {"mx": pool_latest}
+            ).mappings().first()["c"]
+
+        # finished totals + latest snapshot
+        finished_total = conn.execute(text("SELECT COUNT(*) AS c FROM finished_matches")).mappings().first()["c"]
+        finished_latest = conn.execute(text("SELECT MAX(fetched_at_tr) AS mx FROM finished_matches")).mappings().first()["mx"]
+
+    return {
+        "ok": True,
+        "pool": {
+            "total_in_db": int(pool_total),
+            "latest_snapshot": pool_latest,
+            "latest_snapshot_count": int(pool_latest_count),
+        },
+        "finished": {
+            "total_in_db": int(finished_total),
+            "latest_snapshot": finished_latest,
+        }
+    }
