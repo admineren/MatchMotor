@@ -400,7 +400,7 @@ def sync_pool_bettable_matches():
                         nosy_match_id, date, time, match_datetime,
                         league, country, team1, team2,
                         ms1, ms0, ms2, alt25, ust25, betcount,
-                        fetched_at_tr, raw_json, game_result
+                        fetched_at_tr, raw_json, game_result,
                     )
                     VALUES(
                         :mid, :date, :time, :dt,
@@ -425,7 +425,7 @@ def sync_pool_bettable_matches():
                         betcount      = EXCLUDED.betcount,
                         fetched_at_tr = EXCLUDED.fetched_at_tr,
                         raw_json      = EXCLUDED.raw_json
-                        game_result   = EXCLUDED.game_result
+                        game_result   = EXCLUDED.game_result,
                 """),
                 {
                     "mid": match_id,
