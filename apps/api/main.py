@@ -539,3 +539,30 @@ def sync_db_matches():
         "skipped": skipped,
         "synced_at_tr": fetched_at_tr
     }
+
+@app.get("/db/matches")
+def list_db_matches(limit: int = Query(50, ge=1, le=500)):
+    """
+    matches tablosundaki maçları listeler (DB matches paneli için).
+    Varsayılan: son eklenen 50 kayıt.
+    """
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                nosy_match_id,
+                match_datetime, date, time,
+                league, country, team1, team2,
+                betcount,
+                ms1, ms0, ms2, alt25, ust25,
+                source_fetched_at_tr,
+                updated_at
+            FROM matches
+            ORDER BY updated_at DESC
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
+
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": [dict(r) for r in rows],
+    }
