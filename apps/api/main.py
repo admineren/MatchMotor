@@ -865,3 +865,203 @@ def health_metrics():
             "latest_snapshot_count": int(finished_latest_count),
         }
     }
+
+# ------------------------------------------------------------
+# League Profile Stats
+# finished_matches -> aggregation -> panel context
+# ------------------------------------------------------------
+
+@app.get("/stats/league-profile")
+def stats_league_profile(
+    league_code: str = Query(..., min_length=1),
+    league: str = Query(..., min_length=1),
+    min_matches: int = Query(10, ge=1, le=5000),
+):
+    """
+    finished_matches tablosundan lig bazlı profil (V1) üretir.
+    - league_code + league zorunlu
+    - default all-time
+    """
+
+    def _rate(cnt: int, total: int) -> float:
+        if not total:
+            return 0.0
+        return float(cnt) / float(total)
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT
+                    COUNT(*)::int AS match_count,
+
+                    -- 1X2 (FT skoruna göre)
+                    COUNT(*) FILTER (WHERE ft_home > ft_away)::int AS home_win_count,
+                    COUNT(*) FILTER (WHERE ft_home = ft_away)::int AS draw_count,
+                    COUNT(*) FILTER (WHERE ft_home < ft_away)::int AS away_win_count,
+
+                    -- goals
+                    AVG((ft_home + ft_away)::numeric) AS avg_goals_total,
+                    COUNT(*) FILTER (WHERE (ft_home + ft_away) >= 3)::int AS over25_count,
+                    COUNT(*) FILTER (WHERE ft_home > 0 AND ft_away > 0)::int AS btts_count,
+
+                    -- goal distribution buckets
+                    COUNT(*) FILTER (WHERE (ft_home + ft_away) BETWEEN 0 AND 1)::int AS g0_1_count,
+                    COUNT(*) FILTER (WHERE (ft_home + ft_away) BETWEEN 2 AND 3)::int AS g2_3_count,
+                    COUNT(*) FILTER (WHERE (ft_home + ft_away) BETWEEN 4 AND 5)::int AS g4_5_count,
+                    COUNT(*) FILTER (WHERE (ft_home + ft_away) >= 6)::int AS g6p_count,
+
+                    -- corners
+                    AVG((COALESCE(home_corner,0) + COALESCE(away_corner,0))::numeric) AS avg_corners_total,
+                    AVG(COALESCE(home_corner,0)::numeric) AS avg_home_corner,
+                    AVG(COALESCE(away_corner,0)::numeric) AS avg_away_corner,
+
+                    -- yellow cards
+                    AVG((COALESCE(home_yellow,0) + COALESCE(away_yellow,0))::numeric) AS avg_yellow_total,
+                    AVG(COALESCE(home_yellow,0)::numeric) AS avg_yellow_home,
+                    AVG(COALESCE(away_yellow,0)::numeric) AS avg_yellow_away,
+
+                    -- red cards (match-level)
+                    COUNT(*) FILTER (
+                        WHERE (COALESCE(home_red,0) + COALESCE(away_red,0)) > 0
+                    )::int AS red_match_count
+
+                FROM finished_matches
+                WHERE league_code = :league_code
+                  AND league = :league
+            """),
+            {"league_code": league_code, "league": league},
+        ).mappings().first()
+
+    # Eğer hiç maç yoksa boş profil döndür
+    if not row:
+        return {
+            "ok": True,
+            "league_code": league_code,
+            "league": league,
+            "sample": {"match_count": 0, "low_sample": True, "min_matches": min_matches},
+            "one_x_two": {
+                "home": {"count": 0, "rate": 0.0},
+                "draw": {"count": 0, "rate": 0.0},
+                "away": {"count": 0, "rate": 0.0},
+            },
+            "goals": {
+                "avg_total": 0.0,
+                "over25": {"count": 0, "rate": 0.0},
+                "btts": {"count": 0, "rate": 0.0},
+                "distribution": {
+                    "g0_1": {"count": 0, "rate": 0.0},
+                    "g2_3": {"count": 0, "rate": 0.0},
+                    "g4_5": {"count": 0, "rate": 0.0},
+                    "g6p": {"count": 0, "rate": 0.0},
+                },
+            },
+            "corners": {"avg_total": 0.0, "avg_home": 0.0, "avg_away": 0.0},
+            "cards": {
+                "avg_yellow_total": 0.0,
+                "avg_yellow_home": 0.0,
+                "avg_yellow_away": 0.0,
+                "red_match": {"count": 0, "rate": 0.0},
+            },
+        }
+
+    match_count = int(row["match_count"] or 0)
+
+    # counts
+    home_win_count = int(row["home_win_count"] or 0)
+    draw_count = int(row["draw_count"] or 0)
+    away_win_count = int(row["away_win_count"] or 0)
+
+    over25_count = int(row["over25_count"] or 0)
+    btts_count = int(row["btts_count"] or 0)
+
+    g0_1_count = int(row["g0_1_count"] or 0)
+    g2_3_count = int(row["g2_3_count"] or 0)
+    g4_5_count = int(row["g4_5_count"] or 0)
+    g6p_count = int(row["g6p_count"] or 0)
+
+    red_match_count = int(row["red_match_count"] or 0)
+
+    # avgs (numeric -> float)
+    avg_goals_total = float(row["avg_goals_total"] or 0.0)
+
+    avg_corners_total = float(row["avg_corners_total"] or 0.0)
+    avg_home_corner = float(row["avg_home_corner"] or 0.0)
+    avg_away_corner = float(row["avg_away_corner"] or 0.0)
+
+    avg_yellow_total = float(row["avg_yellow_total"] or 0.0)
+    avg_yellow_home = float(row["avg_yellow_home"] or 0.0)
+    avg_yellow_away = float(row["avg_yellow_away"] or 0.0)
+
+    low_sample = match_count < int(min_matches)
+
+    return {
+        "ok": True,
+        "league_code": league_code,
+        "league": league,
+        "sample": {
+            "match_count": match_count,
+            "low_sample": low_sample,
+            "min_matches": int(min_matches),
+        },
+        "one_x_two": {
+            "home": {"count": home_win_count, "rate": _rate(home_win_count, match_count)},
+            "draw": {"count": draw_count, "rate": _rate(draw_count, match_count)},
+            "away": {"count": away_win_count, "rate": _rate(away_win_count, match_count)},
+        },
+        "goals": {
+            "avg_total": avg_goals_total,
+            "over25": {"count": over25_count, "rate": _rate(over25_count, match_count)},
+            "btts": {"count": btts_count, "rate": _rate(btts_count, match_count)},
+            "distribution": {
+                "g0_1": {"count": g0_1_count, "rate": _rate(g0_1_count, match_count)},
+                "g2_3": {"count": g2_3_count, "rate": _rate(g2_3_count, match_count)},
+                "g4_5": {"count": g4_5_count, "rate": _rate(g4_5_count, match_count)},
+                "g6p": {"count": g6p_count, "rate": _rate(g6p_count, match_count)},
+            },
+        },
+        "corners": {
+            "avg_total": avg_corners_total,
+            "avg_home": avg_home_corner,
+            "avg_away": avg_away_corner,
+        },
+        "cards": {
+            "avg_yellow_total": avg_yellow_total,
+            "avg_yellow_home": avg_yellow_home,
+            "avg_yellow_away": avg_yellow_away,
+            "red_match": {"count": red_match_count, "rate": _rate(red_match_count, match_count)},
+        },
+              }
+
+@app.get("/stats/organizations")
+def stats_organizations(
+    min_matches: int = Query(1, ge=1, le=100000),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """
+    finished_matches içinden organizasyon (league_code + league) listesini döner.
+    Her organizasyon için toplam maç sayısı ve ilk/son tarih.
+    """
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT
+                    league_code,
+                    league,
+                    COUNT(*)::int AS match_count,
+                    MIN(date) AS first_date,
+                    MAX(date) AS last_date
+                FROM finished_matches
+                GROUP BY league_code, league
+                HAVING COUNT(*) >= :min_matches
+                ORDER BY match_count DESC
+                LIMIT :limit
+            """),
+            {"min_matches": min_matches, "limit": limit},
+        ).mappings().all()
+
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": [dict(r) for r in rows],
+    }
