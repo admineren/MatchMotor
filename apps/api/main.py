@@ -251,6 +251,7 @@ def ensure_schema():
         conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms1 DOUBLE PRECISION;"""))
         conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms0 DOUBLE PRECISION;"""))
         conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms2 DOUBLE PRECISION;"""))
+        conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS ux_matches_nosy_match_id ON matches (nosy_match_id);"""))
 
 # ---------------------------
 # Nosy CHECK endpoints (root base)
