@@ -229,6 +229,7 @@ def ensure_schema():
         # 🔧 telefon kurtarıcı patch
         conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS fetched_at_tr TEXT;"""))
         conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS raw_json TEXT;"""))
+        conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS game_result INTEGER;"""))
 
 # -----------------------------
 # FINISHED MATCHES (matches-result snapshot)
@@ -399,13 +400,14 @@ def sync_pool_bettable_matches():
                         nosy_match_id, date, time, match_datetime,
                         league, country, team1, team2,
                         ms1, ms0, ms2, alt25, ust25, betcount,
-                        fetched_at_tr, raw_json
+                        fetched_at_tr, raw_json, game_result
                     )
                     VALUES(
                         :mid, :date, :time, :dt,
                         :league, :country, :team1, :team2,
                         :ms1, :ms0, :ms2, :alt25, :ust25, :betcount,
                         :fetched_at_tr, :raw_json
+                        :game_result
                     )
                     ON CONFLICT(nosy_match_id) DO UPDATE SET
                         date          = EXCLUDED.date,
@@ -423,6 +425,7 @@ def sync_pool_bettable_matches():
                         betcount      = EXCLUDED.betcount,
                         fetched_at_tr = EXCLUDED.fetched_at_tr,
                         raw_json      = EXCLUDED.raw_json
+                        game_result   = EXCLUDED.game_result
                 """),
                 {
                     "mid": match_id,
@@ -439,6 +442,7 @@ def sync_pool_bettable_matches():
                     "alt25": alt25,
                     "ust25": ust25,
                     "betcount": betcount,
+                    "game_result": item.get("GameResult"),
                     "fetched_at_tr": fetched_at_tr,
                     "raw_json": _dump_json(item),
                 }
@@ -515,7 +519,7 @@ def get_pool_bettable_matches(
                 nosy_match_id,
                 match_datetime, date, time,
                 league, country, team1, team2,
-                betcount, ms1, ms0, ms2, alt25, ust25,
+                betcount, game_results, ms1, ms0, ms2, alt25, ust25,
                 fetched_at_tr
             FROM pool_matches
             WHERE fetched_at_tr = :snap
