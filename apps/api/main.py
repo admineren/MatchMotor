@@ -1,5 +1,6 @@
 import os
 import requests
+import json
 import datetime as dt
 
 from fastapi import FastAPI, HTTPException, Query
@@ -51,6 +52,86 @@ try:
 except Exception:
     TR_TZ = None  # zoneinfo yoksa health'ta sadece UTC döneceğiz
 
+# ---------------------------
+# Helpers
+# ---------------------------
+def _dump_json(obj) -> str:
+    """
+    Dict / list gibi yapıları güvenli şekilde JSON stringe çevirir.
+    Pool katmanı için yeterli.
+    """
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return "{}"
+
+def _require_api_key():
+    if not NOSY_API_KEY:
+        raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
+
+def _join_url(base: str, endpoint: str) -> str:
+    base = (base or "").rstrip("/")
+    endpoint = (endpoint or "").lstrip("/")
+    return f"{base}/{endpoint}"
+
+def nosy_service_call(endpoint: str, *, params: dict | None = None) -> dict:
+    """
+    SERVICE base üzerinden çağrı:
+    https://www.nosyapi.com/apiv2/service/<endpoint>
+    """
+    _require_api_key()
+    url = _join_url(NOSY_SERVICE_BASE_URL, endpoint)
+
+    q = dict(params or {})
+    q["apiKey"] = NOSY_API_KEY
+
+    try:
+        r = requests.get(url, params=q, timeout=30)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Nosy bağlantı hatası: {e}")
+
+    # Nosy bazen 200 dönüp status=failure verir; o yüzden json’u döndürüp üstte kontrol etmek daha iyi.
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
+
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
+
+def nosy_check_call(api_id: str) -> dict:
+    """
+    CHECK base üzerinden çağrı:
+    https://www.nosyapi.com/apiv2/nosy-service/check?apiKey=...&apiID=...
+    """
+    _require_api_key()
+    if not api_id:
+        raise HTTPException(status_code=500, detail="Check için apiID env eksik.")
+
+    url = _join_url(NOSY_CHECK_BASE_URL, "nosy-service/check")
+    q = {"apiKey": NOSY_API_KEY, "apiID": api_id}
+
+    try:
+        r = requests.get(url, params=q, timeout=30)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Nosy check bağlantı hatası: {e}")
+
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
+
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
+
 # ==========================================================
 # APP
 # ==========================================================
@@ -87,18 +168,11 @@ def health():
         },
     }
 
-# ---------------------------
-# Helpers
-# ---------------------------
-
-def _join_url(base: str, endpoint: str) -> str:
-    base = (base or "").rstrip("/")
-    endpoint = (endpoint or "").lstrip("/")
-    return f"{base}/{endpoint}"
 
 # ==========================================================
 # DATABASE SCHEMA
 # ==========================================================
+
 def ensure_schema() -> None:
     if engine is None:
         raise RuntimeError("DATABASE_URL env eksik; DB engine oluşmadı.")
@@ -164,68 +238,6 @@ def ensure_schema() -> None:
         );
         """))
 
-def _require_api_key():
-    if not NOSY_API_KEY:
-        raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
-
-def nosy_service_call(endpoint: str, *, params: dict | None = None) -> dict:
-    """
-    SERVICE base üzerinden çağrı:
-    https://www.nosyapi.com/apiv2/service/<endpoint>
-    """
-    _require_api_key()
-    url = _join_url(NOSY_SERVICE_BASE_URL, endpoint)
-
-    q = dict(params or {})
-    q["apiKey"] = NOSY_API_KEY
-
-    try:
-        r = requests.get(url, params=q, timeout=30)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Nosy bağlantı hatası: {e}")
-
-    # Nosy bazen 200 dönüp status=failure verir; o yüzden json’u döndürüp üstte kontrol etmek daha iyi.
-    if r.status_code >= 400:
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text}
-        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
-
-    try:
-        return r.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
-
-def nosy_check_call(api_id: str) -> dict:
-    """
-    CHECK base üzerinden çağrı:
-    https://www.nosyapi.com/apiv2/nosy-service/check?apiKey=...&apiID=...
-    """
-    _require_api_key()
-    if not api_id:
-        raise HTTPException(status_code=500, detail="Check için apiID env eksik.")
-
-    url = _join_url(NOSY_CHECK_BASE_URL, "nosy-service/check")
-    q = {"apiKey": NOSY_API_KEY, "apiID": api_id}
-
-    try:
-        r = requests.get(url, params=q, timeout=30)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Nosy check bağlantı hatası: {e}")
-
-    if r.status_code >= 400:
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text}
-        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
-
-    try:
-        return r.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
-
 # ---------------------------
 # Nosy CHECK endpoints (root base)
 # ---------------------------
@@ -241,7 +253,6 @@ def nosy_check_bettable_result():
 @app.get("/nosy/check/matches-result")
 def nosy_check_matches_result():
     return nosy_check_call(NOSY_CHECK_API_ID_MATCHES_RESULT)
-
 
 # ---------------------------
 # Nosy SERVICE proxy endpoints
