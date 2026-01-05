@@ -173,69 +173,42 @@ def health():
 # DATABASE SCHEMA
 # ==========================================================
 
-def ensure_schema() -> None:
+def ensure_schema():
     if engine is None:
-        raise RuntimeError("DATABASE_URL env eksik; DB engine oluşmadı.")
+        raise RuntimeError("DATABASE_URL env eksik")
 
     with engine.begin() as conn:
         conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS pool_matches (
-            id BIGSERIAL PRIMARY KEY,
-
-            nosy_match_id BIGINT NOT NULL UNIQUE,
-
-            match_datetime TEXT,
-            date TEXT,
-            time TEXT,
-
-            league TEXT,
-            country TEXT,
-            team1 TEXT,
-            team2 TEXT,
-
-            betcount INT,
-            ms1 DOUBLE PRECISION,
-            ms0 DOUBLE PRECISION,
-            ms2 DOUBLE PRECISION,
-            alt25 DOUBLE PRECISION,
-            ust25 DOUBLE PRECISION,
-  
-            fetched_at_tr TEXT,
-            raw_json TEXT
-        );
+            CREATE TABLE IF NOT EXISTS pool_matches (
+                id BIGSERIAL PRIMARY KEY,
+                nosy_match_id BIGINT NOT NULL UNIQUE,
+                match_datetime TEXT,
+                date TEXT,
+                time TEXT,
+                league TEXT,
+                country TEXT,
+                team1 TEXT,
+                team2 TEXT,
+                betcount INT,
+                ms1 DOUBLE PRECISION,
+                ms0 DOUBLE PRECISION,
+                ms2 DOUBLE PRECISION,
+                alt25 DOUBLE PRECISION,
+                ust25 DOUBLE PRECISION,
+                fetched_at_tr TEXT,
+                raw_json TEXT
+            );
         """))
-        
+
+        # 🔧 telefon kurtarıcı patch
+        conn.execute(text("""
+            ALTER TABLE pool_matches
+            ADD COLUMN IF NOT EXISTS fetched_at_tr TEXT;
+        """))
 
         conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS db_matches (
-            id BIGSERIAL PRIMARY KEY,
-            nosy_match_id BIGINT UNIQUE,
-            match_datetime TEXT,
-            league TEXT,
-            country TEXT,
-            team1 TEXT,
-            team2 TEXT,
-            betcount INT,
-            ms1 DOUBLE PRECISION,
-            ms0 DOUBLE PRECISION,
-            ms2 DOUBLE PRECISION,
-            alt25 DOUBLE PRECISION,
-            ust25 DOUBLE PRECISION,
-            ht_home INT,
-            ht_away INT,
-            ms_home INT,
-            ms_away INT,
-            home_corner INT,
-            away_corner INT,
-            home_yellow INT,
-            away_yellow INT,
-            home_red INT,
-            away_red INT,
-            created_at TEXT,
-            updated_at TEXT,
-            raw_json_odds TEXT,
-            raw_json_result TEXT
-        );
+            ALTER TABLE pool_matches
+            ADD COLUMN IF NOT EXISTS raw_json TEXT;
         """))
 
 # ---------------------------
