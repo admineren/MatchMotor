@@ -649,21 +649,88 @@ def sync_finished_matches():
 from fastapi import Query
 
 @app.get("/db/finished-matches")
-def list_finished_matches(limit: int = Query(50, ge=1, le=500)):
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT
-                nosy_match_id, league, team1, team2,
-                date, time,
-                ms1, ms0, ms2, alt25, ust25,
-                ft_home, ft_away, ht_home, ht_away,
-                betcount, fetched_at_tr, updated_at
-            FROM finished_matches
-            ORDER BY updated_at DESC
-            LIMIT :limit
-        """), {"limit": limit}).mappings().all()
+def list_finished_matches(
+    day: str | None = Query(default=None, description="YYYY-MM-DD. Boşsa en son snapshot."),
+    which: str = Query(default="latest", description="latest | oldest"),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    """
+    Finished matches listesi.
+    - day boşsa: en son (veya oldest seçilirse ilk) snapshot'tan limit kadar döner
+    - day doluysa: o günün biten maçlarını döner
+    """
+    which = (which or "latest").lower().strip()
+    if which not in ("latest", "oldest"):
+        which = "latest"
 
-    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
+    # snapshot seçimi için MAX/MIN
+    snap_sql = "MAX" if which == "latest" else "MIN"
+
+    with engine.begin() as conn:
+        if day:
+            # O gün biten maçlar
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        nosy_match_id,
+                        league, team1, team2,
+                        date, time,
+                        ms1, ms0, ms2, alt25, ust25,
+                        ft_home, ft_away, ht_home, ht_away,
+                        betcount,
+                        fetched_at_tr,
+                        updated_at
+                    FROM finished_matches
+                    WHERE date = :day
+                    ORDER BY match_datetime NULLS LAST, nosy_match_id
+                    LIMIT :limit
+                """),
+                {"day": day, "limit": limit},
+            ).mappings().all()
+
+            return {
+                "ok": True,
+                "day": day,
+                "which": None,
+                "count": len(rows),
+                "items": [dict(r) for r in rows],
+            }
+
+        # day yoksa: snapshot’a göre döndür
+        snapshot = conn.execute(
+            text(f"SELECT {snap_sql}(fetched_at_tr) AS snap FROM finished_matches")
+        ).scalar()
+
+        if not snapshot:
+            return {"ok": True, "day": None, "which": which, "snapshot": None, "count": 0, "items": []}
+
+        rows = conn.execute(
+            text("""
+                SELECT
+                    nosy_match_id,
+                    league, team1, team2,
+                    date, time,
+                    ms1, ms0, ms2, alt25, ust25,
+                    ft_home, ft_away, ht_home, ht_away,
+                    betcount,
+                    fetched_at_tr,
+                    updated_at
+                FROM finished_matches
+                WHERE fetched_at_tr = :snapshot
+                ORDER BY match_datetime NULLS LAST, nosy_match_id
+                LIMIT :limit
+            """),
+            {"snapshot": snapshot, "limit": limit},
+        ).mappings().all()
+
+        return {
+            "ok": True,
+            "day": None,
+            "which": which,
+            "snapshot": snapshot,
+            "count": len(rows),
+            "items": [dict(r) for r in rows],
+        }
 
 @app.get("/health/metrics")
 def health_metrics():
