@@ -292,7 +292,7 @@ def sync_pool_bettable_matches():
     NosyAPI -> bettable-matches
     Günün bültenini çekip pool_matches tablosuna upsert eder.
     """
-    payload = nosy_service_get("bettable-matches")  # senin mevcut helper'ın: /service + apiKey
+    payload = nosy_service_call("bettable-matches")  # senin mevcut helper'ın: /service + apiKey
     data = payload.get("data") or []
     received = len(data)
 
