@@ -202,58 +202,10 @@ def ensure_schema():
         """))
 
         # 🔧 telefon kurtarıcı patch
-        conn.execute(text("""
-            ALTER TABLE pool_matches
-            ADD COLUMN IF NOT EXISTS fetched_at_tr TEXT;
-        """))
+        conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS fetched_at_tr TEXT;"""))
+        conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS raw_json TEXT;"""))
 
-        conn.execute(text("""
-            ALTER TABLE pool_matches
-            ADD COLUMN IF NOT EXISTS raw_json TEXT;
-        """))
-
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS matches (
-                id BIGSERIAL PRIMARY KEY,
-                nosy_match_id BIGINT NOT NULL UNIQUE,
-                match_datetime TEXT,
-                date TEXT,
-                time TEXT,
-                league TEXT,
-                country TEXT,
-                team1 TEXT,
-                team2 TEXT,
-                betcount INT,
-                ms1 DOUBLE PRECISION,
-                ms0 DOUBLE PRECISION,
-                ms2 DOUBLE PRECISION,
-                alt25 DOUBLE PRECISION,
-                ust25 DOUBLE PRECISION,
-                source_fetched_at_tr TEXT,
-                pool_raw_json TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-        """))
-        
-        # telefon/console yoksa güvenli schema patch
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS source_fetched_at_tr TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS pool_raw_json TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ust25 DOUBLE PRECISION;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS alt25 DOUBLE PRECISION;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_datetime TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS date TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS time TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS league TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS country TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS team1 TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS team2 TEXT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS betcount INT;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms1 DOUBLE PRECISION;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms0 DOUBLE PRECISION;"""))
-        conn.execute(text("""ALTER TABLE matches ADD COLUMN IF NOT EXISTS ms2 DOUBLE PRECISION;"""))
-        conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS ux_matches_nosy_match_id ON matches (nosy_match_id);"""))
-
+                
 # ---------------------------
 # Nosy CHECK endpoints (root base)
 # ---------------------------
