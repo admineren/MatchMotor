@@ -192,6 +192,8 @@ def nosy_bettable_result_details(gameID: int = Query(..., description="Nosy game
     return nosy_service_call("bettable-result/details", params={"gameID": gameID})
 
 @app.get("/nosy/bettable-matches/opening-odds")
-def nosy_bettable_matches_opening_odds():
-    # İddaa programındaki oyunun açıldığı andaki oranlar
-    return nosy_service_call("bettable-matches/opening-odds")
+def nosy_bettable_matches_opening_odds(
+    matchID: int = Query(..., description="Nosy MatchID (zorunlu)")
+):
+    # Açılış oranları (tek maç) - matchID şart
+    return nosy_service_call("bettable-matches/opening-odds", params={"matchID": matchID})
