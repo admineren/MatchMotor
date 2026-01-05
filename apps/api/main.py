@@ -266,6 +266,16 @@ def ensure_schema():
         """))
 
         conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS ux_finished_matches_mid ON finished_matches (nosy_match_id);"""))
+        
+        # finished_matches: corner + kart kolonları
+        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS home_corner INTEGER"))
+        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS away_corner INTEGER"))
+
+        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS home_yellow INTEGER"))
+        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS away_yellow INTEGER"))
+
+        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS home_red INTEGER"))
+        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS away_red INTEGER"))
              
 # ---------------------------
 # Nosy CHECK endpoints (root base)
@@ -519,7 +529,7 @@ def get_pool_bettable_matches(
 def sync_finished_matches():
     """
     NosyAPI -> matches-result
-    Biten maçları (oran + skor) finished_matches tablosuna upsert eder.
+    Biten maçları (oran + skor + corner/kart) finished_matches tablosuna upsert eder.
     """
     payload = nosy_service_call("matches-result")
     data = payload.get("data") or []
@@ -545,10 +555,21 @@ def sync_finished_matches():
                 continue
 
             meta = _meta_map(item.get("matchResult"))
+
             ft_home = _to_int(meta.get("msHomeScore"))
             ft_away = _to_int(meta.get("msAwayScore"))
             ht_home = _to_int(meta.get("htHomeScore"))
             ht_away = _to_int(meta.get("htAwayScore"))
+
+            # corner/kart
+            home_corner = _to_int(meta.get("homeCorner"))
+            away_corner = _to_int(meta.get("awayCorner"))
+
+            home_yellow = _to_int(meta.get("homeyellowCard"))
+            away_yellow = _to_int(meta.get("awayyellowCard"))
+
+            home_red = _to_int(meta.get("homeredCard"))
+            away_red = _to_int(meta.get("awayredCard"))
 
             # skor yoksa "finished" sayma
             if ft_home is None or ft_away is None:
@@ -563,6 +584,9 @@ def sync_finished_matches():
                         league_code, league, country, team1, team2,
                         betcount, ms1, ms0, ms2, alt25, ust25,
                         ft_home, ft_away, ht_home, ht_away,
+                        home_corner, away_corner,
+                        home_yellow, away_yellow,
+                        home_red, away_red,
                         mb, result, game_result, live_status,
                         fetched_at_tr, raw_json,
                         updated_at
@@ -573,6 +597,9 @@ def sync_finished_matches():
                         :league_code, :league, :country, :team1, :team2,
                         :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
                         :ft_home, :ft_away, :ht_home, :ht_away,
+                        :home_corner, :away_corner,
+                        :home_yellow, :away_yellow,
+                        :home_red, :away_red,
                         :mb, :result, :game_result, :live_status,
                         :fetched_at_tr, :raw_json,
                         NOW()
@@ -596,6 +623,12 @@ def sync_finished_matches():
                         ft_away = EXCLUDED.ft_away,
                         ht_home = EXCLUDED.ht_home,
                         ht_away = EXCLUDED.ht_away,
+                        home_corner = EXCLUDED.home_corner,
+                        away_corner = EXCLUDED.away_corner,
+                        home_yellow = EXCLUDED.home_yellow,
+                        away_yellow = EXCLUDED.away_yellow,
+                        home_red = EXCLUDED.home_red,
+                        away_red = EXCLUDED.away_red,
                         mb = EXCLUDED.mb,
                         result = EXCLUDED.result,
                         game_result = EXCLUDED.game_result,
@@ -624,6 +657,12 @@ def sync_finished_matches():
                     "ft_away": ft_away,
                     "ht_home": ht_home,
                     "ht_away": ht_away,
+                    "home_corner": home_corner,
+                    "away_corner": away_corner,
+                    "home_yellow": home_yellow,
+                    "away_yellow": away_yellow,
+                    "home_red": home_red,
+                    "away_red": away_red,
                     "mb": item.get("MB"),
                     "result": item.get("Result"),
                     "game_result": item.get("GameResult"),
@@ -644,13 +683,11 @@ def sync_finished_matches():
         "fetched_at_tr": fetched_at_tr,
         "rowCount": payload.get("rowCount"),
         "creditUsed": payload.get("creditUsed"),
-            }
-
-from fastapi import Query
+    }
 
 @app.get("/db/finished-matches")
 def list_finished_matches(
-    day: str | None = Query(default=None, description="YYYY-MM-DD. Boşsa en son snapshot."),
+    day: Optional[str] = Query(default=None, description="YYYY-MM-DD. Boşsa en son snapshot."),
     which: str = Query(default="latest", description="latest | oldest"),
     limit: int = Query(default=50, ge=1, le=500),
 ):
@@ -663,12 +700,49 @@ def list_finished_matches(
     if which not in ("latest", "oldest"):
         which = "latest"
 
-    # snapshot seçimi için MAX/MIN
     snap_sql = "MAX" if which == "latest" else "MIN"
+
+    def _decorate_rows(rows):
+        items = []
+        for r in rows:
+            d = dict(r)
+
+            # skor stringleri
+            d["ft"] = f'{d["ft_home"]}-{d["ft_away"]}' if d.get("ft_home") is not None and d.get("ft_away") is not None else None
+            d["ht"] = f'{d["ht_home"]}-{d["ht_away"]}' if d.get("ht_home") is not None and d.get("ht_away") is not None else None
+
+            # corners
+            hc, ac = d.get("home_corner"), d.get("away_corner")
+            if hc is not None and ac is not None:
+                d["corners_total"] = hc + ac
+                d["corners"] = f"{hc}-{ac}"
+            else:
+                d["corners_total"] = None
+                d["corners"] = None
+
+            # yellow cards
+            hy, ay = d.get("home_yellow"), d.get("away_yellow")
+            if hy is not None and ay is not None:
+                d["yc_total"] = hy + ay
+                d["yc"] = f"{hy}-{ay}"
+            else:
+                d["yc_total"] = None
+                d["yc"] = None
+
+            # red cards
+            hr, ar = d.get("home_red"), d.get("away_red")
+            if hr is not None and ar is not None:
+                d["rc_total"] = hr + ar
+                d["rc"] = f"{hr}-{ar}"
+            else:
+                d["rc_total"] = None
+                d["rc"] = None
+
+            items.append(d)
+        return items
 
     with engine.begin() as conn:
         if day:
-            # O gün biten maçlar
             rows = conn.execute(
                 text("""
                     SELECT
@@ -677,6 +751,9 @@ def list_finished_matches(
                         date, time,
                         ms1, ms0, ms2, alt25, ust25,
                         ft_home, ft_away, ht_home, ht_away,
+                        home_corner, away_corner,
+                        home_yellow, away_yellow,
+                        home_red, away_red,
                         betcount,
                         fetched_at_tr,
                         updated_at
@@ -688,15 +765,15 @@ def list_finished_matches(
                 {"day": day, "limit": limit},
             ).mappings().all()
 
+            items = _decorate_rows(rows)
             return {
                 "ok": True,
                 "day": day,
                 "which": None,
-                "count": len(rows),
-                "items": [dict(r) for r in rows],
+                "count": len(items),
+                "items": items,
             }
 
-        # day yoksa: snapshot’a göre döndür
         snapshot = conn.execute(
             text(f"SELECT {snap_sql}(fetched_at_tr) AS snap FROM finished_matches")
         ).scalar()
@@ -712,6 +789,9 @@ def list_finished_matches(
                     date, time,
                     ms1, ms0, ms2, alt25, ust25,
                     ft_home, ft_away, ht_home, ht_away,
+                    home_corner, away_corner,
+                    home_yellow, away_yellow,
+                    home_red, away_red,
                     betcount,
                     fetched_at_tr,
                     updated_at
@@ -723,21 +803,29 @@ def list_finished_matches(
             {"snapshot": snapshot, "limit": limit},
         ).mappings().all()
 
+        items = _decorate_rows(rows)
         return {
             "ok": True,
             "day": None,
             "which": which,
             "snapshot": snapshot,
-            "count": len(rows),
-            "items": [dict(r) for r in rows],
-        }
+            "count": len(items),
+            "items": items,
+            }
 
 @app.get("/health/metrics")
 def health_metrics():
     with engine.begin() as conn:
-        # pool totals + latest snapshot
-        pool_total = conn.execute(text("SELECT COUNT(*) AS c FROM pool_matches")).mappings().first()["c"]
-        pool_latest = conn.execute(text("SELECT MAX(fetched_at_tr) AS mx FROM pool_matches")).mappings().first()["mx"]
+        # -----------------
+        # POOL
+        # -----------------
+        pool_total = conn.execute(
+            text("SELECT COUNT(*) AS c FROM pool_matches")
+        ).mappings().first()["c"]
+
+        pool_latest = conn.execute(
+            text("SELECT MAX(fetched_at_tr) AS mx FROM pool_matches")
+        ).mappings().first()["mx"]
 
         pool_latest_count = 0
         if pool_latest:
@@ -746,9 +834,23 @@ def health_metrics():
                 {"mx": pool_latest}
             ).mappings().first()["c"]
 
-        # finished totals + latest snapshot
-        finished_total = conn.execute(text("SELECT COUNT(*) AS c FROM finished_matches")).mappings().first()["c"]
-        finished_latest = conn.execute(text("SELECT MAX(fetched_at_tr) AS mx FROM finished_matches")).mappings().first()["mx"]
+        # -----------------
+        # FINISHED
+        # -----------------
+        finished_total = conn.execute(
+            text("SELECT COUNT(*) AS c FROM finished_matches")
+        ).mappings().first()["c"]
+
+        finished_latest = conn.execute(
+            text("SELECT MAX(fetched_at_tr) AS mx FROM finished_matches")
+        ).mappings().first()["mx"]
+
+        finished_latest_count = 0
+        if finished_latest:
+            finished_latest_count = conn.execute(
+                text("SELECT COUNT(*) AS c FROM finished_matches WHERE fetched_at_tr = :mx"),
+                {"mx": finished_latest}
+            ).mappings().first()["c"]
 
     return {
         "ok": True,
@@ -760,5 +862,6 @@ def health_metrics():
         "finished": {
             "total_in_db": int(finished_total),
             "latest_snapshot": finished_latest,
+            "latest_snapshot_count": int(finished_latest_count),
         }
     }
