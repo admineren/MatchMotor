@@ -151,6 +151,13 @@ def nosy_check_call(api_id: str) -> dict:
     except Exception:
         raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
 
+def make_aware(dt, tz):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt
+
 # ==========================================================
 # APP
 # ==========================================================
@@ -799,6 +806,9 @@ def sync_finished_matches(
                     continue
 
                 # TR timezone farkı varsa (naive), sadece relative kıyas yapıyoruz; yeterli
+                dt_obj = make_aware(dt_obj, TR_TZ)
+                cutoff_dt = make_aware(cutoff_dt, TR_TZ)
+
                 if dt_obj <= cutoff_dt:
                     candidates.append(int(mid))
 
