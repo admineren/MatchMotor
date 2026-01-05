@@ -66,6 +66,24 @@ def _dump_json(obj) -> str:
     except Exception:
         return "{}"
 
+def _meta_map(match_result_list) -> dict:
+    m = {}
+    if isinstance(match_result_list, list):
+        for it in match_result_list:
+            if not isinstance(it, dict):
+                continue
+            k = it.get("metaName")
+            v = it.get("value")
+            if k is not None:
+                m[str(k)] = v
+    return m
+
+def _to_int(x):
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return None
+
 def _require_api_key():
     if not NOSY_API_KEY:
         raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
@@ -205,7 +223,50 @@ def ensure_schema():
         conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS fetched_at_tr TEXT;"""))
         conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS raw_json TEXT;"""))
 
-                
+# -----------------------------
+# FINISHED MATCHES (matches-result snapshot)
+# -----------------------------
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS finished_matches (
+                id BIGSERIAL PRIMARY KEY,
+                nosy_match_id BIGINT NOT NULL UNIQUE,
+
+                match_datetime TEXT,
+                date TEXT,
+                time TEXT,
+
+                league_code TEXT,
+                league TEXT,
+                country TEXT,
+                team1 TEXT,
+                team2 TEXT,
+
+                betcount INT,
+                ms1 DOUBLE PRECISION,
+                ms0 DOUBLE PRECISION,
+                ms2 DOUBLE PRECISION,
+                alt25 DOUBLE PRECISION,
+                ust25 DOUBLE PRECISION,
+
+                ft_home INT,
+                ft_away INT,
+                ht_home INT,
+                ht_away INT,
+
+                mb INT,
+                result INT,
+                game_result INT,
+                live_status INT,
+
+                fetched_at_tr TEXT,
+                raw_json TEXT,
+
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """))
+
+        conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS ux_finished_matches_mid ON finished_matches (nosy_match_id);"""))
+             
 # ---------------------------
 # Nosy CHECK endpoints (root base)
 # ---------------------------
@@ -453,3 +514,153 @@ def get_pool_bettable_matches(
         "count": len(rows),
         "items": [dict(r) for r in rows],
     }
+
+@app.post("/db/finished-matches/sync")
+def sync_finished_matches():
+    """
+    NosyAPI -> matches-result
+    Biten maçları (oran + skor) finished_matches tablosuna upsert eder.
+    """
+    payload = nosy_service_call("matches-result")
+    data = payload.get("data") or []
+    received = len(data)
+
+    fetched_at_tr = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
+
+    upserted = 0
+    skipped = 0
+    no_score = 0
+
+    with engine.begin() as conn:
+        for item in data:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+
+            mid = item.get("MatchID")
+            try:
+                mid = int(mid)
+            except Exception:
+                skipped += 1
+                continue
+
+            meta = _meta_map(item.get("matchResult"))
+            ft_home = _to_int(meta.get("msHomeScore"))
+            ft_away = _to_int(meta.get("msAwayScore"))
+            ht_home = _to_int(meta.get("htHomeScore"))
+            ht_away = _to_int(meta.get("htAwayScore"))
+
+            # skor yoksa "finished" sayma
+            if ft_home is None or ft_away is None:
+                no_score += 1
+                continue
+
+            conn.execute(
+                text("""
+                    INSERT INTO finished_matches(
+                        nosy_match_id,
+                        match_datetime, date, time,
+                        league_code, league, country, team1, team2,
+                        betcount, ms1, ms0, ms2, alt25, ust25,
+                        ft_home, ft_away, ht_home, ht_away,
+                        mb, result, game_result, live_status,
+                        fetched_at_tr, raw_json,
+                        updated_at
+                    )
+                    VALUES(
+                        :mid,
+                        :dt, :date, :time,
+                        :league_code, :league, :country, :team1, :team2,
+                        :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
+                        :ft_home, :ft_away, :ht_home, :ht_away,
+                        :mb, :result, :game_result, :live_status,
+                        :fetched_at_tr, :raw_json,
+                        NOW()
+                    )
+                    ON CONFLICT(nosy_match_id) DO UPDATE SET
+                        match_datetime = EXCLUDED.match_datetime,
+                        date = EXCLUDED.date,
+                        time = EXCLUDED.time,
+                        league_code = EXCLUDED.league_code,
+                        league = EXCLUDED.league,
+                        country = EXCLUDED.country,
+                        team1 = EXCLUDED.team1,
+                        team2 = EXCLUDED.team2,
+                        betcount = EXCLUDED.betcount,
+                        ms1 = EXCLUDED.ms1,
+                        ms0 = EXCLUDED.ms0,
+                        ms2 = EXCLUDED.ms2,
+                        alt25 = EXCLUDED.alt25,
+                        ust25 = EXCLUDED.ust25,
+                        ft_home = EXCLUDED.ft_home,
+                        ft_away = EXCLUDED.ft_away,
+                        ht_home = EXCLUDED.ht_home,
+                        ht_away = EXCLUDED.ht_away,
+                        mb = EXCLUDED.mb,
+                        result = EXCLUDED.result,
+                        game_result = EXCLUDED.game_result,
+                        live_status = EXCLUDED.live_status,
+                        fetched_at_tr = EXCLUDED.fetched_at_tr,
+                        raw_json = EXCLUDED.raw_json,
+                        updated_at = NOW()
+                """),
+                {
+                    "mid": mid,
+                    "dt": str(item.get("DateTime") or ""),
+                    "date": str(item.get("Date") or ""),
+                    "time": str(item.get("Time") or ""),
+                    "league_code": str(item.get("LeagueCode") or ""),
+                    "league": str(item.get("League") or ""),
+                    "country": str(item.get("Country") or ""),
+                    "team1": str(item.get("Team1") or ""),
+                    "team2": str(item.get("Team2") or ""),
+                    "betcount": item.get("BetCount"),
+                    "ms1": item.get("HomeWin"),
+                    "ms0": item.get("Draw"),
+                    "ms2": item.get("AwayWin"),
+                    "alt25": item.get("Under25"),
+                    "ust25": item.get("Over25"),
+                    "ft_home": ft_home,
+                    "ft_away": ft_away,
+                    "ht_home": ht_home,
+                    "ht_away": ht_away,
+                    "mb": item.get("MB"),
+                    "result": item.get("Result"),
+                    "game_result": item.get("GameResult"),
+                    "live_status": item.get("LiveStatus"),
+                    "fetched_at_tr": fetched_at_tr,
+                    "raw_json": _dump_json(item),
+                }
+            )
+            upserted += 1
+
+    return {
+        "ok": True,
+        "endpoint": "matches-result",
+        "received": received,
+        "upserted": upserted,
+        "skipped": skipped,
+        "no_score": no_score,
+        "fetched_at_tr": fetched_at_tr,
+        "rowCount": payload.get("rowCount"),
+        "creditUsed": payload.get("creditUsed"),
+            }
+
+from fastapi import Query
+
+@app.get("/db/finished-matches")
+def list_finished_matches(limit: int = Query(50, ge=1, le=500)):
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                nosy_match_id, league, team1, team2,
+                date, time,
+                ms1, ms0, ms2, alt25, ust25,
+                ft_home, ft_away, ht_home, ht_away,
+                betcount, fetched_at_tr, updated_at
+            FROM finished_matches
+            ORDER BY updated_at DESC
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
+
+    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
