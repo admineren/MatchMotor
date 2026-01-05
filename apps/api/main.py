@@ -107,24 +107,30 @@ def ensure_schema() -> None:
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS pool_matches (
             id BIGSERIAL PRIMARY KEY,
-            nosy_match_id BIGINT UNIQUE,
+
+            nosy_match_id BIGINT NOT NULL UNIQUE,
+
             match_datetime TEXT,
             date TEXT,
             time TEXT,
+
             league TEXT,
             country TEXT,
             team1 TEXT,
             team2 TEXT,
+
             betcount INT,
             ms1 DOUBLE PRECISION,
             ms0 DOUBLE PRECISION,
             ms2 DOUBLE PRECISION,
             alt25 DOUBLE PRECISION,
             ust25 DOUBLE PRECISION,
-            fetched_at TEXT,
+  
+            fetched_at_tr TEXT,
             raw_json TEXT
         );
         """))
+        
 
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS db_matches (
