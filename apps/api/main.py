@@ -1294,3 +1294,82 @@ def stats_organizations(
         "count": len(rows),
         "items": [dict(r) for r in rows],
     }
+
+# =========================
+# FREE API (RapidAPI) TEST
+# =========================
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
+FREEAPI_HOST = os.getenv("FREEAPI_HOST", "free-api-live-football-data.p.rapidapi.com").strip()
+
+def _require_rapidapi_key():
+    if not RAPIDAPI_KEY:
+        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY env eksik.")
+
+def freeapi_get(path: str, params: dict | None = None) -> dict:
+    _require_rapidapi_key()
+
+    base = f"https://{FREEAPI_HOST}".rstrip("/")
+    url = f"{base}/{path.lstrip('/')}"
+
+    headers = {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": FREEAPI_HOST,
+    }
+
+    try:
+        r = requests.get(url, headers=headers, params=(params or {}), timeout=30)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"FreeAPI bağlantı hatası: {e}")
+
+    if r.status_code != 200:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
+
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
+
+
+@app.get("/freeapi/test/ping", tags=["FreeAPI"])
+def freeapi_test_ping():
+    """
+    Request harcamaz. Sadece env/host kontrol.
+    """
+    return {
+        "ok": True,
+        "rapidapi_key_set": bool(RAPIDAPI_KEY),
+        "freeapi_host": FREEAPI_HOST,
+    }
+
+
+@app.get("/freeapi/test/matches-by-date/count", tags=["FreeAPI"])
+def freeapi_matches_by_date_count(
+    date: str = Query(..., description="YYYYMMDD örn 20260107"),
+):
+    """
+    1 request ile:
+    - 200 OK geliyor mu?
+    - Bu tarih için kaç maç dönüyor?
+    Not: upstream tüm payload'ı döndürür, biz sadece sayıyı gösteriyoruz.
+    """
+    data = freeapi_get("football-get-matches-by-date", params={"date": date})
+
+    response = data.get("response") if isinstance(data, dict) else None
+    matches = (response or {}).get("matches") if isinstance(response, dict) else None
+
+    match_count = len(matches) if isinstance(matches, list) else None
+
+    # küçük meta: response içinde başka ne var görmek için (büyük JSON basmadan)
+    resp_keys = list(response.keys()) if isinstance(response, dict) else None
+
+    return {
+        "ok": True,
+        "requested_date": date,
+        "host": FREEAPI_HOST,
+        "match_count": match_count,
+        "response_keys": resp_keys,
+        }
