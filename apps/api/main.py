@@ -548,6 +548,18 @@ def sync_finished_matches(
     - Backfill: Sadece 'dün 22:00-23:59' arası başlayan ve finished'a geçmemiş maçlar için details dener.
     """
 
+    # küçük/büyük harf farkını öldüren meta parser
+    def _meta_map_ci(match_result):
+        base = _meta_map(match_result)
+        if not isinstance(base, dict):
+            return {}
+        # key'leri normalize et (lower)
+        out = {}
+        for k, v in base.items():
+            if isinstance(k, str):
+                out[k.lower()] = v
+        return out
+
     # -----------------------
     # 1) BULK: matches-result
     # -----------------------
@@ -574,20 +586,20 @@ def sync_finished_matches(
                 skipped += 1
                 continue
 
-            meta = _meta_map(item.get("matchResult"))
+            meta = _meta_map_ci(item.get("matchResult"))
 
-            ft_home = _to_int(meta.get("msHomeScore"))
-            ft_away = _to_int(meta.get("msAwayScore"))
-            ht_home = _to_int(meta.get("htHomeScore"))
-            ht_away = _to_int(meta.get("htAwayScore"))
+            # NOTE: metaName'ler API'de bazen farklı casing ile gelebiliyor, o yüzden lower map kullanıyoruz
+            ft_home = _to_int(meta.get("mshomescore"))
+            ft_away = _to_int(meta.get("msawayscore"))
+            ht_home = _to_int(meta.get("hthomescore"))
+            ht_away = _to_int(meta.get("htawayscore"))
 
-            # corner/kart
-            home_corner = _to_int(meta.get("homeCorner"))
-            away_corner = _to_int(meta.get("awayCorner"))
-            home_yellow = _to_int(meta.get("homeyellowCard"))
-            away_yellow = _to_int(meta.get("awayyellowCard"))
-            home_red    = _to_int(meta.get("homeredCard"))
-            away_red    = _to_int(meta.get("awayredCard"))
+            home_corner = _to_int(meta.get("homecorner"))
+            away_corner = _to_int(meta.get("awaycorner"))
+            home_yellow = _to_int(meta.get("homeyellowcard"))
+            away_yellow = _to_int(meta.get("awayyellowcard"))
+            home_red = _to_int(meta.get("homeredcard"))
+            away_red = _to_int(meta.get("awayredcard"))
 
             # skor yoksa finished sayma
             if ft_home is None or ft_away is None:
@@ -595,7 +607,8 @@ def sync_finished_matches(
                 continue
 
             conn.execute(
-                text("""
+                text(
+                    """
                     INSERT INTO finished_matches(
                         nosy_match_id,
                         match_datetime, date, time,
@@ -654,7 +667,8 @@ def sync_finished_matches(
                         fetched_at_tr = EXCLUDED.fetched_at_tr,
                         raw_json = EXCLUDED.raw_json,
                         updated_at = NOW()
-                """),
+                    """
+                ),
                 {
                     "mid": mid,
                     "dt": str(item.get("DateTime") or ""),
@@ -687,7 +701,7 @@ def sync_finished_matches(
                     "live_status": item.get("LiveStatus"),
                     "fetched_at_tr": fetched_at_tr,
                     "raw_json": _dump_json(item),
-                }
+                },
             )
             upserted += 1
 
@@ -714,38 +728,46 @@ def sync_finished_matches(
 
             backfill_report["window"] = {"day": yesterday, "time_from": t_from, "time_to": t_to}
 
-            # finished'da olmayan (veya skor eksik) adayları seç
-            mids = conn.execute(
-                text("""
-                    SELECT p.nosy_match_id
-                    FROM pool_matches p
-                    LEFT JOIN finished_matches f
-                      ON f.nosy_match_id = p.nosy_match_id
-                    WHERE
-                      p.date = :day
-                      AND p.time >= :t_from
-                      AND p.time <= :t_to
-                      AND (
-                        f.nosy_match_id IS NULL
-                        OR f.ft_home IS NULL
-                        OR f.ft_away IS NULL
-                      )
-                    ORDER BY p.time ASC, p.nosy_match_id
-                    LIMIT :lim
-                """),
-                {"day": yesterday, "t_from": t_from, "t_to": t_to, "lim": int(max_details)},
-            ).scalars().all()
+            mids = (
+                conn.execute(
+                    text(
+                        """
+                        SELECT p.nosy_match_id
+                        FROM pool_matches p
+                        LEFT JOIN finished_matches f
+                          ON f.nosy_match_id = p.nosy_match_id
+                        WHERE
+                          p.date = :day
+                          AND p.time >= :t_from
+                          AND p.time <= :t_to
+                          AND (
+                            f.nosy_match_id IS NULL
+                            OR f.ft_home IS NULL
+                            OR f.ft_away IS NULL
+                          )
+                        ORDER BY p.time ASC, p.nosy_match_id
+                        LIMIT :lim
+                        """
+                    ),
+                    {"day": yesterday, "t_from": t_from, "t_to": t_to, "lim": int(max_details)},
+                )
+                .scalars()
+                .all()
+            )
 
             backfill_report["candidates"] = len(mids)
 
-            # her maça details dene
             for mid in mids:
                 backfill_report["requested"] += 1
 
-                details = nosy_service_call("matches-result/details", params={"match_id": int(mid)})
+                # Swagger ekranında param adı matchID görünüyor.
+                # Senin wrapper bunu match_id ile map ediyorsa da sorun olmasın diye iki anahtarı da veriyoruz.
+                details = nosy_service_call(
+                    "matches-result/details",
+                    params={"matchID": int(mid), "match_id": int(mid)},
+                )
                 dd = (details or {}).get("data")
 
-                # Bazı servisler data'yı liste veya dict döndürebilir
                 item = None
                 if isinstance(dd, list) and dd:
                     item = dd[0]
@@ -756,25 +778,30 @@ def sync_finished_matches(
                     backfill_report["skipped"] += 1
                     continue
 
-                meta = _meta_map(item.get("matchResult"))
-                ft_home = _to_int(meta.get("msHomeScore"))
-                ft_away = _to_int(meta.get("msAwayScore"))
-                ht_home = _to_int(meta.get("htHomeScore"))
-                ht_away = _to_int(meta.get("htAwayScore"))
+                meta = _meta_map_ci(item.get("matchResult"))
 
-                home_corner = _to_int(meta.get("homeCorner"))
-                away_corner = _to_int(meta.get("awayCorner"))
-                home_yellow = _to_int(meta.get("homeyellowCard"))
-                away_yellow = _to_int(meta.get("awayyellowCard"))
-                home_red    = _to_int(meta.get("homeredCard"))
-                away_red    = _to_int(meta.get("awayredCard"))
+                ft_home = _to_int(meta.get("mshomescore"))
+                ft_away = _to_int(meta.get("msawayscore"))
+                ht_home = _to_int(meta.get("hthomescore"))
+                ht_away = _to_int(meta.get("htawayscore"))
+
+                home_corner = _to_int(meta.get("homecorner"))
+                away_corner = _to_int(meta.get("awaycorner"))
+                home_yellow = _to_int(meta.get("homeyellowcard"))
+                away_yellow = _to_int(meta.get("awayyellowcard"))
+                home_red = _to_int(meta.get("homeredcard"))
+                away_red = _to_int(meta.get("awayredcard"))
 
                 if ft_home is None or ft_away is None:
                     backfill_report["no_score"] += 1
                     continue
 
+                # backfill yazarken de "details item" içinden alanları alıyoruz (casing PascalCase)
+                fetched_at_tr_bf = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
+
                 conn.execute(
-                    text("""
+                    text(
+                        """
                         INSERT INTO finished_matches(
                             nosy_match_id,
                             match_datetime, date, time,
@@ -833,7 +860,8 @@ def sync_finished_matches(
                             fetched_at_tr = EXCLUDED.fetched_at_tr,
                             raw_json = EXCLUDED.raw_json,
                             updated_at = NOW()
-                    """),
+                        """
+                    ),
                     {
                         "mid": int(mid),
                         "dt": str(item.get("DateTime") or ""),
@@ -864,9 +892,9 @@ def sync_finished_matches(
                         "result": item.get("Result"),
                         "game_result": item.get("GameResult"),
                         "live_status": item.get("LiveStatus"),
-                        "fetched_at_tr": fetched_at_tr,
+                        "fetched_at_tr": fetched_at_tr_bf,
                         "raw_json": _dump_json(item),
-                    }
+                    },
                 )
 
                 backfill_report["upserted"] += 1
@@ -884,7 +912,7 @@ def sync_finished_matches(
             "creditUsed": payload.get("creditUsed"),
         },
         "backfill": backfill_report,
-                }
+    }
 
 @app.get("/db/finished-matches")
 def list_finished_matches(
