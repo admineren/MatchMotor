@@ -519,7 +519,7 @@ def get_pool_bettable_matches(
                 nosy_match_id,
                 match_datetime, date, time,
                 league, country, team1, team2,
-                betcount, game_results, ms1, ms0, ms2, alt25, ust25,
+                betcount, game_result, ms1, ms0, ms2, alt25, ust25,
                 fetched_at_tr
             FROM pool_matches
             WHERE fetched_at_tr = :snap
