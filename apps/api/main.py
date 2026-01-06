@@ -538,355 +538,353 @@ def get_pool_bettable_matches(
 
 @app.post("/db/finished-matches/sync")
 def sync_finished_matches(
-    backfill: int = Query(1, description="1 ise pool üzerinden details backfill çalıştırır"),
-    lookback_days: int = Query(2, ge=1, le=7, description="Pool'da kaç gün geriye bakılsın"),
-    settle_minutes: int = Query(180, ge=60, le=600, description="Maçın bitmiş sayılması için dakika tamponu"),
-    max_details: int = Query(30, ge=0, le=200, description="Details çağrısı için üst limit (kredi kontrolü)"),
+    backfill: int = Query(default=0, description="1 ise gece sarkan maçlar için details backfill yapar"),
+    max_details: int = Query(default=25, ge=0, le=200, description="Backfill'de en fazla kaç maça details denenecek"),
 ):
     """
-    NosyAPI -> matches-result (bulk) + matches-result/details (backfill)
-
-    Bulk:
-    - matches-result listesini çekip finished_matches tablosuna upsert eder.
-
-    Backfill:
-    - pool_matches tablosundan son lookback_days içinde olup,
-      bitmiş olması muhtemel (settle_minutes) ve finished'a düşmemiş maçları bulur.
-    - Her aday için matches-result/details ile tek maç sonucunu çekip finished'a upsert eder.
-
-    Notlar:
-    - Backfill kredi tahmini: details çağrısı sayısı (requested)
-    - bulk kredisi: payload["creditUsed"]
+    NosyAPI -> matches-result (bulk)
+    + opsiyonel: matches-result/details (backfill)
+    - Bulk: API'nin döndürdüğü biten maçları finished_matches tablosuna upsert eder.
+    - Backfill: Sadece 'dün 22:00-23:59' arası başlayan ve finished'a geçmemiş maçlar için details dener.
     """
 
-    def _now_tr():
-        return datetime.now(TR_TZ) if TR_TZ else datetime.utcnow()
-
-    def _parse_dt_from_pool(date_str: str, time_str: str) -> datetime | None:
-        # pool'da match_datetime dolu olmalı ama boş gelirse date+time ile de deneyelim
-        # Basit bir parse: "YYYY-MM-DD" + "HH:MM:SS"
-        try:
-            if not date_str:
-                return None
-            t = time_str or "00:00:00"
-            return datetime.fromisoformat(f"{date_str} {t}")
-        except Exception:
-            return None
-
-    def _upsert_finished_from_item(conn, item: dict, fetched_at_tr_val: str) -> tuple[bool, bool]:
-        """
-        Returns: (upserted_ok, has_score)
-        """
-        if not isinstance(item, dict):
-            return (False, False)
-
-        mid = item.get("MatchID")
-        try:
-            mid = int(mid)
-        except Exception:
-            return (False, False)
-
-        meta = _meta_map(item.get("matchResult"))
-
-        ft_home = _to_int(meta.get("msHomeScore"))
-        ft_away = _to_int(meta.get("msAwayScore"))
-        ht_home = _to_int(meta.get("htHomeScore"))
-        ht_away = _to_int(meta.get("htAwayScore"))
-
-        # corner/kart
-        home_corner = _to_int(meta.get("homeCorner"))
-        away_corner = _to_int(meta.get("awayCorner"))
-
-        home_yellow = _to_int(meta.get("homeyellowCard"))
-        away_yellow = _to_int(meta.get("awayyellowCard"))
-
-        home_red = _to_int(meta.get("homeredCard"))
-        away_red = _to_int(meta.get("awayredCard"))
-
-        # skor yoksa finished saymayız
-        if ft_home is None or ft_away is None:
-            return (False, False)
-
-        conn.execute(
-            text("""
-                INSERT INTO finished_matches(
-                    nosy_match_id,
-                    match_datetime, date, time,
-                    league_code, league, country, team1, team2,
-                    betcount, ms1, ms0, ms2, alt25, ust25,
-                    ft_home, ft_away, ht_home, ht_away,
-                    home_corner, away_corner,
-                    home_yellow, away_yellow,
-                    home_red, away_red,
-                    mb, result, game_result, live_status,
-                    fetched_at_tr, raw_json,
-                    updated_at
-                )
-                VALUES(
-                    :mid,
-                    :dt, :date, :time,
-                    :league_code, :league, :country, :team1, :team2,
-                    :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
-                    :ft_home, :ft_away, :ht_home, :ht_away,
-                    :home_corner, :away_corner,
-                    :home_yellow, :away_yellow,
-                    :home_red, :away_red,
-                    :mb, :result, :game_result, :live_status,
-                    :fetched_at_tr, :raw_json,
-                    NOW()
-                )
-                ON CONFLICT(nosy_match_id) DO UPDATE SET
-                    match_datetime = EXCLUDED.match_datetime,
-                    date = EXCLUDED.date,
-                    time = EXCLUDED.time,
-                    league_code = EXCLUDED.league_code,
-                    league = EXCLUDED.league,
-                    country = EXCLUDED.country,
-                    team1 = EXCLUDED.team1,
-                    team2 = EXCLUDED.team2,
-                    betcount = EXCLUDED.betcount,
-                    ms1 = EXCLUDED.ms1,
-                    ms0 = EXCLUDED.ms0,
-                    ms2 = EXCLUDED.ms2,
-                    alt25 = EXCLUDED.alt25,
-                    ust25 = EXCLUDED.ust25,
-                    ft_home = EXCLUDED.ft_home,
-                    ft_away = EXCLUDED.ft_away,
-                    ht_home = EXCLUDED.ht_home,
-                    ht_away = EXCLUDED.ht_away,
-                    home_corner = EXCLUDED.home_corner,
-                    away_corner = EXCLUDED.away_corner,
-                    home_yellow = EXCLUDED.home_yellow,
-                    away_yellow = EXCLUDED.away_yellow,
-                    home_red = EXCLUDED.home_red,
-                    away_red = EXCLUDED.away_red,
-                    mb = EXCLUDED.mb,
-                    result = EXCLUDED.result,
-                    game_result = EXCLUDED.game_result,
-                    live_status = EXCLUDED.live_status,
-                    fetched_at_tr = EXCLUDED.fetched_at_tr,
-                    raw_json = EXCLUDED.raw_json,
-                    updated_at = NOW()
-            """),
-            {
-                "mid": mid,
-                "dt": str(item.get("DateTime") or ""),
-                "date": str(item.get("Date") or ""),
-                "time": str(item.get("Time") or ""),
-                "league_code": str(item.get("LeagueCode") or ""),
-                "league": str(item.get("League") or ""),
-                "country": str(item.get("Country") or ""),
-                "team1": str(item.get("Team1") or ""),
-                "team2": str(item.get("Team2") or ""),
-                "betcount": item.get("BetCount"),
-                "ms1": item.get("HomeWin"),
-                "ms0": item.get("Draw"),
-                "ms2": item.get("AwayWin"),
-                "alt25": item.get("Under25"),
-                "ust25": item.get("Over25"),
-                "ft_home": ft_home,
-                "ft_away": ft_away,
-                "ht_home": ht_home,
-                "ht_away": ht_away,
-                "home_corner": home_corner,
-                "away_corner": away_corner,
-                "home_yellow": home_yellow,
-                "away_yellow": away_yellow,
-                "home_red": home_red,
-                "away_red": away_red,
-                "mb": item.get("MB"),
-                "result": item.get("Result"),
-                "game_result": item.get("GameResult"),
-                "live_status": item.get("LiveStatus"),
-                "fetched_at_tr": fetched_at_tr_val,
-                "raw_json": _dump_json(item),
-            }
-        )
-        return (True, True)
-
-    # -------------------------
-    # BULK: matches-result
-    # -------------------------
+    # -----------------------
+    # 1) BULK: matches-result
+    # -----------------------
     payload = nosy_service_call("matches-result")
     data = payload.get("data") or []
     received = len(data)
 
-    fetched_at_tr = _now_tr().isoformat()
+    fetched_at_tr = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
 
-    bulk_upserted = 0
-    bulk_skipped = 0
-    bulk_no_score = 0
-
-    # -------------------------
-    # BACKFILL counters
-    # -------------------------
-    backfill_candidates = 0
-    backfill_requested = 0
-    backfill_upserted = 0
-    backfill_no_score = 0
-    backfill_errors = 0
+    upserted = 0
+    skipped = 0
+    no_score = 0
 
     with engine.begin() as conn:
-        # BULK upsert
         for item in data:
             if not isinstance(item, dict):
-                bulk_skipped += 1
+                skipped += 1
                 continue
 
-            ok, has_score = _upsert_finished_from_item(conn, item, fetched_at_tr)
-            if ok:
-                bulk_upserted += 1
-            else:
-                # skor yoksa say
-                if has_score is False:
-                    # item dict ama skor yok / parse yok
-                    # mid parse hatası da buraya gelebilir, onu skipped sayalım
-                    mid = item.get("MatchID")
-                    try:
-                        int(mid)
-                        bulk_no_score += 1
-                    except Exception:
-                        bulk_skipped += 1
+            mid = item.get("MatchID")
+            try:
+                mid = int(mid)
+            except Exception:
+                skipped += 1
+                continue
 
-        # -------------------------
-        # BACKFILL (optional)
-        # -------------------------
-        if int(backfill) == 1 and int(max_details) > 0:
-            now_tr = _now_tr()
-            cutoff_dt = now_tr - timedelta(minutes=int(settle_minutes))
+            meta = _meta_map(item.get("matchResult"))
 
-            # lookback_days için date alt sınırı
-            date_min = (now_tr.date() - timedelta(days=int(lookback_days))).isoformat()
+            ft_home = _to_int(meta.get("msHomeScore"))
+            ft_away = _to_int(meta.get("msAwayScore"))
+            ht_home = _to_int(meta.get("htHomeScore"))
+            ht_away = _to_int(meta.get("htAwayScore"))
 
-            # Pool'dan adayları seç:
-            # - son lookback_days (pool.date >= date_min)
-            # - match_datetime mümkünse cutoff'tan eski (veya date+time ile hesaplanabilir)
-            # - finished'da yok
-            rows = conn.execute(
+            # corner/kart
+            home_corner = _to_int(meta.get("homeCorner"))
+            away_corner = _to_int(meta.get("awayCorner"))
+            home_yellow = _to_int(meta.get("homeyellowCard"))
+            away_yellow = _to_int(meta.get("awayyellowCard"))
+            home_red    = _to_int(meta.get("homeredCard"))
+            away_red    = _to_int(meta.get("awayredCard"))
+
+            # skor yoksa finished sayma
+            if ft_home is None or ft_away is None:
+                no_score += 1
+                continue
+
+            conn.execute(
                 text("""
-                    SELECT
-                        p.nosy_match_id,
-                        p.match_datetime,
-                        p.date,
-                        p.time
+                    INSERT INTO finished_matches(
+                        nosy_match_id,
+                        match_datetime, date, time,
+                        league_code, league, country, team1, team2,
+                        betcount, ms1, ms0, ms2, alt25, ust25,
+                        ft_home, ft_away, ht_home, ht_away,
+                        home_corner, away_corner,
+                        home_yellow, away_yellow,
+                        home_red, away_red,
+                        mb, result, game_result, live_status,
+                        fetched_at_tr, raw_json,
+                        updated_at
+                    )
+                    VALUES(
+                        :mid,
+                        :dt, :date, :time,
+                        :league_code, :league, :country, :team1, :team2,
+                        :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
+                        :ft_home, :ft_away, :ht_home, :ht_away,
+                        :home_corner, :away_corner,
+                        :home_yellow, :away_yellow,
+                        :home_red, :away_red,
+                        :mb, :result, :game_result, :live_status,
+                        :fetched_at_tr, :raw_json,
+                        NOW()
+                    )
+                    ON CONFLICT(nosy_match_id) DO UPDATE SET
+                        match_datetime = EXCLUDED.match_datetime,
+                        date = EXCLUDED.date,
+                        time = EXCLUDED.time,
+                        league_code = EXCLUDED.league_code,
+                        league = EXCLUDED.league,
+                        country = EXCLUDED.country,
+                        team1 = EXCLUDED.team1,
+                        team2 = EXCLUDED.team2,
+                        betcount = EXCLUDED.betcount,
+                        ms1 = EXCLUDED.ms1,
+                        ms0 = EXCLUDED.ms0,
+                        ms2 = EXCLUDED.ms2,
+                        alt25 = EXCLUDED.alt25,
+                        ust25 = EXCLUDED.ust25,
+                        ft_home = EXCLUDED.ft_home,
+                        ft_away = EXCLUDED.ft_away,
+                        ht_home = EXCLUDED.ht_home,
+                        ht_away = EXCLUDED.ht_away,
+                        home_corner = EXCLUDED.home_corner,
+                        away_corner = EXCLUDED.away_corner,
+                        home_yellow = EXCLUDED.home_yellow,
+                        away_yellow = EXCLUDED.away_yellow,
+                        home_red = EXCLUDED.home_red,
+                        away_red = EXCLUDED.away_red,
+                        mb = EXCLUDED.mb,
+                        result = EXCLUDED.result,
+                        game_result = EXCLUDED.game_result,
+                        live_status = EXCLUDED.live_status,
+                        fetched_at_tr = EXCLUDED.fetched_at_tr,
+                        raw_json = EXCLUDED.raw_json,
+                        updated_at = NOW()
+                """),
+                {
+                    "mid": mid,
+                    "dt": str(item.get("DateTime") or ""),
+                    "date": str(item.get("Date") or ""),
+                    "time": str(item.get("Time") or ""),
+                    "league_code": str(item.get("LeagueCode") or ""),
+                    "league": str(item.get("League") or ""),
+                    "country": str(item.get("Country") or ""),
+                    "team1": str(item.get("Team1") or ""),
+                    "team2": str(item.get("Team2") or ""),
+                    "betcount": item.get("BetCount"),
+                    "ms1": item.get("HomeWin"),
+                    "ms0": item.get("Draw"),
+                    "ms2": item.get("AwayWin"),
+                    "alt25": item.get("Under25"),
+                    "ust25": item.get("Over25"),
+                    "ft_home": ft_home,
+                    "ft_away": ft_away,
+                    "ht_home": ht_home,
+                    "ht_away": ht_away,
+                    "home_corner": home_corner,
+                    "away_corner": away_corner,
+                    "home_yellow": home_yellow,
+                    "away_yellow": away_yellow,
+                    "home_red": home_red,
+                    "away_red": away_red,
+                    "mb": item.get("MB"),
+                    "result": item.get("Result"),
+                    "game_result": item.get("GameResult"),
+                    "live_status": item.get("LiveStatus"),
+                    "fetched_at_tr": fetched_at_tr,
+                    "raw_json": _dump_json(item),
+                }
+            )
+            upserted += 1
+
+        # -----------------------
+        # 2) BACKFILL (optional)
+        # -----------------------
+        backfill_report = {
+            "enabled": bool(backfill),
+            "window": None,
+            "candidates": 0,
+            "requested": 0,
+            "upserted": 0,
+            "no_score": 0,
+            "skipped": 0,
+        }
+
+        if int(backfill) == 1 and int(max_details) > 0:
+            now_tr = datetime.now(TR_TZ) if TR_TZ else datetime.utcnow()
+            yesterday = (now_tr.date() - timedelta(days=1)).isoformat()
+
+            # "dün 22:00:00 - 23:59:59" bandı
+            t_from = "22:00:00"
+            t_to = "23:59:59"
+
+            backfill_report["window"] = {"day": yesterday, "time_from": t_from, "time_to": t_to}
+
+            # finished'da olmayan (veya skor eksik) adayları seç
+            mids = conn.execute(
+                text("""
+                    SELECT p.nosy_match_id
                     FROM pool_matches p
                     LEFT JOIN finished_matches f
-                        ON f.nosy_match_id = p.nosy_match_id
+                      ON f.nosy_match_id = p.nosy_match_id
                     WHERE
+                      p.date = :day
+                      AND p.time >= :t_from
+                      AND p.time <= :t_to
+                      AND (
                         f.nosy_match_id IS NULL
-                        AND (p.date IS NULL OR p.date = '' OR p.date >= :date_min)
-                    ORDER BY
-                        p.match_datetime NULLS LAST,
-                        p.nosy_match_id
+                        OR f.ft_home IS NULL
+                        OR f.ft_away IS NULL
+                      )
+                    ORDER BY p.time ASC, p.nosy_match_id
                     LIMIT :lim
                 """),
-                {"date_min": date_min, "lim": int(max_details) * 5},  # önce geniş alıp aşağıda cutoff ile filtreleyeceğiz
-            ).mappings().all()
+                {"day": yesterday, "t_from": t_from, "t_to": t_to, "lim": int(max_details)},
+            ).scalars().all()
 
-            # cutoff'a göre filtrele (match_datetime yoksa date+time ile dene)
-            candidates = []
-            for r in rows:
-                mid = r.get("nosy_match_id")
-                if mid is None:
-                    continue
-                dt_val = r.get("match_datetime")
-                # match_datetime DB'de string olabilir, datetime olabilir. güvenli parse:
-                dt_obj = None
-                if isinstance(dt_val, datetime):
-                    dt_obj = dt_val
-                else:
-                    # string parse dene
-                    try:
-                        if dt_val:
-                            dt_obj = datetime.fromisoformat(str(dt_val).replace("Z", ""))
-                    except Exception:
-                        dt_obj = None
+            backfill_report["candidates"] = len(mids)
 
-                if dt_obj is None:
-                    dt_obj = _parse_dt_from_pool(str(r.get("date") or ""), str(r.get("time") or ""))
+            # her maça details dene
+            for mid in mids:
+                backfill_report["requested"] += 1
 
-                # dt_obj yoksa güvenli tarafta kal: details atma
-                if dt_obj is None:
+                details = nosy_service_call("matches-result/details", params={"match_id": int(mid)})
+                dd = (details or {}).get("data")
+
+                # Bazı servisler data'yı liste veya dict döndürebilir
+                item = None
+                if isinstance(dd, list) and dd:
+                    item = dd[0]
+                elif isinstance(dd, dict):
+                    item = dd
+
+                if not isinstance(item, dict):
+                    backfill_report["skipped"] += 1
                     continue
 
-                # TR timezone farkı varsa (naive), sadece relative kıyas yapıyoruz; yeterli
-                dt_obj = make_aware(dt_obj, TR_TZ)
-                cutoff_dt = make_aware(cutoff_dt, TR_TZ)
+                meta = _meta_map(item.get("matchResult"))
+                ft_home = _to_int(meta.get("msHomeScore"))
+                ft_away = _to_int(meta.get("msAwayScore"))
+                ht_home = _to_int(meta.get("htHomeScore"))
+                ht_away = _to_int(meta.get("htAwayScore"))
 
-                if dt_obj <= cutoff_dt:
-                    candidates.append(int(mid))
+                home_corner = _to_int(meta.get("homeCorner"))
+                away_corner = _to_int(meta.get("awayCorner"))
+                home_yellow = _to_int(meta.get("homeyellowCard"))
+                away_yellow = _to_int(meta.get("awayyellowCard"))
+                home_red    = _to_int(meta.get("homeredCard"))
+                away_red    = _to_int(meta.get("awayredCard"))
 
-                if len(candidates) >= int(max_details):
-                    break
-
-            backfill_candidates = len(candidates)
-
-            for mid in candidates:
-                backfill_requested += 1
-                try:
-                    # Nosy details: matches-result/details (MatchID zorunlu)
-                    # nosy_service_call helper'ın endpoint parametresi alıyorsa:
-                    # örn: nosy_service_call("matches-result/details", params={"matchId": mid})
-                    # Senin helper imzan farklıysa aşağıyı ona göre uyarla.
-                    detail_payload = nosy_service_call("matches-result/details", params={"matchId": mid})
-
-                    detail_data = detail_payload.get("data")
-                    # data bazen liste, bazen dict olabilir; biz dict bekliyoruz
-                    if isinstance(detail_data, list) and detail_data:
-                        detail_item = detail_data[0]
-                    else:
-                        detail_item = detail_data
-
-                    if not isinstance(detail_item, dict):
-                        backfill_no_score += 1
-                        continue
-
-                    ok, has_score = _upsert_finished_from_item(conn, detail_item, fetched_at_tr)
-                    if ok:
-                        backfill_upserted += 1
-                    else:
-                        backfill_no_score += 1
-
-                except Exception:
-                    backfill_errors += 1
+                if ft_home is None or ft_away is None:
+                    backfill_report["no_score"] += 1
                     continue
 
-    bulk_credit_used = payload.get("creditUsed")
-    try:
-        bulk_credit_used_int = int(bulk_credit_used) if bulk_credit_used is not None else 0
-    except Exception:
-        bulk_credit_used_int = 0
+                conn.execute(
+                    text("""
+                        INSERT INTO finished_matches(
+                            nosy_match_id,
+                            match_datetime, date, time,
+                            league_code, league, country, team1, team2,
+                            betcount, ms1, ms0, ms2, alt25, ust25,
+                            ft_home, ft_away, ht_home, ht_away,
+                            home_corner, away_corner,
+                            home_yellow, away_yellow,
+                            home_red, away_red,
+                            mb, result, game_result, live_status,
+                            fetched_at_tr, raw_json,
+                            updated_at
+                        )
+                        VALUES(
+                            :mid,
+                            :dt, :date, :time,
+                            :league_code, :league, :country, :team1, :team2,
+                            :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
+                            :ft_home, :ft_away, :ht_home, :ht_away,
+                            :home_corner, :away_corner,
+                            :home_yellow, :away_yellow,
+                            :home_red, :away_red,
+                            :mb, :result, :game_result, :live_status,
+                            :fetched_at_tr, :raw_json,
+                            NOW()
+                        )
+                        ON CONFLICT(nosy_match_id) DO UPDATE SET
+                            match_datetime = EXCLUDED.match_datetime,
+                            date = EXCLUDED.date,
+                            time = EXCLUDED.time,
+                            league_code = EXCLUDED.league_code,
+                            league = EXCLUDED.league,
+                            country = EXCLUDED.country,
+                            team1 = EXCLUDED.team1,
+                            team2 = EXCLUDED.team2,
+                            betcount = EXCLUDED.betcount,
+                            ms1 = EXCLUDED.ms1,
+                            ms0 = EXCLUDED.ms0,
+                            ms2 = EXCLUDED.ms2,
+                            alt25 = EXCLUDED.alt25,
+                            ust25 = EXCLUDED.ust25,
+                            ft_home = EXCLUDED.ft_home,
+                            ft_away = EXCLUDED.ft_away,
+                            ht_home = EXCLUDED.ht_home,
+                            ht_away = EXCLUDED.ht_away,
+                            home_corner = EXCLUDED.home_corner,
+                            away_corner = EXCLUDED.away_corner,
+                            home_yellow = EXCLUDED.home_yellow,
+                            away_yellow = EXCLUDED.away_yellow,
+                            home_red = EXCLUDED.home_red,
+                            away_red = EXCLUDED.away_red,
+                            mb = EXCLUDED.mb,
+                            result = EXCLUDED.result,
+                            game_result = EXCLUDED.game_result,
+                            live_status = EXCLUDED.live_status,
+                            fetched_at_tr = EXCLUDED.fetched_at_tr,
+                            raw_json = EXCLUDED.raw_json,
+                            updated_at = NOW()
+                    """),
+                    {
+                        "mid": int(mid),
+                        "dt": str(item.get("DateTime") or ""),
+                        "date": str(item.get("Date") or ""),
+                        "time": str(item.get("Time") or ""),
+                        "league_code": str(item.get("LeagueCode") or ""),
+                        "league": str(item.get("League") or ""),
+                        "country": str(item.get("Country") or ""),
+                        "team1": str(item.get("Team1") or ""),
+                        "team2": str(item.get("Team2") or ""),
+                        "betcount": item.get("BetCount"),
+                        "ms1": item.get("HomeWin"),
+                        "ms0": item.get("Draw"),
+                        "ms2": item.get("AwayWin"),
+                        "alt25": item.get("Under25"),
+                        "ust25": item.get("Over25"),
+                        "ft_home": ft_home,
+                        "ft_away": ft_away,
+                        "ht_home": ht_home,
+                        "ht_away": ht_away,
+                        "home_corner": home_corner,
+                        "away_corner": away_corner,
+                        "home_yellow": home_yellow,
+                        "away_yellow": away_yellow,
+                        "home_red": home_red,
+                        "away_red": away_red,
+                        "mb": item.get("MB"),
+                        "result": item.get("Result"),
+                        "game_result": item.get("GameResult"),
+                        "live_status": item.get("LiveStatus"),
+                        "fetched_at_tr": fetched_at_tr,
+                        "raw_json": _dump_json(item),
+                    }
+                )
 
-    backfill_credit_used_est = int(backfill_requested)  # çağrı başına 1 kredi varsayımı
+                backfill_report["upserted"] += 1
 
     return {
         "ok": True,
-        "endpoint": "finished-matches/sync",
-        "fetched_at_tr": fetched_at_tr,
+        "endpoint": "matches-result",
         "bulk": {
-            "endpoint": "matches-result",
             "received": received,
-            "upserted": bulk_upserted,
-            "skipped": bulk_skipped,
-            "no_score": bulk_no_score,
+            "upserted": upserted,
+            "skipped": skipped,
+            "no_score": no_score,
+            "fetched_at_tr": fetched_at_tr,
             "rowCount": payload.get("rowCount"),
-            "creditUsed": bulk_credit_used,
+            "creditUsed": payload.get("creditUsed"),
         },
-        "backfill": {
-            "enabled": int(backfill) == 1,
-            "source": "pool_matches -> matches-result/details",
-            "lookback_days": int(lookback_days),
-            "settle_minutes": int(settle_minutes),
-            "max_details": int(max_details),
-            "candidates": backfill_candidates,
-            "requested": backfill_requested,
-            "upserted": backfill_upserted,
-            "no_score": backfill_no_score,
-            "errors": backfill_errors,
-            "credit_used_est": backfill_credit_used_est,
-        },
-        "total_credit_used_est": int(bulk_credit_used_int + backfill_credit_used_est),
-}
+        "backfill": backfill_report,
+                }
 
 @app.get("/db/finished-matches")
 def list_finished_matches(
