@@ -1414,9 +1414,79 @@ def flashscore_call(endpoint: str, *, params: dict | None = None) -> dict:
     except Exception:
         raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
 
+def flashscore_base_check() -> dict:
+    """
+    Flashscore RapidAPI base URL'ye GET atar (sonunda /ping yok).
+    Sadece rate limit header'larını ve TR saat bilgilerini döndürür.
+    """
+    _require_rapidapi_key()
+
+    url = FLASHSCORE_BASE_URL  # <- SONUNDA /ping YOK
+
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": FLASHSCORE_RAPIDAPI_HOST,
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Flashscore bağlantı hatası: {e}")
+
+    # Upstream hata ise body'i de gösterelim (debug için)
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        raise HTTPException(
+            status_code=r.status_code,
+            detail={"url": url, "body": body}
+        )
+
+    # Rate-limit header'larını topla
+    h = {k.lower(): v for k, v in r.headers.items()}
+    limit = h.get("x-ratelimit-requests-limit")
+    remaining = h.get("x-ratelimit-requests-remaining")
+    reset_raw = h.get("x-ratelimit-requests-reset")  # bazen epoch saniye gibi gelir
+
+    now_tr = datetime.now(TR_TZ)
+
+    reset_tr_iso = None
+    reset_in_seconds = None
+
+    # reset epoch ise TR saatine çevirelim
+    if reset_raw and reset_raw.isdigit():
+        reset_epoch = int(reset_raw)
+        reset_dt_tr = datetime.fromtimestamp(reset_epoch, tz=timezone.utc).astimezone(TR_TZ)
+        reset_tr_iso = reset_dt_tr.isoformat()
+
+        # kaç saniye kaldı (negatifse 0 yap)
+        reset_in_seconds = max(0, int((reset_dt_tr - now_tr).total_seconds()))
+
+    return {
+        "ok": True,
+        "flashscore": {
+            "status_code": r.status_code,
+            "host": FLASHSCORE_RAPIDAPI_HOST,
+            "base_url": FLASHSCORE_BASE_URL,
+            "rate_limits": {
+                "requests_limit": limit,
+                "requests_remaining": remaining,
+                "requests_reset_raw": reset_raw,
+                "requests_reset_tr": reset_tr_iso,
+                "seconds_until_reset": reset_in_seconds,
+            },
+            "turkey_time": now_tr.isoformat(),
+        },
+    }
+
 @app.get("/flashscore/ping")
 def flashscore_ping():
-    # Dokümanda ping path farklıysa burada sadece endpoint stringini değiştirirsin.
-    # Örn: "ping" yerine "health" vs.
-    return flashscore_call("ping")
-
+    data = flashscore_base_check()
+    # data zaten sadece flashscore içeriyor (nosy alanı yok)
+    return {
+        "status": "success",
+        "service": "flashscore",
+        **data
+    }
