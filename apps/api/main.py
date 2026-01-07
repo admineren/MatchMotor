@@ -1758,112 +1758,130 @@ def flashscore_db_finished_ms_sync_date(
     finished_with_ms = 0
     upserted = 0
     skipped = 0
-
     written = 0
 
     conn = get_conn()
     cur = conn.cursor()
 
-    for blk in blocks:
-        matches = blk.get("matches") or []
-        if not isinstance(matches, list):
-            continue
-
-        for m in matches:
-            received += 1
-
-            if (m.get("stage") or "").lower() != "finished":
-                continue
-            finished += 1
-
-            odds = m.get("odds") or {}
-            ms1 = _safe_float(odds.get("1"))
-            ms0 = _safe_float(odds.get("X"))
-            ms2 = _safe_float(odds.get("2"))
-            if ms1 is None or ms0 is None or ms2 is None:
+    try:
+        for blk in blocks:
+            matches = blk.get("matches") or []
+            if not isinstance(matches, list):
                 continue
 
-            ht = m.get("home_team") or {}
-            at = m.get("away_team") or {}
-            ft_home = _safe_int(ht.get("score"))
-            ft_away = _safe_int(at.get("score"))
-            if ft_home is None or ft_away is None:
-                continue
+            for m in matches:
+                received += 1
 
-            match_id = m.get("match_id")
-            ts = m.get("timestamp")
-            if not match_id or ts is None:
-                continue
+                if (m.get("stage") or "").lower() != "finished":
+                    continue
+                finished += 1
 
-            # timestamp -> TR datetime (ve TR tarih kontrolü)
-            dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
-            if dt_tr.date() != target_date:
-                skipped += 1
-                continue
+                odds = m.get("odds") or {}
+                ms1 = _safe_float(odds.get("1"))
+                ms0 = _safe_float(odds.get("X"))
+                ms2 = _safe_float(odds.get("2"))
+                if ms1 is None or ms0 is None or ms2 is None:
+                    continue
 
-            finished_with_ms += 1
+                ht = m.get("home_team") or {}
+                at = m.get("away_team") or {}
+                ft_home = _safe_int(ht.get("score"))
+                ft_away = _safe_int(at.get("score"))
+                if ft_home is None or ft_away is None:
+                    continue
 
-            # DB şişmesin diye opsiyonel limit
-            if limit_write and written >= limit_write:
-                skipped += 1
-                continue
+                match_id = m.get("match_id")
+                ts = m.get("timestamp")
+                if not match_id or ts is None:
+                    continue
 
-            country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
-            tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name")
-            
-            with engine.begin() as conn:
-                conn.execute(text("""
-                INSERT INTO flash_finished_ms (
-                    flash_match_id, match_datetime_tr, date, time, fetched_at_tr,
-                    country_name, tournament_name,
-                    home, away, ft_home, ft_away,
-                    ms1, ms0, ms2,
-                    raw_json, updated_at
+                # timestamp -> TR datetime (ve TR tarih kontrolü)
+                try:
+                    dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
+                except Exception:
+                    skipped += 1
+                    continue
+
+                if dt_tr.date() != target_date:
+                    skipped += 1
+                    continue
+
+                finished_with_ms += 1
+
+                # DB şişmesin diye opsiyonel limit
+                if limit_write and written >= limit_write:
+                    skipped += 1
+                    continue
+
+                country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
+                tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name")
+
+                cur.execute(
+                    """
+                    INSERT INTO flash_finished_ms (
+                        flash_match_id, match_datetime_tr, date, time, fetched_at_tr,
+                        country_name, tournament_name,
+                        home, away, ft_home, ft_away,
+                        ms1, ms0, ms2,
+                        raw_json, updated_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, NOW()
+                    )
+                    ON CONFLICT (flash_match_id) DO UPDATE SET
+                        match_datetime_tr = EXCLUDED.match_datetime_tr,
+                        date = EXCLUDED.date,
+                        time = EXCLUDED.time,
+                        fetched_at_tr = EXCLUDED.fetched_at_tr,
+                        country_name = EXCLUDED.country_name,
+                        tournament_name = EXCLUDED.tournament_name,
+                        home = EXCLUDED.home,
+                        away = EXCLUDED.away,
+                        ft_home = EXCLUDED.ft_home,
+                        ft_away = EXCLUDED.ft_away,
+                        ms1 = EXCLUDED.ms1,
+                        ms0 = EXCLUDED.ms0,
+                        ms2 = EXCLUDED.ms2,
+                        raw_json = EXCLUDED.raw_json,
+                        updated_at = NOW()
+                    """,
+                    (
+                        match_id,
+                        dt_tr.isoformat(),
+                        dt_tr.date().isoformat(),
+                        dt_tr.time().strftime("%H:%M:%S"),
+                        fetched_at_tr,
+                        country_name,
+                        tournament_name,
+                        ht.get("name"),
+                        at.get("name"),
+                        ft_home,
+                        ft_away,
+                        ms1,
+                        ms0,
+                        ms2,
+                        json.dumps(m, ensure_ascii=False),
+                    ),
                 )
-                VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, NOW()
-                )
-                ON CONFLICT (flash_match_id) DO UPDATE SET
-                    match_datetime_tr = EXCLUDED.match_datetime_tr,
-                    date = EXCLUDED.date,
-                    time = EXCLUDED.time,
-                    fetched_at_tr = EXCLUDED.fetched_at_tr,
-                    country_name = EXCLUDED.country_name,
-                    tournament_name = EXCLUDED.tournament_name,
-                    home = EXCLUDED.home,
-                    away = EXCLUDED.away,
-                    ft_home = EXCLUDED.ft_home,
-                    ft_away = EXCLUDED.ft_away,
-                    ms1 = EXCLUDED.ms1,
-                    ms0 = EXCLUDED.ms0,
-                    ms2 = EXCLUDED.ms2,
-                    raw_json = EXCLUDED.raw_json,
-                    updated_at = NOW()
-                ;(
-            """))
-                match_id,
-                dt_tr.isoformat(),
-                dt_tr.date().isoformat(),
-                dt_tr.time().strftime("%H:%M:%S"),
-                fetched_at_tr,
-                country_name, tournament_name,
-                ht.get("name"), at.get("name"),
-                ft_home, ft_away,
-                ms1, ms0, ms2,
-                json.dumps(m, ensure_ascii=False),
-            )
 
-            written += 1
-            upserted += 1
+                written += 1
+                upserted += 1
 
-    engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True
-    ) if DATABASE_URL else None
+        conn.commit()
+
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     return {
         "ok": True,
@@ -1874,7 +1892,7 @@ def flashscore_db_finished_ms_sync_date(
         "upserted": upserted,
         "skipped": skipped,
         "limit_write": limit_write,
-        "fetched_at_tr": fetched_at_tr
+        "fetched_at_tr": fetched_at_tr,
     }
 
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
