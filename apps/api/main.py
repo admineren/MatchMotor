@@ -1951,3 +1951,85 @@ def flashscore_finished_ms_list(
         "items": [dict(r) for r in rows],
         }
 
+@app.get("/flashscore/db/summary", tags=["Flashscore DB"])
+def flashscore_db_summary():
+    ensure_schema()
+
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
+
+    with engine.connect() as conn:
+        total_in_db = conn.execute(text("SELECT COUNT(*) FROM flash_finished_ms")).scalar() or 0
+
+        latest_snapshot = conn.execute(
+            text("SELECT MAX(fetched_at_tr) FROM flash_finished_ms")
+        ).scalar()
+
+        latest_snapshot_count = 0
+        if latest_snapshot is not None:
+            latest_snapshot_count = conn.execute(
+                text("SELECT COUNT(*) FROM flash_finished_ms WHERE fetched_at_tr = :snap"),
+                {"snap": latest_snapshot},
+            ).scalar() or 0
+
+    return {
+        "finished": {
+            "total_in_db": int(total_in_db),
+            "latest_snapshot": latest_snapshot.isoformat() if latest_snapshot else None,
+            "latest_snapshot_count": int(latest_snapshot_count),
+        }
+    }
+
+@app.get("/flashscore/db/by-tournament", tags=["Flashscore DB"])
+def flashscore_db_by_tournament():
+    ensure_schema()
+
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
+
+    with engine.connect() as conn:
+        # en son snapshot
+        latest_snapshot = conn.execute(
+            text("SELECT MAX(fetched_at_tr) FROM flash_finished_ms")
+        ).scalar()
+
+        # lig/kupa bazlı toplam sayılar
+        rows = conn.execute(text("""
+            SELECT
+                COALESCE(tournament_name, 'Unknown') AS tournament_name,
+                COUNT(*) AS total_in_db
+            FROM flash_finished_ms
+            GROUP BY COALESCE(tournament_name, 'Unknown')
+            ORDER BY total_in_db DESC
+        """)).mappings().all()
+
+        latest_map = {}
+        if latest_snapshot is not None:
+            latest_rows = conn.execute(
+                text("""
+                    SELECT
+                        COALESCE(tournament_name, 'Unknown') AS tournament_name,
+                        COUNT(*) AS cnt
+                    FROM flash_finished_ms
+                    WHERE fetched_at_tr = :snap
+                    GROUP BY COALESCE(tournament_name, 'Unknown')
+                """),
+                {"snap": latest_snapshot},
+            ).mappings().all()
+
+            latest_map = {r["tournament_name"]: r["cnt"] for r in latest_rows}
+
+    result = []
+    for r in rows:
+        name = r["tournament_name"]
+        result.append({
+            "tournament_name": name,
+            "total_in_db": int(r["total_in_db"]),
+            "latest_snapshot_count": int(latest_map.get(name, 0)),
+        })
+
+    return {
+        "latest_snapshot": latest_snapshot.isoformat() if latest_snapshot else None,
+        "by_tournament": result,
+    }
+
