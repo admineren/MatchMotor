@@ -351,6 +351,38 @@ def ensure_schema():
         conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS match_id BIGINT"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finished_matches_match_id ON finished_matches(match_id)"))
 
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS flash_finished_ms (
+                id BIGSERIAL PRIMARY KEY,
+                flash_match_id TEXT NOT NULL UNIQUE,
+
+                match_datetime_tr TEXT,
+                date TEXT,
+                time TEXT,
+
+                country_name TEXT,
+                tournament_name TEXT,
+
+                home TEXT,
+                away TEXT,
+
+                ft_home INT,
+                ft_away INT,
+
+                ms1 DOUBLE PRECISION,
+                ms0 DOUBLE PRECISION,
+                ms2 DOUBLE PRECISION,
+
+                fetched_at_tr TEXT,
+                raw_json TEXT,
+
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """))
+        
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS idx_flash_finished_ms_date ON flash_finished_ms(date);"""))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS idx_flash_finished_ms_fetched ON flash_finished_ms(fetched_at_tr);"""))
+
 # ---------------------------
 # Nosy CHECK endpoints (root base)
 # ---------------------------
@@ -1610,4 +1642,275 @@ def flashscore_standings_form(match_id: str, type: str):
         raise HTTPException(status_code=400, detail="Type overall, home veya away olmalı.")
 
     return flashscore_get(f"match/standings-form/{match_id}/{type}")
+
+# ==========================================================
+# Flashscore -> DB (Finished + MS odds only) - Phase 1
+# ==========================================================
+
+def _safe_int(x):
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "" or s == "-" or s.lower() == "null":
+            return None
+        return int(s)
+    except Exception:
+        return None
+
+def _safe_float(x):
+    try:
+        if x is None:
+            return None
+        s = str(x).strip().replace(",", ".")
+        if s == "" or s == "-" or s.lower() == "null":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def _fs_ts_to_tr(ts: int) -> Tuple[str, str, str]:
+    """UNIX timestamp -> (match_datetime_tr_iso, date_str, time_str) in TR"""
+    if TR_TZ:
+        dtr = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(TR_TZ)
+    else:
+        dtr = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    iso = dtr.isoformat()
+    return iso, dtr.date().isoformat(), dtr.time().replace(microsecond=0).isoformat()
+
+def _fs_pick_blocks(payload: Any) -> List[Dict[str, Any]]:
+    """Flashscore match/list payload shape can vary. Normalize to list of blocks."""
+    if isinstance(payload, list):
+        return [b for b in payload if isinstance(b, dict)]
+    if isinstance(payload, dict):
+        for k in ("data", "response", "items", "result"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return [b for b in v if isinstance(b, dict)]
+        # sometimes payload itself is a block
+        return [payload]
+    return []
+
+def _fs_iter_matches(block: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ms = block.get("matches") or block.get("data") or []
+    if isinstance(ms, list):
+        return [m for m in ms if isinstance(m, dict)]
+    return []
+
+def _fs_is_finished(m: Dict[str, Any]) -> bool:
+    return (str(m.get("stage") or "").strip().lower() == "finished")
+
+def _fs_pick_ms_odds(m: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    odds = m.get("odds") or {}
+    if not isinstance(odds, dict):
+        return None, None, None
+    ms1 = _safe_float(odds.get("1"))
+    ms0 = _safe_float(odds.get("X"))
+    ms2 = _safe_float(odds.get("2"))
+    return ms1, ms0, ms2
+
+@app.post("/flashscore/db/finished-ms/sync", tags=["Flashscore"])
+def flashscore_finished_ms_sync(
+    day: int = Query(0, ge=-7, le=7, description="0=today, -1=yesterday, +1=tomorrow (Flashscore day offset)"),
+):
+    """
+    Phase-1:
+    Flashscore match/list -> SADECE stage=Finished + MS(1/X/2) var + FT skor var
+    DB: flash_finished_ms tablosuna upsert eder.
+    """
+    ensure_schema()
+
+    fetched_at_tr = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
+
+    payload = flashscore_get(f"match/list/1/{day}")
+    blocks = _fs_pick_blocks(payload)
+
+    received = 0
+    finished = 0
+    finished_with_ms = 0
+    upserted = 0
+    skipped = 0
+
+    UPSERT = text("""
+        INSERT INTO flash_finished_ms(
+            flash_match_id,
+            match_datetime_tr, date, time,
+            country_name, tournament_name,
+            home, away,
+            ft_home, ft_away,
+            ms1, ms0, ms2,
+            fetched_at_tr, raw_json,
+            updated_at
+        )
+        VALUES(
+            :flash_match_id,
+            :match_datetime_tr, :date, :time,
+            :country_name, :tournament_name,
+            :home, :away,
+            :ft_home, :ft_away,
+            :ms1, :ms0, :ms2,
+            :fetched_at_tr, :raw_json,
+            NOW()
+        )
+        ON CONFLICT(flash_match_id) DO UPDATE SET
+            match_datetime_tr = EXCLUDED.match_datetime_tr,
+            date = EXCLUDED.date,
+            time = EXCLUDED.time,
+            country_name = EXCLUDED.country_name,
+            tournament_name = EXCLUDED.tournament_name,
+            home = EXCLUDED.home,
+            away = EXCLUDED.away,
+            ft_home = EXCLUDED.ft_home,
+            ft_away = EXCLUDED.ft_away,
+            ms1 = EXCLUDED.ms1,
+            ms0 = EXCLUDED.ms0,
+            ms2 = EXCLUDED.ms2,
+            fetched_at_tr = EXCLUDED.fetched_at_tr,
+            raw_json = EXCLUDED.raw_json,
+            updated_at = NOW()
+    """)
+
+    with engine.begin() as conn:
+        for b in blocks:
+            for m in _fs_iter_matches(b):
+                received += 1
+
+                if not _fs_is_finished(m):
+                    continue
+                finished += 1
+
+                ms1, ms0, ms2 = _fs_pick_ms_odds(m)
+                if ms1 is None or ms0 is None or ms2 is None:
+                    continue
+
+                ht = m.get("home_team") or {}
+                at = m.get("away_team") or {}
+                if not isinstance(ht, dict) or not isinstance(at, dict):
+                    continue
+
+                ft_home = _safe_int(ht.get("score"))
+                ft_away = _safe_int(at.get("score"))
+                if ft_home is None or ft_away is None:
+                    continue
+
+                match_id = m.get("match_id")
+                ts = m.get("timestamp")
+                if not match_id or ts is None:
+                    skipped += 1
+                    continue
+
+                finished_with_ms += 1
+
+                match_dt_tr, date_str, time_str = _fs_ts_to_tr(ts)
+
+                country_name = b.get("country_name") or b.get("country") or None
+                tournament_name = b.get("name") or b.get("tournament_name") or None
+
+                conn.execute(
+                    UPSERT,
+                    {
+                        "flash_match_id": str(match_id),
+                        "match_datetime_tr": match_dt_tr,
+                        "date": date_str,
+                        "time": time_str,
+                        "country_name": (str(country_name) if country_name is not None else None),
+                        "tournament_name": (str(tournament_name) if tournament_name is not None else None),
+                        "home": str(ht.get("name") or ""),
+                        "away": str(at.get("name") or ""),
+                        "ft_home": ft_home,
+                        "ft_away": ft_away,
+                        "ms1": ms1,
+                        "ms0": ms0,
+                        "ms2": ms2,
+                        "fetched_at_tr": fetched_at_tr,
+                        "raw_json": _dump_json(m),
+                    }
+                )
+                upserted += 1
+
+    return {
+        "ok": True,
+        "day": day,
+        "received": received,
+        "finished": finished,
+        "finished_with_ms": finished_with_ms,
+        "upserted": upserted,
+        "skipped": skipped,
+        "fetched_at_tr": fetched_at_tr,
+    }
+
+@app.get("/flashscore/db/finished-ms", tags=["Flashscore"])
+def flashscore_finished_ms_list(
+    day: Optional[str] = Query(default=None, description="YYYY-MM-DD (opsiyonel)"),
+    which: str = Query(default="latest", description="latest | oldest"),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    """
+    flash_finished_ms listesini DB'den döner.
+    - day verilirse: o günün kayıtları
+    - day yoksa: snapshot (fetched_at_tr) bazlı latest/oldest
+    """
+    ensure_schema()
+
+    which = (which or "latest").lower().strip()
+    if which not in ("latest", "oldest"):
+        which = "latest"
+
+    snap_sql = "MAX" if which == "latest" else "MIN"
+
+    with engine.begin() as conn:
+        if day:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        flash_match_id,
+                        match_datetime_tr, date, time,
+                        country_name, tournament_name,
+                        home, away,
+                        ft_home, ft_away,
+                        ms1, ms0, ms2,
+                        fetched_at_tr,
+                        updated_at
+                    FROM flash_finished_ms
+                    WHERE date = :day
+                    ORDER BY match_datetime_tr NULLS LAST, flash_match_id
+                    LIMIT :limit
+                """),
+                {"day": day, "limit": limit},
+            ).mappings().all()
+
+            return {"ok": True, "day": day, "which": None, "count": len(rows), "items": [dict(r) for r in rows]}
+
+        snapshot = conn.execute(text(f"SELECT {snap_sql}(fetched_at_tr) AS snap FROM flash_finished_ms")).scalar()
+
+        if not snapshot:
+            return {"ok": True, "day": None, "which": which, "snapshot": None, "count": 0, "items": []}
+
+        rows = conn.execute(
+            text("""
+                SELECT
+                    flash_match_id,
+                    match_datetime_tr, date, time,
+                    country_name, tournament_name,
+                    home, away,
+                    ft_home, ft_away,
+                    ms1, ms0, ms2,
+                    fetched_at_tr,
+                    updated_at
+                FROM flash_finished_ms
+                WHERE fetched_at_tr = :snapshot
+                ORDER BY match_datetime_tr NULLS LAST, flash_match_id
+                LIMIT :limit
+            """),
+            {"snapshot": snapshot, "limit": limit},
+        ).mappings().all()
+
+    return {
+        "ok": True,
+        "day": None,
+        "which": which,
+        "snapshot": snapshot,
+        "count": len(rows),
+        "items": [dict(r) for r in rows],
+        }
 
