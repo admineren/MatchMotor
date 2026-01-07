@@ -74,35 +74,38 @@ def _to_int_score(x):
     except Exception:
         return None
 
-def _meta_ci_get(match_result, wanted_key: str):
-    """
-    match_result: Nosy 'matchResult' alanı (genelde list[dict], bazen dict)
-    wanted_key: örn "msHomeScore"
-    """
-    if not match_result or not wanted_key:
-        return None
+def _meta_map(match_result_list) -> dict:
+    m = {}
+    if isinstance(match_result_list, list):
+        for it in match_result_list:
+            if not isinstance(it, dict):
+                continue
+            k = it.get("metaName")
+            v = it.get("value")
+            if k is not None:
+                m[str(k)] = v
+    return m
 
+def _meta_ci_get(match_result, wanted_key: str):
+    if not match_result:
+        return None
     w = wanted_key.lower()
 
-    # match_result dict gelirse (nadir)
     if isinstance(match_result, dict):
         for k, v in match_result.items():
             if isinstance(k, str) and k.lower() == w:
-                if isinstance(v, dict):
-                    return v.get("value") if "value" in v else v.get("Value")
+                if isinstance(v, dict) and "value" in v:
+                    return v.get("value")
                 return v
         return None
 
-    # standart: list[dict]
     if isinstance(match_result, list):
         for row in match_result:
             if not isinstance(row, dict):
                 continue
             name = row.get("metaName") or row.get("MetaName") or row.get("metaname")
             if isinstance(name, str) and name.lower() == w:
-                return row.get("value") or row.get("Value") or row.get("VALUE")
-        return None
-
+                return row.get("value") or row.get("Value")
     return None
 
 def _pick_int_from_match_result(match_result, *keys):
