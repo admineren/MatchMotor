@@ -209,6 +209,7 @@ def ensure_schema():
             CREATE TABLE IF NOT EXISTS pool_matches (
                 id BIGSERIAL PRIMARY KEY,
                 nosy_match_id BIGINT NOT NULL UNIQUE,
+                match_id BIGNIT
                 match_datetime TEXT,
                 date TEXT,
                 time TEXT,
@@ -231,6 +232,8 @@ def ensure_schema():
         conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS fetched_at_tr TEXT;"""))
         conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS raw_json TEXT;"""))
         conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS game_result INTEGER;"""))
+        conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS match_id BIGINT;"""))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS idx_pool_matches_match_id ON pool_matches(match_id);"""))
 
 # -----------------------------
 # FINISHED MATCHES (matches-result snapshot)
@@ -239,6 +242,7 @@ def ensure_schema():
             CREATE TABLE IF NOT EXISTS finished_matches (
                 id BIGSERIAL PRIMARY KEY,
                 nosy_match_id BIGINT NOT NULL UNIQUE,
+                match_id
 
                 match_datetime TEXT,
                 date TEXT,
@@ -285,7 +289,9 @@ def ensure_schema():
 
         conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS home_red INTEGER"))
         conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS away_red INTEGER"))
-             
+        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS match_id BIGINT"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finished_matches_match_id ON finished_matches(match_id)"))
+
 # ---------------------------
 # Nosy CHECK endpoints (root base)
 # ---------------------------
