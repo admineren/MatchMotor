@@ -1844,7 +1844,7 @@ def flashscore_db_finished_ms_sync_date(
                     raw_json = EXCLUDED.raw_json,
                     updated_at = NOW()
                 ;(
-            """)
+            """))
                 match_id,
                 dt_tr.isoformat(),
                 dt_tr.date().isoformat(),
