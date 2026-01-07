@@ -116,6 +116,51 @@ def _debug_no_score(reason: str, mid: int, item: dict, meta: dict, keys_tried: d
         "keys_tried": keys_tried,
     }
 
+def _meta_ci_get(match_result, wanted_key: str):
+    """
+    match_result: Nosy'nin matchResult alanı (genelde list[dict])
+    wanted_key: örn "msHomeScore"
+    """
+    if not match_result:
+        return None
+
+    w = wanted_key.lower()
+
+    # match_result bazen list bazen dict gelebilir
+    if isinstance(match_result, dict):
+        # eğer direkt dict ise: anahtarlar zaten meta isimleri olabilir
+        for k, v in match_result.items():
+            if isinstance(k, str) and k.lower() == w:
+                # v dict ise value alanını al
+                if isinstance(v, dict) and "value" in v:
+                    return v.get("value")
+                return v
+        return None
+
+    if isinstance(match_result, list):
+        for row in match_result:
+            if not isinstance(row, dict):
+                continue
+            name = row.get("metaName") or row.get("MetaName") or row.get("metaname")
+            if isinstance(name, str) and name.lower() == w:
+                return row.get("value") or row.get("Value") or row.get("VALUE")
+        return None
+
+    return None
+
+
+def _to_int_score(x):
+    # skor için "-" vb gelirse None say
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "" or s == "-" or s.lower() == "null":
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
 def _require_api_key():
     if not NOSY_API_KEY:
         raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
@@ -582,22 +627,9 @@ def sync_finished_matches(
     - Backfill: Sadece 'dün 22:00-23:59' arası başlayan ve finished'a geçmemiş maçlar için details dener.
     """
 
-    # küçük/büyük harf farkını öldüren meta parser
-    def _meta_map_ci(match_result):
-        base = _meta_map(match_result)
-        if not isinstance(base, dict):
-            return {}
-        # key'leri normalize et (lower)
-        out = {}
-        for k, v in base.items():
-            if isinstance(k, str):
-                out[k.lower()] = v
-        return out
-
     # -----------------------
     # 1) BULK: matches-result
     # -----------------------
-    no_score_reasons = []   # en fazla 50-100 tane tutalım
     MAX_DEBUG = 50
     payload = nosy_service_call("matches-result")
     data = payload.get("data") or []
@@ -622,22 +654,19 @@ def sync_finished_matches(
                 skipped += 1
                 continue
 
-            meta = _meta_map_ci(item.get("matchResult"))
-
-            # NOTE: metaName'ler API'de bazen farklı casing ile gelebiliyor, o yüzden lower map kullanıyoruz
-            meta = _meta_map_ci(item.get("matchResult"))
-
-            ft_home = _to_int(meta.get("msHomeScore"))
-            ft_away = _to_int(meta.get("msAwayScore"))
-            ht_home = _to_int(meta.get("htHomeScore"))
-            ht_away = _to_int(meta.get("htAwayScore"))
-
-            home_corner = _to_int(meta.get("homeCorner"))
-            away_corner = _to_int(meta.get("awayCorner"))
-            home_yellow = _to_int(meta.get("homeyellowCard"))
-            away_yellow = _to_int(meta.get("awayyellowCard"))
-            home_red = _to_int(meta.get("homeredCard"))
-            away_red = _to_int(meta.get("awayredCard"))
+            mr = item.get("matchResult")
+            
+            ft_home = _to_int_score(_meta_ci_get(mr, "msHomeScore"))
+            ft_away = _to_int_score(_meta_ci_get(mr, "msAwayScore"))
+            ht_home = _to_int_score(_meta_ci_get(mr, "htHomeScore"))
+            ht_away = _to_int_score(_meta_ci_get(mr, "htAwayScore"))
+            
+            home_corner = _to_int_score(_meta_ci_get(mr, "homeCorner"))
+            away_corner = _to_int_score(_meta_ci_get(mr, "awayCorner"))
+            home_yellow = _to_int_score(_meta_ci_get(mr, "homeyellowCard"))
+            away_yellow = _to_int_score(_meta_ci_get(mr, "awayyellowCard"))
+            home_red    = _to_int_score(_meta_ci_get(mr, "homeredCard"))
+            away_red    = _to_int_score(_meta_ci_get(mr, "awayredCard"))
 
             # skor yoksa finished sayma
             if ft_home is None or ft_away is None:
@@ -816,21 +845,19 @@ def sync_finished_matches(
                     backfill_report["skipped"] += 1
                     continue
 
-                meta = _meta_map_ci(item.get("matchResult"))
-
-                meta = _meta_map_ci(item.get("matchResult"))
+                mr = item.get("matchResult")
                 
-                ft_home = _to_int(meta.get("msHomeScore"))
-                ft_away = _to_int(meta.get("msAwayScore"))
-                ht_home = _to_int(meta.get("htHomeScore"))
-                ht_away = _to_int(meta.get("htAwayScore"))
+                ft_home = _to_int_score(_meta_ci_get(mr, "msHomeScore"))
+                ft_away = _to_int_score(_meta_ci_get(mr, "msAwayScore"))
+                ht_home = _to_int_score(_meta_ci_get(mr, "htHomeScore"))
+                ht_away = _to_int_score(_meta_ci_get(mr, "htAwayScore"))
                 
-                home_corner = _to_int(meta.get("homeCorner"))
-                away_corner = _to_int(meta.get("awayCorner"))
-                home_yellow = _to_int(meta.get("homeyellowCard"))
-                away_yellow = _to_int(meta.get("awayyellowCard"))
-                home_red = _to_int(meta.get("homeredCard"))
-                away_red = _to_int(meta.get("awayredCard"))
+                home_corner = _to_int_score(_meta_ci_get(mr, "homeCorner"))
+                away_corner = _to_int_score(_meta_ci_get(mr, "awayCorner"))
+                home_yellow = _to_int_score(_meta_ci_get(mr, "homeyellowCard"))
+                away_yellow = _to_int_score(_meta_ci_get(mr, "awayyellowCard"))
+                home_red    = _to_int_score(_meta_ci_get(mr, "homeredCard"))
+                away_red    = _to_int_score(_meta_ci_get(mr, "awayredCard"))
 
                 if ft_home is None or ft_away is None:
                     backfill_report["no_score"] += 1
