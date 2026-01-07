@@ -57,86 +57,43 @@ except Exception:
 # Helpers
 # ---------------------------
 def _dump_json(obj) -> str:
-    """
-    Dict / list gibi yapıları güvenli şekilde JSON stringe çevirir.
-    Pool katmanı için yeterli.
-    """
     try:
         return json.dumps(obj, ensure_ascii=False)
     except Exception:
         return "{}"
 
-def _meta_map(match_result_list) -> dict:
-    m = {}
-    if isinstance(match_result_list, list):
-        for it in match_result_list:
-            if not isinstance(it, dict):
-                continue
-            k = it.get("metaName")
-            v = it.get("value")
-            if k is not None:
-                m[str(k)] = v
-    return m
-
-def _to_int(x):
+def _to_int_score(x):
+    """Skor/kart/korner gibi alanlarda: '-' boş/null => None, '0' => 0"""
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "" or s == "-" or s.lower() == "null":
+        return None
     try:
-        return int(str(x).strip())
+        return int(s)
     except Exception:
         return None
 
-def _first_int(meta, keys):
-    for k in keys:
-        if k is None:
-            continue
-        v = meta.get(k.lower())
-        if v is None:
-            continue
-        iv = _to_int(v)
-        if iv is not None:
-            return iv
-    return None
-
-def _pick_int(meta: dict, *keys):
-    for k in keys:
-        if k in meta:
-            n = _to_int(meta.get(k))
-            if n is not None:
-                return n, k
-    return None, None
-
-def _debug_no_score(reason: str, mid: int, item: dict, meta: dict, keys_tried: dict):
-    # Çok şişmesin diye en kritik alanları dönüyoruz
-    return {
-        "match_id": mid,
-        "reason": reason,
-        "GameResult": item.get("GameResult"),
-        "Result": item.get("Result"),
-        "LiveStatus": item.get("LiveStatus"),
-        "keys_present_sample": list(meta.keys())[:30],
-        "keys_tried": keys_tried,
-    }
-
 def _meta_ci_get(match_result, wanted_key: str):
     """
-    match_result: Nosy'nin matchResult alanı (genelde list[dict])
+    match_result: Nosy 'matchResult' alanı (genelde list[dict], bazen dict)
     wanted_key: örn "msHomeScore"
     """
-    if not match_result:
+    if not match_result or not wanted_key:
         return None
 
     w = wanted_key.lower()
 
-    # match_result bazen list bazen dict gelebilir
+    # match_result dict gelirse (nadir)
     if isinstance(match_result, dict):
-        # eğer direkt dict ise: anahtarlar zaten meta isimleri olabilir
         for k, v in match_result.items():
             if isinstance(k, str) and k.lower() == w:
-                # v dict ise value alanını al
-                if isinstance(v, dict) and "value" in v:
-                    return v.get("value")
+                if isinstance(v, dict):
+                    return v.get("value") if "value" in v else v.get("Value")
                 return v
         return None
 
+    # standart: list[dict]
     if isinstance(match_result, list):
         for row in match_result:
             if not isinstance(row, dict):
@@ -148,18 +105,30 @@ def _meta_ci_get(match_result, wanted_key: str):
 
     return None
 
+def _pick_int_from_match_result(match_result, *keys):
+    """
+    keys: ("msHomeScore", "mshomescore", ...)
+    döner: (int|None, used_key|None, raw_value)
+    """
+    for k in keys:
+        raw = _meta_ci_get(match_result, k)
+        iv = _to_int_score(raw)
+        if iv is not None:
+            return iv, k, raw
+    return None, None, None
 
-def _to_int_score(x):
-    # skor için "-" vb gelirse None say
-    if x is None:
-        return None
-    s = str(x).strip()
-    if s == "" or s == "-" or s.lower() == "null":
-        return None
-    try:
-        return int(s)
-    except Exception:
-        return None
+def _debug_no_score(reason: str, mid: int, item: dict, keys_tried: dict):
+    mr = item.get("matchResult") or []
+    sample = mr[:6] if isinstance(mr, list) else list(mr.items())[:6] if isinstance(mr, dict) else []
+    return {
+        "match_id": mid,
+        "reason": reason,
+        "GameResult": item.get("GameResult"),
+        "Result": item.get("Result"),
+        "LiveStatus": item.get("LiveStatus"),
+        "keys_tried": keys_tried,
+        "matchResult_sample": sample,
+    }
 
 def _require_api_key():
     if not NOSY_API_KEY:
@@ -171,10 +140,6 @@ def _join_url(base: str, endpoint: str) -> str:
     return f"{base}/{endpoint}"
 
 def nosy_service_call(endpoint: str, *, params: dict | None = None) -> dict:
-    """
-    SERVICE base üzerinden çağrı:
-    https://www.nosyapi.com/apiv2/service/<endpoint>
-    """
     _require_api_key()
     url = _join_url(NOSY_SERVICE_BASE_URL, endpoint)
 
@@ -186,7 +151,6 @@ def nosy_service_call(endpoint: str, *, params: dict | None = None) -> dict:
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Nosy bağlantı hatası: {e}")
 
-    # Nosy bazen 200 dönüp status=failure verir; o yüzden json’u döndürüp üstte kontrol etmek daha iyi.
     if r.status_code >= 400:
         try:
             body = r.json()
@@ -200,10 +164,6 @@ def nosy_service_call(endpoint: str, *, params: dict | None = None) -> dict:
         raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
 
 def nosy_check_call(api_id: str) -> dict:
-    """
-    CHECK base üzerinden çağrı:
-    https://www.nosyapi.com/apiv2/nosy-service/check?apiKey=...&apiID=...
-    """
     _require_api_key()
     if not api_id:
         raise HTTPException(status_code=500, detail="Check için apiID env eksik.")
@@ -234,6 +194,7 @@ def make_aware(dt, tz):
     if dt.tzinfo is None:
         return dt.replace(tzinfo=tz)
     return dt
+
 
 # ==========================================================
 # APP
@@ -625,12 +586,78 @@ def sync_finished_matches(
     + opsiyonel: matches-result/details (backfill)
     - Bulk: API'nin döndürdüğü biten maçları finished_matches tablosuna upsert eder.
     - Backfill: Sadece 'dün 22:00-23:59' arası başlayan ve finished'a geçmemiş maçlar için details dener.
-    """
+    """        
+
+    # debug: backfill no_score örnekleri
+    no_score_debug = []
+
+    # INSERT/UPSERT SQL (bulk ve backfill ortak)
+    UPSERT_SQL = text(
+        """
+        INSERT INTO finished_matches(
+            nosy_match_id,
+            match_datetime, date, time,
+            league_code, league, country, team1, team2,
+            betcount, ms1, ms0, ms2, alt25, ust25,
+            ft_home, ft_away, ht_home, ht_away,
+            home_corner, away_corner,
+            home_yellow, away_yellow,
+            home_red, away_red,
+            mb, result, game_result, live_status,
+            fetched_at_tr, raw_json,
+            updated_at
+        )
+        VALUES(
+            :mid,
+            :dt, :date, :time,
+            :league_code, :league, :country, :team1, :team2,
+            :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
+            :ft_home, :ft_away, :ht_home, :ht_away,
+            :home_corner, :away_corner,
+            :home_yellow, :away_yellow,
+            :home_red, :away_red,
+            :mb, :result, :game_result, :live_status,
+            :fetched_at_tr, :raw_json,
+            NOW()
+        )
+        ON CONFLICT(nosy_match_id) DO UPDATE SET
+            match_datetime = EXCLUDED.match_datetime,
+            date = EXCLUDED.date,
+            time = EXCLUDED.time,
+            league_code = EXCLUDED.league_code,
+            league = EXCLUDED.league,
+            country = EXCLUDED.country,
+            team1 = EXCLUDED.team1,
+            team2 = EXCLUDED.team2,
+            betcount = EXCLUDED.betcount,
+            ms1 = EXCLUDED.ms1,
+            ms0 = EXCLUDED.ms0,
+            ms2 = EXCLUDED.ms2,
+            alt25 = EXCLUDED.alt25,
+            ust25 = EXCLUDED.ust25,
+            ft_home = EXCLUDED.ft_home,
+            ft_away = EXCLUDED.ft_away,
+            ht_home = EXCLUDED.ht_home,
+            ht_away = EXCLUDED.ht_away,
+            home_corner = EXCLUDED.home_corner,
+            away_corner = EXCLUDED.away_corner,
+            home_yellow = EXCLUDED.home_yellow,
+            away_yellow = EXCLUDED.away_yellow,
+            home_red = EXCLUDED.home_red,
+            away_red = EXCLUDED.away_red,
+            mb = EXCLUDED.mb,
+            result = EXCLUDED.result,
+            game_result = EXCLUDED.game_result,
+            live_status = EXCLUDED.live_status,
+            fetched_at_tr = EXCLUDED.fetched_at_tr,
+            raw_json = EXCLUDED.raw_json,
+            updated_at = NOW()
+        """
+    )
 
     # -----------------------
     # 1) BULK: matches-result
     # -----------------------
-    MAX_DEBUG = 50
     payload = nosy_service_call("matches-result")
     data = payload.get("data") or []
     received = len(data)
@@ -654,7 +681,7 @@ def sync_finished_matches(
                 skipped += 1
                 continue
 
-            mr = item.get("matchResult")
+            mr = item.get("matchResult") or item.get("MatchResult") or []
             
             ft_home = _to_int_score(_meta_ci_get(mr, "msHomeScore"))
             ft_away = _to_int_score(_meta_ci_get(mr, "msAwayScore"))
@@ -663,10 +690,10 @@ def sync_finished_matches(
             
             home_corner = _to_int_score(_meta_ci_get(mr, "homeCorner"))
             away_corner = _to_int_score(_meta_ci_get(mr, "awayCorner"))
-            home_yellow = _to_int_score(_meta_ci_get(mr, "homeyellowCard"))
-            away_yellow = _to_int_score(_meta_ci_get(mr, "awayyellowCard"))
-            home_red    = _to_int_score(_meta_ci_get(mr, "homeredCard"))
-            away_red    = _to_int_score(_meta_ci_get(mr, "awayredCard"))
+            home_yellow = _to_int_score(_meta_ci_get(mr, "homeYellowCard"))
+            away_yellow = _to_int_score(_meta_ci_get(mr, "awayYellowCard"))
+            home_red    = _to_int_score(_meta_ci_get(mr, "homeRedCard"))
+            away_red    = _to_int_score(_meta_ci_get(mr, "awayRedCard"))
 
             # skor yoksa finished sayma
             if ft_home is None or ft_away is None:
@@ -674,68 +701,7 @@ def sync_finished_matches(
                 continue
 
             conn.execute(
-                text(
-                    """
-                    INSERT INTO finished_matches(
-                        nosy_match_id,
-                        match_datetime, date, time,
-                        league_code, league, country, team1, team2,
-                        betcount, ms1, ms0, ms2, alt25, ust25,
-                        ft_home, ft_away, ht_home, ht_away,
-                        home_corner, away_corner,
-                        home_yellow, away_yellow,
-                        home_red, away_red,
-                        mb, result, game_result, live_status,
-                        fetched_at_tr, raw_json,
-                        updated_at
-                    )
-                    VALUES(
-                        :mid,
-                        :dt, :date, :time,
-                        :league_code, :league, :country, :team1, :team2,
-                        :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
-                        :ft_home, :ft_away, :ht_home, :ht_away,
-                        :home_corner, :away_corner,
-                        :home_yellow, :away_yellow,
-                        :home_red, :away_red,
-                        :mb, :result, :game_result, :live_status,
-                        :fetched_at_tr, :raw_json,
-                        NOW()
-                    )
-                    ON CONFLICT(nosy_match_id) DO UPDATE SET
-                        match_datetime = EXCLUDED.match_datetime,
-                        date = EXCLUDED.date,
-                        time = EXCLUDED.time,
-                        league_code = EXCLUDED.league_code,
-                        league = EXCLUDED.league,
-                        country = EXCLUDED.country,
-                        team1 = EXCLUDED.team1,
-                        team2 = EXCLUDED.team2,
-                        betcount = EXCLUDED.betcount,
-                        ms1 = EXCLUDED.ms1,
-                        ms0 = EXCLUDED.ms0,
-                        ms2 = EXCLUDED.ms2,
-                        alt25 = EXCLUDED.alt25,
-                        ust25 = EXCLUDED.ust25,
-                        ft_home = EXCLUDED.ft_home,
-                        ft_away = EXCLUDED.ft_away,
-                        ht_home = EXCLUDED.ht_home,
-                        ht_away = EXCLUDED.ht_away,
-                        home_corner = EXCLUDED.home_corner,
-                        away_corner = EXCLUDED.away_corner,
-                        home_yellow = EXCLUDED.home_yellow,
-                        away_yellow = EXCLUDED.away_yellow,
-                        home_red = EXCLUDED.home_red,
-                        away_red = EXCLUDED.away_red,
-                        mb = EXCLUDED.mb,
-                        result = EXCLUDED.result,
-                        game_result = EXCLUDED.game_result,
-                        live_status = EXCLUDED.live_status,
-                        fetched_at_tr = EXCLUDED.fetched_at_tr,
-                        raw_json = EXCLUDED.raw_json,
-                        updated_at = NOW()
-                    """
-                ),
+                UPSERT_SQL,
                 {
                     "mid": mid,
                     "dt": str(item.get("DateTime") or ""),
@@ -789,10 +755,8 @@ def sync_finished_matches(
             now_tr = datetime.now(TR_TZ) if TR_TZ else datetime.utcnow()
             yesterday = (now_tr.date() - timedelta(days=1)).isoformat()
 
-            # "dün 22:00:00 - 23:59:59" bandı
             t_from = "22:00:00"
             t_to = "23:59:59"
-
             backfill_report["window"] = {"day": yesterday, "time_from": t_from, "time_to": t_to}
 
             mids = (
@@ -827,143 +791,88 @@ def sync_finished_matches(
             for mid in mids:
                 backfill_report["requested"] += 1
 
-                # Swagger ekranında param adı matchID görünüyor.
-                # Senin wrapper bunu match_id ile map ediyorsa da sorun olmasın diye iki anahtarı da veriyoruz.
                 details = nosy_service_call(
                     "matches-result/details",
                     params={"matchID": int(mid), "match_id": int(mid)},
                 )
                 dd = (details or {}).get("data")
 
-                item = None
+                item2 = None
                 if isinstance(dd, list) and dd:
-                    item = dd[0]
+                    item2 = dd[0]
                 elif isinstance(dd, dict):
-                    item = dd
+                    item2 = dd
 
-                if not isinstance(item, dict):
+                if not isinstance(item2, dict):
                     backfill_report["skipped"] += 1
                     continue
 
-                mr = item.get("matchResult")
-                
-                ft_home = _to_int_score(_meta_ci_get(mr, "msHomeScore"))
-                ft_away = _to_int_score(_meta_ci_get(mr, "msAwayScore"))
-                ht_home = _to_int_score(_meta_ci_get(mr, "htHomeScore"))
-                ht_away = _to_int_score(_meta_ci_get(mr, "htAwayScore"))
-                
-                home_corner = _to_int_score(_meta_ci_get(mr, "homeCorner"))
-                away_corner = _to_int_score(_meta_ci_get(mr, "awayCorner"))
-                home_yellow = _to_int_score(_meta_ci_get(mr, "homeyellowCard"))
-                away_yellow = _to_int_score(_meta_ci_get(mr, "awayyellowCard"))
-                home_red    = _to_int_score(_meta_ci_get(mr, "homeredCard"))
-                away_red    = _to_int_score(_meta_ci_get(mr, "awayredCard"))
+                mr2 = item2.get("matchResult")
 
-                if ft_home is None or ft_away is None:
+                ft_home2 = _to_int_score(_meta_ci_get(mr2, "msHomeScore"))
+                ft_away2 = _to_int_score(_meta_ci_get(mr2, "msAwayScore"))
+                ht_home2 = _to_int_score(_meta_ci_get(mr2, "htHomeScore"))
+                ht_away2 = _to_int_score(_meta_ci_get(mr2, "htAwayScore"))
+
+                home_corner2 = _to_int_score(_meta_ci_get(mr2, "homeCorner"))
+                away_corner2 = _to_int_score(_meta_ci_get(mr2, "awayCorner"))
+                home_yellow2 = _to_int_score(_meta_ci_get(mr2, "homeyellowCard"))
+                away_yellow2 = _to_int_score(_meta_ci_get(mr2, "awayyellowCard"))
+                home_red2 = _to_int_score(_meta_ci_get(mr2, "homeredCard"))
+                away_red2 = _to_int_score(_meta_ci_get(mr2, "awayredCard"))
+
+                if ft_home2 is None or ft_away2 is None:
                     backfill_report["no_score"] += 1
+                    if len(no_score_debug) < 10:
+                        no_score_debug.append(
+                            {
+                                "mid": int(mid),
+                                "GameResult": item2.get("GameResult"),
+                                "LiveStatus": item2.get("LiveStatus"),
+                                "Result": item2.get("Result"),
+                                "sample_matchResult_first3": (item2.get("matchResult") or [])[:3],
+                            }
+                        )
                     continue
 
-                # backfill yazarken de "details item" içinden alanları alıyoruz (casing PascalCase)
                 fetched_at_tr_bf = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
 
                 conn.execute(
-                    text(
-                        """
-                        INSERT INTO finished_matches(
-                            nosy_match_id,
-                            match_datetime, date, time,
-                            league_code, league, country, team1, team2,
-                            betcount, ms1, ms0, ms2, alt25, ust25,
-                            ft_home, ft_away, ht_home, ht_away,
-                            home_corner, away_corner,
-                            home_yellow, away_yellow,
-                            home_red, away_red,
-                            mb, result, game_result, live_status,
-                            fetched_at_tr, raw_json,
-                            updated_at
-                        )
-                        VALUES(
-                            :mid,
-                            :dt, :date, :time,
-                            :league_code, :league, :country, :team1, :team2,
-                            :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
-                            :ft_home, :ft_away, :ht_home, :ht_away,
-                            :home_corner, :away_corner,
-                            :home_yellow, :away_yellow,
-                            :home_red, :away_red,
-                            :mb, :result, :game_result, :live_status,
-                            :fetched_at_tr, :raw_json,
-                            NOW()
-                        )
-                        ON CONFLICT(nosy_match_id) DO UPDATE SET
-                            match_datetime = EXCLUDED.match_datetime,
-                            date = EXCLUDED.date,
-                            time = EXCLUDED.time,
-                            league_code = EXCLUDED.league_code,
-                            league = EXCLUDED.league,
-                            country = EXCLUDED.country,
-                            team1 = EXCLUDED.team1,
-                            team2 = EXCLUDED.team2,
-                            betcount = EXCLUDED.betcount,
-                            ms1 = EXCLUDED.ms1,
-                            ms0 = EXCLUDED.ms0,
-                            ms2 = EXCLUDED.ms2,
-                            alt25 = EXCLUDED.alt25,
-                            ust25 = EXCLUDED.ust25,
-                            ft_home = EXCLUDED.ft_home,
-                            ft_away = EXCLUDED.ft_away,
-                            ht_home = EXCLUDED.ht_home,
-                            ht_away = EXCLUDED.ht_away,
-                            home_corner = EXCLUDED.home_corner,
-                            away_corner = EXCLUDED.away_corner,
-                            home_yellow = EXCLUDED.home_yellow,
-                            away_yellow = EXCLUDED.away_yellow,
-                            home_red = EXCLUDED.home_red,
-                            away_red = EXCLUDED.away_red,
-                            mb = EXCLUDED.mb,
-                            result = EXCLUDED.result,
-                            game_result = EXCLUDED.game_result,
-                            live_status = EXCLUDED.live_status,
-                            fetched_at_tr = EXCLUDED.fetched_at_tr,
-                            raw_json = EXCLUDED.raw_json,
-                            updated_at = NOW()
-                        """
-                    ),
+                    UPSERT_SQL,
                     {
                         "mid": int(mid),
-                        "dt": str(item.get("DateTime") or ""),
-                        "date": str(item.get("Date") or ""),
-                        "time": str(item.get("Time") or ""),
-                        "league_code": str(item.get("LeagueCode") or ""),
-                        "league": str(item.get("League") or ""),
-                        "country": str(item.get("Country") or ""),
-                        "team1": str(item.get("Team1") or ""),
-                        "team2": str(item.get("Team2") or ""),
-                        "betcount": item.get("BetCount"),
-                        "ms1": item.get("HomeWin"),
-                        "ms0": item.get("Draw"),
-                        "ms2": item.get("AwayWin"),
-                        "alt25": item.get("Under25"),
-                        "ust25": item.get("Over25"),
-                        "ft_home": ft_home,
-                        "ft_away": ft_away,
-                        "ht_home": ht_home,
-                        "ht_away": ht_away,
-                        "home_corner": home_corner,
-                        "away_corner": away_corner,
-                        "home_yellow": home_yellow,
-                        "away_yellow": away_yellow,
-                        "home_red": home_red,
-                        "away_red": away_red,
-                        "mb": item.get("MB"),
-                        "result": item.get("Result"),
-                        "game_result": item.get("GameResult"),
-                        "live_status": item.get("LiveStatus"),
+                        "dt": str(item2.get("DateTime") or ""),
+                        "date": str(item2.get("Date") or ""),
+                        "time": str(item2.get("Time") or ""),
+                        "league_code": str(item2.get("LeagueCode") or ""),
+                        "league": str(item2.get("League") or ""),
+                        "country": str(item2.get("Country") or ""),
+                        "team1": str(item2.get("Team1") or ""),
+                        "team2": str(item2.get("Team2") or ""),
+                        "betcount": item2.get("BetCount"),
+                        "ms1": item2.get("HomeWin"),
+                        "ms0": item2.get("Draw"),
+                        "ms2": item2.get("AwayWin"),
+                        "alt25": item2.get("Under25"),
+                        "ust25": item2.get("Over25"),
+                        "ft_home": ft_home2,
+                        "ft_away": ft_away2,
+                        "ht_home": ht_home2,
+                        "ht_away": ht_away2,
+                        "home_corner": home_corner2,
+                        "away_corner": away_corner2,
+                        "home_yellow": home_yellow2,
+                        "away_yellow": away_yellow2,
+                        "home_red": home_red2,
+                        "away_red": away_red2,
+                        "mb": item2.get("MB"),
+                        "result": item2.get("Result"),
+                        "game_result": item2.get("GameResult"),
+                        "live_status": item2.get("LiveStatus"),
                         "fetched_at_tr": fetched_at_tr_bf,
-                        "raw_json": _dump_json(item),
+                        "raw_json": _dump_json(item2),
                     },
                 )
-
                 backfill_report["upserted"] += 1
 
     return {
@@ -979,8 +888,9 @@ def sync_finished_matches(
             "creditUsed": payload.get("creditUsed"),
         },
         "backfill": backfill_report,
-    }
-
+        "no_score_debug": no_score_debug,
+                              }
+                                                  
 @app.get("/db/finished-matches")
 def list_finished_matches(
     day: Optional[str] = Query(default=None, description="YYYY-MM-DD. Boşsa en son snapshot."),
