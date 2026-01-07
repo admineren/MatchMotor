@@ -1810,8 +1810,9 @@ def flashscore_db_finished_ms_sync_date(
 
             country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
             tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name")
-
-            cur.execute("""
+            
+            with engine.begin() as conn:
+                conn.execute(text("""
                 INSERT INTO flash_finished_ms (
                     flash_match_id, match_datetime_tr, date, time, fetched_at_tr,
                     country_name, tournament_name,
@@ -1858,9 +1859,10 @@ def flashscore_db_finished_ms_sync_date(
             written += 1
             upserted += 1
 
-    conn.commit()
-    cur.close()
-    conn.close()
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True
+    ) if DATABASE_URL else None
 
     return {
         "ok": True,
