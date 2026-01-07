@@ -84,6 +84,18 @@ def _to_int(x):
     except Exception:
         return None
 
+def _first_int(meta, keys):
+    for k in keys:
+        if k is None:
+            continue
+        v = meta.get(k.lower())
+        if v is None:
+            continue
+        iv = _to_int(v)
+        if iv is not None:
+            return iv
+    return None
+
 def _require_api_key():
     if not NOSY_API_KEY:
         raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
@@ -363,7 +375,7 @@ def sync_pool_bettable_matches():
     NosyAPI -> bettable-matches
     Günün bültenini çekip pool_matches tablosuna upsert eder.
     """
-    payload = nosy_service_call("bettable-matches")  # senin mevcut helper'ın: /service + apiKey
+    payload = nosy_service_call("bettable-matches")
     data = payload.get("data") or []
     received = len(data)
 
@@ -378,21 +390,22 @@ def sync_pool_bettable_matches():
                 skipped += 1
                 continue
 
-            match_id = item.get("MatchID")
+            mid = item.get("MatchID")
             try:
-                match_id = int(match_id)
+                mid = int(mid)
             except Exception:
                 skipped += 1
                 continue
 
-            # Temel alanlar (bettable-matches response’undan)
+            # Temel alanlar
             date_val = str(item.get("Date") or "")
             time_val = str(item.get("Time") or "")
             dt_val   = str(item.get("DateTime") or "")
-            league   = str(item.get("League") or "")
-            country  = str(item.get("Country") or "")
-            team1    = str(item.get("Team1") or "")
-            team2    = str(item.get("Team2") or "")
+
+            league  = str(item.get("League") or "")
+            country = str(item.get("Country") or "")
+            team1   = str(item.get("Team1") or "")
+            team2   = str(item.get("Team2") or "")
 
             ms1 = item.get("HomeWin")
             ms0 = item.get("Draw")
@@ -400,58 +413,60 @@ def sync_pool_bettable_matches():
             alt25 = item.get("Under25")
             ust25 = item.get("Over25")
             betcount = item.get("BetCount")
+            game_result = item.get("GameResult")
 
             conn.execute(
                 text("""
                     INSERT INTO pool_matches(
-                        nosy_match_id, date, time, match_datetime,
+                        nosy_match_id,
+                        match_datetime, date, time,
                         league, country, team1, team2,
-                        ms1, ms0, ms2, alt25, ust25, betcount,
+                        betcount, ms1, ms0, ms2, alt25, ust25,
                         fetched_at_tr, raw_json, game_result
                     )
                     VALUES(
-                        :mid, :date, :time, :dt,
+                        :mid,
+                        :dt, :date, :time,
                         :league, :country, :team1, :team2,
-                        :ms1, :ms0, :ms2, :alt25, :ust25, :betcount,
-                        :fetched_at_tr, :raw_json,
-                        :game_result
+                        :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
+                        :fetched_at_tr, :raw_json, :game_result
                     )
                     ON CONFLICT(nosy_match_id) DO UPDATE SET
-                        date          = EXCLUDED.date,
-                        time          = EXCLUDED.time,
-                        match_datetime= EXCLUDED.match_datetime,
-                        league        = EXCLUDED.league,
-                        country       = EXCLUDED.country,
-                        team1         = EXCLUDED.team1,
-                        team2         = EXCLUDED.team2,
-                        ms1           = EXCLUDED.ms1,
-                        ms0           = EXCLUDED.ms0,
-                        ms2           = EXCLUDED.ms2,
-                        alt25         = EXCLUDED.alt25,
-                        ust25         = EXCLUDED.ust25,
-                        betcount      = EXCLUDED.betcount,
+                        match_datetime = EXCLUDED.match_datetime,
+                        date = EXCLUDED.date,
+                        time = EXCLUDED.time,
+                        league = EXCLUDED.league,
+                        country = EXCLUDED.country,
+                        team1 = EXCLUDED.team1,
+                        team2 = EXCLUDED.team2,
+                        betcount = EXCLUDED.betcount,
+                        ms1 = EXCLUDED.ms1,
+                        ms0 = EXCLUDED.ms0,
+                        ms2 = EXCLUDED.ms2,
+                        alt25 = EXCLUDED.alt25,
+                        ust25 = EXCLUDED.ust25,
                         fetched_at_tr = EXCLUDED.fetched_at_tr,
-                        raw_json      = EXCLUDED.raw_json,
-                        game_result   = EXCLUDED.game_result
+                        raw_json = EXCLUDED.raw_json,
+                        game_result = EXCLUDED.game_result
                 """),
                 {
-                    "mid": match_id,
+                    "mid": mid,
+                    "dt": dt_val,
                     "date": date_val,
                     "time": time_val,
-                    "dt": dt_val,
                     "league": league,
                     "country": country,
                     "team1": team1,
                     "team2": team2,
+                    "betcount": betcount,
                     "ms1": ms1,
                     "ms0": ms0,
                     "ms2": ms2,
                     "alt25": alt25,
                     "ust25": ust25,
-                    "betcount": betcount,
-                    "game_result": item.get("GameResult"),
                     "fetched_at_tr": fetched_at_tr,
                     "raw_json": _dump_json(item),
+                    "game_result": game_result,
                 }
             )
             upserted += 1
@@ -465,15 +480,7 @@ def sync_pool_bettable_matches():
         "fetched_at_tr": fetched_at_tr,
         "rowCount": payload.get("rowCount"),
         "creditUsed": payload.get("creditUsed"),
-    }
-
-    return {
-        "ok": True,
-        "selected_from_pool": selected,
-        "upserted_into_matches": upserted,
-        "skipped": skipped,
-        "synced_at_tr": fetched_at_tr
-    }
+    }                 
 
 @app.get("/pool/bettable-matches")
 def get_pool_bettable_matches(
