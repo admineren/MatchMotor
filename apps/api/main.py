@@ -96,6 +96,26 @@ def _first_int(meta, keys):
             return iv
     return None
 
+def _pick_int(meta: dict, *keys):
+    for k in keys:
+        if k in meta:
+            n = _to_int(meta.get(k))
+            if n is not None:
+                return n, k
+    return None, None
+
+def _debug_no_score(reason: str, mid: int, item: dict, meta: dict, keys_tried: dict):
+    # Çok şişmesin diye en kritik alanları dönüyoruz
+    return {
+        "match_id": mid,
+        "reason": reason,
+        "GameResult": item.get("GameResult"),
+        "Result": item.get("Result"),
+        "LiveStatus": item.get("LiveStatus"),
+        "keys_present_sample": list(meta.keys())[:30],
+        "keys_tried": keys_tried,
+    }
+
 def _require_api_key():
     if not NOSY_API_KEY:
         raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
@@ -577,6 +597,8 @@ def sync_finished_matches(
     # -----------------------
     # 1) BULK: matches-result
     # -----------------------
+    no_score_reasons = []   # en fazla 50-100 tane tutalım
+    MAX_DEBUG = 50
     payload = nosy_service_call("matches-result")
     data = payload.get("data") or []
     received = len(data)
@@ -603,17 +625,19 @@ def sync_finished_matches(
             meta = _meta_map_ci(item.get("matchResult"))
 
             # NOTE: metaName'ler API'de bazen farklı casing ile gelebiliyor, o yüzden lower map kullanıyoruz
-            ft_home = _to_int(meta.get("mshomescore"))
-            ft_away = _to_int(meta.get("msawayscore"))
-            ht_home = _to_int(meta.get("hthomescore"))
-            ht_away = _to_int(meta.get("htawayscore"))
+            meta = _meta_map_ci(item.get("matchResult"))
 
-            home_corner = _to_int(meta.get("homecorner"))
-            away_corner = _to_int(meta.get("awaycorner"))
-            home_yellow = _to_int(meta.get("homeyellowcard"))
-            away_yellow = _to_int(meta.get("awayyellowcard"))
-            home_red = _to_int(meta.get("homeredcard"))
-            away_red = _to_int(meta.get("awayredcard"))
+            ft_home = _to_int(meta.get("msHomeScore"))
+            ft_away = _to_int(meta.get("msAwayScore"))
+            ht_home = _to_int(meta.get("htHomeScore"))
+            ht_away = _to_int(meta.get("htAwayScore"))
+
+            home_corner = _to_int(meta.get("homeCorner"))
+            away_corner = _to_int(meta.get("awayCorner"))
+            home_yellow = _to_int(meta.get("homeyellowCard"))
+            away_yellow = _to_int(meta.get("awayyellowCard"))
+            home_red = _to_int(meta.get("homeredCard"))
+            away_red = _to_int(meta.get("awayredCard"))
 
             # skor yoksa finished sayma
             if ft_home is None or ft_away is None:
@@ -794,17 +818,19 @@ def sync_finished_matches(
 
                 meta = _meta_map_ci(item.get("matchResult"))
 
-                ft_home = _to_int(meta.get("mshomescore"))
-                ft_away = _to_int(meta.get("msawayscore"))
-                ht_home = _to_int(meta.get("hthomescore"))
-                ht_away = _to_int(meta.get("htawayscore"))
-
-                home_corner = _to_int(meta.get("homecorner"))
-                away_corner = _to_int(meta.get("awaycorner"))
-                home_yellow = _to_int(meta.get("homeyellowcard"))
-                away_yellow = _to_int(meta.get("awayyellowcard"))
-                home_red = _to_int(meta.get("homeredcard"))
-                away_red = _to_int(meta.get("awayredcard"))
+                meta = _meta_map_ci(item.get("matchResult"))
+                
+                ft_home = _to_int(meta.get("msHomeScore"))
+                ft_away = _to_int(meta.get("msAwayScore"))
+                ht_home = _to_int(meta.get("htHomeScore"))
+                ht_away = _to_int(meta.get("htAwayScore"))
+                
+                home_corner = _to_int(meta.get("homeCorner"))
+                away_corner = _to_int(meta.get("awayCorner"))
+                home_yellow = _to_int(meta.get("homeyellowCard"))
+                away_yellow = _to_int(meta.get("awayyellowCard"))
+                home_red = _to_int(meta.get("homeredCard"))
+                away_red = _to_int(meta.get("awayredCard"))
 
                 if ft_home is None or ft_away is None:
                     backfill_report["no_score"] += 1
