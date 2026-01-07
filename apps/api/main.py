@@ -1359,262 +1359,64 @@ def stats_organizations(
 # ==========================================================
 # Flashscore API Layer (RapidAPI) - separated in Swagger
 # ==========================================================
-import os
-import requests
-from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException
-
-flashscore_router = APIRouter(prefix="/flashscore", tags=["Flashscore"])
-
 
 # ---------------------------
-# Helpers
+# Config (ENV) - FLASHSCORE (RapidAPI)
 # ---------------------------
-def _fs_headers() -> dict:
-    key = os.getenv("RAPIDAPI_KEY")
-    host = os.getenv("FLASHSCORE_RAPIDAPI_HOST")
-    if not key or not host:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing env vars: RAPIDAPI_KEY and/or FLASHSCORE_RAPIDAPI_HOST",
-        )
-    return {
-        "x-rapidapi-key": key,
-        "x-rapidapi-host": host,
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
+
+FLASHSCORE_BASE_URL = os.getenv(
+    "FLASHSCORE_BASE_URL",
+    "https://flashscore4.p.rapidapi.com/api/flashscore/v1"
+).strip().rstrip("/")
+
+FLASHSCORE_RAPIDAPI_HOST = os.getenv(
+    "FLASHSCORE_RAPIDAPI_HOST",
+    "flashscore4.p.rapidapi.com"
+).strip()
+
+# ---------------------------
+# FLASHSCORE HELPER
+# ---------------------------
+def _require_rapidapi_key():
+    if not RAPIDAPI_KEY:
+        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY env eksik.")
+
+def flashscore_call(endpoint: str, *, params: dict | None = None) -> dict:
+    """
+    RapidAPI Flashscore çağrısı.
+    Base: https://flashscore4.p.rapidapi.com/api/flashscore/v1
+    Header zorunlu: x-rapidapi-key, x-rapidapi-host
+    """
+    _require_rapidapi_key()
+
+    url = _join_url(FLASHSCORE_BASE_URL, endpoint)
+
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": FLASHSCORE_RAPIDAPI_HOST,
     }
 
-
-def _fs_get(url: str, timeout: int = 12):
     try:
-        r = requests.get(url, headers=_fs_headers(), timeout=timeout)
+        r = requests.get(url, headers=headers, params=(params or {}), timeout=30)
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Flashscore request error: {e}")
+        raise HTTPException(status_code=502, detail=f"Flashscore bağlantı hatası: {e}")
 
     if r.status_code >= 400:
-        # mümkün olduğunca response'u göster
         try:
-            payload = r.json()
+            body = r.json()
         except Exception:
-            payload = r.text
-        raise HTTPException(status_code=502, detail={"status": r.status_code, "body": payload})
+            body = {"raw": r.text}
+        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
 
     try:
-        return r.json(), r.headers
+        return r.json()
     except Exception:
-        raise HTTPException(status_code=502, detail="Flashscore returned non-JSON response")
+        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
 
-
-def _to_tr_iso(ts: int | None) -> str | None:
-    if ts is None:
-        return None
-    dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-    # Senin üstte tanımladığın TR_TZ'yi kullanıyoruz (Europe/Istanbul)
-    if "TR_TZ" in globals() and TR_TZ:
-        dt = dt.astimezone(TR_TZ)
-    return dt.isoformat(timespec="seconds")
-
-
-def _rl(headers: dict) -> dict:
-    # RapidAPI header isimleri API'ye göre değişebiliyor; güvenli parse
-    keys = [
-        "x-ratelimit-requests-limit",
-        "x-ratelimit-requests-remaining",
-        "x-ratelimit-requests-reset",
-        "x-ratelimit-limit",
-        "x-ratelimit-remaining",
-        "x-ratelimit-reset",
-    ]
-    out = {}
-    for k in keys:
-        if k in headers:
-            out[k] = headers.get(k)
-    return out
-
-
-# ---------------------------
-# Ping (API çalışıyor mu?)
-# ---------------------------
-@flashscore_router.get("/ping")
+@app.get("/flashscore/ping")
 def flashscore_ping():
-    # hafif bir endpoint: country list iyi bir "ping"
-    url = "https://flashscore4.p.rapidapi.com/api/flashscore/v1/country/list"
-    data, headers = _fs_get(url)
+    # Dokümanda ping path farklıysa burada sadece endpoint stringini değiştirirsin.
+    # Örn: "ping" yerine "health" vs.
+    return flashscore_call("ping")
 
-    now_tr = datetime.now(TR_TZ).isoformat(timespec="seconds") if ("TR_TZ" in globals() and TR_TZ) else datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    return {
-        "ok": True,
-        "now_tr": now_tr,
-        "countries_count": len(data) if isinstance(data, list) else None,
-        "ratelimit": _rl(headers),
-    }
-
-
-# ---------------------------
-# Matches list (DAY / DATE) - sade özet
-# ---------------------------
-def _flatten_matches(payload: list) -> list:
-    # payload: tournaments list -> each has matches
-    all_matches = []
-    if not isinstance(payload, list):
-        return all_matches
-    for t in payload:
-        for m in (t.get("matches") or []):
-            all_matches.append(m)
-    return all_matches
-
-
-@flashscore_router.get("/matches/day/{day_offset}")
-def flashscore_matches_day(day_offset: int):
-    url = f"https://flashscore4.p.rapidapi.com/api/flashscore/v1/match/list/1/{day_offset}"
-    payload, headers = _fs_get(url)
-    matches = _flatten_matches(payload)
-
-    with_odds = 0
-    finished = 0
-    for m in matches:
-        if m.get("odds") and m.get("odds") != []:
-            # bazı liglerde odds: {} bazı yerlerde []
-            if isinstance(m["odds"], dict) and len(m["odds"]) > 0:
-                with_odds += 1
-            elif isinstance(m["odds"], list) and len(m["odds"]) > 0:
-                with_odds += 1
-        if str(m.get("stage")).lower() == "finished":
-            finished += 1
-
-    return {
-        "day_offset": day_offset,
-        "matches_total": len(matches),
-        "matches_finished": finished,
-        "matches_with_1x2_odds": with_odds,
-        "ratelimit": _rl(headers),
-    }
-
-
-@flashscore_router.get("/matches/date/{date_yyyy_mm_dd}")
-def flashscore_matches_date(date_yyyy_mm_dd: str):
-    # format örn: 2025-12-22
-    url = f"https://flashscore4.p.rapidapi.com/api/flashscore/v1/match/list/1/{date_yyyy_mm_dd}"
-    payload, headers = _fs_get(url)
-    matches = _flatten_matches(payload)
-
-    with_odds = 0
-    finished = 0
-    for m in matches:
-        if m.get("odds") and m.get("odds") != []:
-            if isinstance(m["odds"], dict) and len(m["odds"]) > 0:
-                with_odds += 1
-            elif isinstance(m["odds"], list) and len(m["odds"]) > 0:
-                with_odds += 1
-        if str(m.get("stage")).lower() == "finished":
-            finished += 1
-
-    return {
-        "date": date_yyyy_mm_dd,
-        "matches_total": len(matches),
-        "matches_finished": finished,
-        "matches_with_1x2_odds": with_odds,
-        "ratelimit": _rl(headers),
-    }
-
-
-# ---------------------------
-# Odds (FULL markets) - okunur format
-# ---------------------------
-def _has_any_odds(bookmaker: dict) -> bool:
-    for grp in bookmaker.get("odds", []) or []:
-        if grp.get("odds"):
-            return True
-    return False
-
-
-def _label_from_odds_item(o: dict) -> str:
-    # olabildiğince okunur label
-    # 1X2'de eventParticipantId: None => DRAW
-    if o.get("winner") == "HOME":
-        return "HOME"
-    if o.get("winner") == "AWAY":
-        return "AWAY"
-    if o.get("eventParticipantId") is None and o.get("handicap") is None:
-        return "DRAW"
-
-    # OU / BTTS vs.
-    if o.get("selection"):
-        return str(o["selection"])
-    if o.get("bothTeamsToScore"):
-        return f"BTTS_{o['bothTeamsToScore']}"
-    if o.get("doubleChance"):
-        return f"DC_{o['doubleChance']}"
-    if o.get("handicap") and o["handicap"].get("selection"):
-        return str(o["handicap"]["selection"])
-    return "OPTION"
-
-
-def _normalize_bookmaker(bookmaker: dict) -> dict:
-    # bettingScope -> bettingType -> list
-    out = {}
-    for grp in bookmaker.get("odds", []) or []:
-        scope = grp.get("bettingScope") or "UNKNOWN_SCOPE"
-        btype = grp.get("bettingType") or "UNKNOWN_TYPE"
-
-        key = f"{scope}:{btype}"
-        items = []
-        for o in grp.get("odds", []) or []:
-            line = None
-            if o.get("handicap") and o["handicap"].get("value") is not None:
-                try:
-                    line = float(o["handicap"]["value"])
-                except Exception:
-                    line = o["handicap"]["value"]
-
-            items.append({
-                "label": _label_from_odds_item(o),
-                "line": line,
-                "value": o.get("value"),
-                "opening": o.get("openingValue"),
-                "active": o.get("active"),
-            })
-
-        # aynı market içinde okunurluk için: önce line, sonra label
-        items.sort(key=lambda x: (x["line"] is None, x["line"] if x["line"] is not None else 0, x["label"]))
-        out[key] = items
-
-    return out
-
-
-@flashscore_router.get("/match/odds/{match_id}")
-def flashscore_match_odds(match_id: str):
-    url = f"https://flashscore4.p.rapidapi.com/api/flashscore/v1/match/odds/{match_id}"
-    payload, headers = _fs_get(url)
-
-    # payload genelde bookmaker list
-    if not isinstance(payload, list):
-        return {"match_id": match_id, "bookmakers": [], "ratelimit": _rl(headers)}
-
-    available = [b for b in payload if _has_any_odds(b)]
-
-    # okunurluk: sadece odds olan bookmakerlar
-    bookmakers = []
-    for b in available:
-        markets = _normalize_bookmaker(b)
-        bookmakers.append({
-            "name": b.get("name"),
-            "image_path": b.get("image_path"),
-            "markets_count": len(markets),
-            "markets": markets,   # full market list (okunur sade format)
-        })
-
-    return {
-        "match_id": match_id,
-        "bookmakers_with_odds": len(bookmakers),
-        "bookmakers": bookmakers,
-        "ratelimit": _rl(headers),
-    }
-
-app.include_router(flashscore_router)
-
-
-# ---------------------------
-# Router hook (IMPORTANT)
-# ---------------------------
-# En sonda FastAPI app'ine ekle:
-# app.include_router(flashscore_router)
