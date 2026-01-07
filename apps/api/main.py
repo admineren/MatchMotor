@@ -130,6 +130,21 @@ def _debug_no_score(reason: str, mid: int, item: dict, keys_tried: dict):
         "matchResult_sample": sample,
     }
 
+def _gr_int(item: dict):
+        gr = item.get("GameResult")
+        try:
+            return int(str(gr).strip())
+        except Exception:
+            return None
+
+def _take_details_data(details_payload):
+        dd = (details_payload or {}).get("data")
+        if isinstance(dd, list) and dd:
+            return dd[0]
+        if isinstance(dd, dict):
+            return dd
+        return None
+
 def _require_api_key():
     if not NOSY_API_KEY:
         raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
@@ -584,16 +599,18 @@ def sync_finished_matches(
     """
     NosyAPI -> matches-result (bulk)
     + opsiyonel: matches-result/details (backfill)
-    - Bulk: API'nin döndürdüğü biten maçları finished_matches tablosuna upsert eder.
-    - Backfill: Sadece 'dün 22:00-23:59' arası başlayan ve finished'a geçmemiş maçlar için details dener.
-    """        
 
-    # debug: backfill no_score örnekleri
-    no_score_debug = []
+    KURAL:
+    - SADECE GameResult belirleyici.
+    - GameResult != 1 ise skor/kart/korner parse edilmez, DB'ye yazılmaz.
+    - GameResult == 1 ise skor + diğer metalar parse edilir ve upsert edilir.
+    - Result / LiveStatus güvenilmez; karar mekanizmasında kullanılmaz.
+    """
 
-    # INSERT/UPSERT SQL (bulk ve backfill ortak)
-    UPSERT_SQL = text(
-        """
+    # -------------------------
+    # SQL (tek yerde)
+    # -------------------------
+    UPSERT_SQL = text("""
         INSERT INTO finished_matches(
             nosy_match_id,
             match_datetime, date, time,
@@ -652,8 +669,7 @@ def sync_finished_matches(
             fetched_at_tr = EXCLUDED.fetched_at_tr,
             raw_json = EXCLUDED.raw_json,
             updated_at = NOW()
-        """
-    )
+    """)
 
     # -----------------------
     # 1) BULK: matches-result
@@ -664,41 +680,103 @@ def sync_finished_matches(
 
     fetched_at_tr = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
 
-    upserted = 0
-    skipped = 0
-    no_score = 0
+    bulk_report = {
+        "received": received,
+        "upserted": 0,
+        "skipped": 0,
+        "not_finished_gr0": 0,      # GameResult != 1 => işlem yapılmadı
+        "gr1_but_no_score": 0,      # GameResult==1 ama FT skor yok
+        "gr1_but_empty_matchResult": 0,
+        "fetched_at_tr": fetched_at_tr,
+        "rowCount": payload.get("rowCount"),
+        "creditUsed": payload.get("creditUsed"),
+    }
+    bulk_debug = []  # ilk 10 örnek
+    MAX_DEBUG = 10
+
+    # -----------------------
+    # 2) BACKFILL REPORT
+    # -----------------------
+    backfill_report = {
+        "enabled": bool(backfill),
+        "window": None,
+        "candidates": 0,
+        "requested": 0,
+        "upserted": 0,
+        "details_failed": 0,        # details data gelmedi
+        "not_finished_gr0": 0,      # GameResult != 1 => işlem yapılmadı
+        "gr1_but_no_score": 0,      # GameResult==1 ama FT skor yok
+        "gr1_but_empty_matchResult": 0,
+    }
+    backfill_debug = []  # ilk 10 örnek
 
     with engine.begin() as conn:
+        # -------- BULK LOOP --------
         for item in data:
             if not isinstance(item, dict):
-                skipped += 1
+                bulk_report["skipped"] += 1
                 continue
 
             mid = item.get("MatchID")
             try:
                 mid = int(mid)
             except Exception:
-                skipped += 1
+                bulk_report["skipped"] += 1
                 continue
 
-            mr = item.get("matchResult") or item.get("MatchResult") or []
-            
+            gr_i = _gr_int(item)
+
+            # >>>>> SADECE GameResult belirleyici <<<<<
+            if gr_i != 1:
+                bulk_report["not_finished_gr0"] += 1
+                if len(bulk_debug) < MAX_DEBUG:
+                    bulk_debug.append({
+                        "stage": "bulk",
+                        "mid": mid,
+                        "why": "GameResult!=1 => parse yok",
+                        "GameResult": item.get("GameResult"),
+                        "matchResult_len": len(item.get("matchResult") or []),
+                    })
+                continue
+
+            mr = item.get("matchResult") or []
+            if not mr:
+                bulk_report["gr1_but_empty_matchResult"] += 1
+                if len(bulk_debug) < MAX_DEBUG:
+                    bulk_debug.append({
+                        "stage": "bulk",
+                        "mid": mid,
+                        "why": "GameResult==1 ama matchResult boş",
+                        "GameResult": item.get("GameResult"),
+                    })
+                continue
+
             ft_home = _to_int_score(_meta_ci_get(mr, "msHomeScore"))
             ft_away = _to_int_score(_meta_ci_get(mr, "msAwayScore"))
+
+            # GameResult==1 ama skor yoksa yazma
+            if ft_home is None or ft_away is None:
+                bulk_report["gr1_but_no_score"] += 1
+                if len(bulk_debug) < MAX_DEBUG:
+                    bulk_debug.append({
+                        "stage": "bulk",
+                        "mid": mid,
+                        "why": "GameResult==1 ama FT skor yok",
+                        "GameResult": item.get("GameResult"),
+                        "sample_matchResult_first3": (mr[:3] if isinstance(mr, list) else []),
+                    })
+                continue
+
+            # diğer metalar (opsiyonel)
             ht_home = _to_int_score(_meta_ci_get(mr, "htHomeScore"))
             ht_away = _to_int_score(_meta_ci_get(mr, "htAwayScore"))
-            
+
             home_corner = _to_int_score(_meta_ci_get(mr, "homeCorner"))
             away_corner = _to_int_score(_meta_ci_get(mr, "awayCorner"))
             home_yellow = _to_int_score(_meta_ci_get(mr, "homeYellowCard"))
             away_yellow = _to_int_score(_meta_ci_get(mr, "awayYellowCard"))
-            home_red    = _to_int_score(_meta_ci_get(mr, "homeRedCard"))
-            away_red    = _to_int_score(_meta_ci_get(mr, "awayRedCard"))
-
-            # skor yoksa finished sayma
-            if ft_home is None or ft_away is None:
-                no_score += 1
-                continue
+            home_red = _to_int_score(_meta_ci_get(mr, "homeRedCard"))
+            away_red = _to_int_score(_meta_ci_get(mr, "awayRedCard"))
 
             conn.execute(
                 UPSERT_SQL,
@@ -729,40 +807,26 @@ def sync_finished_matches(
                     "home_red": home_red,
                     "away_red": away_red,
                     "mb": item.get("MB"),
-                    "result": item.get("Result"),
-                    "game_result": item.get("GameResult"),
-                    "live_status": item.get("LiveStatus"),
+                    "result": item.get("Result"),       # zorunlu değil
+                    "game_result": gr_i,               # zorunlu (1)
+                    "live_status": item.get("LiveStatus"),  # karar için kullanılmaz
                     "fetched_at_tr": fetched_at_tr,
                     "raw_json": _dump_json(item),
-                },
+                }
             )
-            upserted += 1
+            bulk_report["upserted"] += 1
 
-        # -----------------------
-        # 2) BACKFILL (optional)
-        # -----------------------
-        backfill_report = {
-            "enabled": bool(backfill),
-            "window": None,
-            "candidates": 0,
-            "requested": 0,
-            "upserted": 0,
-            "no_score": 0,
-            "skipped": 0,
-        }
-
+        # -------- BACKFILL (optional) --------
         if int(backfill) == 1 and int(max_details) > 0:
             now_tr = datetime.now(TR_TZ) if TR_TZ else datetime.utcnow()
             yesterday = (now_tr.date() - timedelta(days=1)).isoformat()
-
             t_from = "22:00:00"
             t_to = "23:59:59"
             backfill_report["window"] = {"day": yesterday, "time_from": t_from, "time_to": t_to}
 
             mids = (
                 conn.execute(
-                    text(
-                        """
+                    text("""
                         SELECT p.nosy_match_id
                         FROM pool_matches p
                         LEFT JOIN finished_matches f
@@ -778,8 +842,7 @@ def sync_finished_matches(
                           )
                         ORDER BY p.time ASC, p.nosy_match_id
                         LIMIT :lim
-                        """
-                    ),
+                    """),
                     {"day": yesterday, "t_from": t_from, "t_to": t_to, "lim": int(max_details)},
                 )
                 .scalars()
@@ -791,49 +854,70 @@ def sync_finished_matches(
             for mid in mids:
                 backfill_report["requested"] += 1
 
-                details = nosy_service_call(
+                details_payload = nosy_service_call(
                     "matches-result/details",
                     params={"matchID": int(mid), "match_id": int(mid)},
                 )
-                dd = (details or {}).get("data")
+                item = _take_details_data(details_payload)
 
-                item2 = None
-                if isinstance(dd, list) and dd:
-                    item2 = dd[0]
-                elif isinstance(dd, dict):
-                    item2 = dd
-
-                if not isinstance(item2, dict):
-                    backfill_report["skipped"] += 1
+                if not isinstance(item, dict):
+                    backfill_report["details_failed"] += 1
+                    if len(backfill_debug) < MAX_DEBUG:
+                        backfill_debug.append({"stage": "backfill", "mid": int(mid), "why": "details_failed"})
                     continue
 
-                mr2 = item2.get("matchResult")
+                gr_i = _gr_int(item)
 
-                ft_home2 = _to_int_score(_meta_ci_get(mr2, "msHomeScore"))
-                ft_away2 = _to_int_score(_meta_ci_get(mr2, "msAwayScore"))
-                ht_home2 = _to_int_score(_meta_ci_get(mr2, "htHomeScore"))
-                ht_away2 = _to_int_score(_meta_ci_get(mr2, "htAwayScore"))
-
-                home_corner2 = _to_int_score(_meta_ci_get(mr2, "homeCorner"))
-                away_corner2 = _to_int_score(_meta_ci_get(mr2, "awayCorner"))
-                home_yellow2 = _to_int_score(_meta_ci_get(mr2, "homeyellowCard"))
-                away_yellow2 = _to_int_score(_meta_ci_get(mr2, "awayyellowCard"))
-                home_red2 = _to_int_score(_meta_ci_get(mr2, "homeredCard"))
-                away_red2 = _to_int_score(_meta_ci_get(mr2, "awayredCard"))
-
-                if ft_home2 is None or ft_away2 is None:
-                    backfill_report["no_score"] += 1
-                    if len(no_score_debug) < 10:
-                        no_score_debug.append(
-                            {
-                                "mid": int(mid),
-                                "GameResult": item2.get("GameResult"),
-                                "LiveStatus": item2.get("LiveStatus"),
-                                "Result": item2.get("Result"),
-                                "sample_matchResult_first3": (item2.get("matchResult") or [])[:3],
-                            }
-                        )
+                # >>>>> SADECE GameResult belirleyici <<<<<
+                if gr_i != 1:
+                    backfill_report["not_finished_gr0"] += 1
+                    if len(backfill_debug) < MAX_DEBUG:
+                        backfill_debug.append({
+                            "stage": "backfill",
+                            "mid": int(mid),
+                            "why": "GameResult!=1 => parse yok",
+                            "GameResult": item.get("GameResult"),
+                            "matchResult_len": len(item.get("matchResult") or []),
+                        })
                     continue
+
+                mr = item.get("matchResult") or []
+                if not mr:
+                    backfill_report["gr1_but_empty_matchResult"] += 1
+                    if len(backfill_debug) < MAX_DEBUG:
+                        backfill_debug.append({
+                            "stage": "backfill",
+                            "mid": int(mid),
+                            "why": "GameResult==1 ama matchResult boş",
+                            "GameResult": item.get("GameResult"),
+                        })
+                    continue
+
+                ft_home = _to_int_score(_meta_ci_get(mr, "msHomeScore"))
+                ft_away = _to_int_score(_meta_ci_get(mr, "msAwayScore"))
+
+                if ft_home is None or ft_away is None:
+                    backfill_report["gr1_but_no_score"] += 1
+                    if len(backfill_debug) < MAX_DEBUG:
+                        backfill_debug.append({
+                            "stage": "backfill",
+                            "mid": int(mid),
+                            "why": "GameResult==1 ama FT skor yok",
+                            "GameResult": item.get("GameResult"),
+                            "sample_matchResult_first3": (mr[:3] if isinstance(mr, list) else []),
+                        })
+                    continue
+
+                # diğer metalar (opsiyonel)
+                ht_home = _to_int_score(_meta_ci_get(mr, "htHomeScore"))
+                ht_away = _to_int_score(_meta_ci_get(mr, "htAwayScore"))
+
+                home_corner = _to_int_score(_meta_ci_get(mr, "homeCorner"))
+                away_corner = _to_int_score(_meta_ci_get(mr, "awayCorner"))
+                home_yellow = _to_int_score(_meta_ci_get(mr, "homeYellowCard"))
+                away_yellow = _to_int_score(_meta_ci_get(mr, "awayYellowCard"))
+                home_red = _to_int_score(_meta_ci_get(mr, "homeRedCard"))
+                away_red = _to_int_score(_meta_ci_get(mr, "awayRedCard"))
 
                 fetched_at_tr_bf = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
 
@@ -841,56 +925,49 @@ def sync_finished_matches(
                     UPSERT_SQL,
                     {
                         "mid": int(mid),
-                        "dt": str(item2.get("DateTime") or ""),
-                        "date": str(item2.get("Date") or ""),
-                        "time": str(item2.get("Time") or ""),
-                        "league_code": str(item2.get("LeagueCode") or ""),
-                        "league": str(item2.get("League") or ""),
-                        "country": str(item2.get("Country") or ""),
-                        "team1": str(item2.get("Team1") or ""),
-                        "team2": str(item2.get("Team2") or ""),
-                        "betcount": item2.get("BetCount"),
-                        "ms1": item2.get("HomeWin"),
-                        "ms0": item2.get("Draw"),
-                        "ms2": item2.get("AwayWin"),
-                        "alt25": item2.get("Under25"),
-                        "ust25": item2.get("Over25"),
-                        "ft_home": ft_home2,
-                        "ft_away": ft_away2,
-                        "ht_home": ht_home2,
-                        "ht_away": ht_away2,
-                        "home_corner": home_corner2,
-                        "away_corner": away_corner2,
-                        "home_yellow": home_yellow2,
-                        "away_yellow": away_yellow2,
-                        "home_red": home_red2,
-                        "away_red": away_red2,
-                        "mb": item2.get("MB"),
-                        "result": item2.get("Result"),
-                        "game_result": item2.get("GameResult"),
-                        "live_status": item2.get("LiveStatus"),
+                        "dt": str(item.get("DateTime") or ""),
+                        "date": str(item.get("Date") or ""),
+                        "time": str(item.get("Time") or ""),
+                        "league_code": str(item.get("LeagueCode") or ""),
+                        "league": str(item.get("League") or ""),
+                        "country": str(item.get("Country") or ""),
+                        "team1": str(item.get("Team1") or ""),
+                        "team2": str(item.get("Team2") or ""),
+                        "betcount": item.get("BetCount"),
+                        "ms1": item.get("HomeWin"),
+                        "ms0": item.get("Draw"),
+                        "ms2": item.get("AwayWin"),
+                        "alt25": item.get("Under25"),
+                        "ust25": item.get("Over25"),
+                        "ft_home": ft_home,
+                        "ft_away": ft_away,
+                        "ht_home": ht_home,
+                        "ht_away": ht_away,
+                        "home_corner": home_corner,
+                        "away_corner": away_corner,
+                        "home_yellow": home_yellow,
+                        "away_yellow": away_yellow,
+                        "home_red": home_red,
+                        "away_red": away_red,
+                        "mb": item.get("MB"),
+                        "result": item.get("Result"),       # zorunlu değil
+                        "game_result": gr_i,               # zorunlu (1)
+                        "live_status": item.get("LiveStatus"),  # karar için kullanılmaz
                         "fetched_at_tr": fetched_at_tr_bf,
-                        "raw_json": _dump_json(item2),
-                    },
+                        "raw_json": _dump_json(item),
+                    }
                 )
                 backfill_report["upserted"] += 1
 
     return {
         "ok": True,
         "endpoint": "matches-result",
-        "bulk": {
-            "received": received,
-            "upserted": upserted,
-            "skipped": skipped,
-            "no_score": no_score,
-            "fetched_at_tr": fetched_at_tr,
-            "rowCount": payload.get("rowCount"),
-            "creditUsed": payload.get("creditUsed"),
-        },
+        "bulk": bulk_report,
+        "bulk_debug": bulk_debug,
         "backfill": backfill_report,
-        "no_score_debug": no_score_debug,
-                              }
-                                                  
+        "backfill_debug": backfill_debug,
+    }
+
 @app.get("/db/finished-matches")
 def list_finished_matches(
     day: Optional[str] = Query(default=None, description="YYYY-MM-DD. Boşsa en son snapshot."),
