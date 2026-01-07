@@ -1843,7 +1843,8 @@ def flashscore_db_finished_ms_sync_date(
                     ms2 = EXCLUDED.ms2,
                     raw_json = EXCLUDED.raw_json,
                     updated_at = NOW()
-            """, (
+                ;(
+            """)
                 match_id,
                 dt_tr.isoformat(),
                 dt_tr.date().isoformat(),
@@ -1854,7 +1855,7 @@ def flashscore_db_finished_ms_sync_date(
                 ft_home, ft_away,
                 ms1, ms0, ms2,
                 json.dumps(m, ensure_ascii=False),
-            ))
+            )
 
             written += 1
             upserted += 1
