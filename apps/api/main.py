@@ -1481,12 +1481,39 @@ def flashscore_base_check() -> dict:
         },
     }
 
-@app.get("/flashscore/ping")
-def flashscore_ping():
-    data = flashscore_base_check()
-    # data zaten sadece flashscore içeriyor (nosy alanı yok)
-    return {
-        "status": "success",
-        "service": "flashscore",
-        **data
+def flashscore_get(path: str):
+    """
+    Flashscore RapidAPI GET helper.
+    path örn: 'general/1/countries'
+    """
+    _require_rapidapi_key()
+
+    url = f"{FLASHSCORE_BASE_URL}/{path.lstrip('/')}"
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": FLASHSCORE_RAPIDAPI_HOST,
     }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Flashscore bağlantı hatası: {e}")
+
+    if r.status_code >= 400:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
+
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
+
+@app.get("/flashscore/country", tags=["Flashscore"])
+def flashscore_countries():
+    # Senin verdiğin gerçek endpoint:
+    # /general/1/countries
+    return flashscore_get("general/1/countries")
+
