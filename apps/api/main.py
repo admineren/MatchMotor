@@ -3,9 +3,9 @@ import requests
 import json
 import datetime as dt
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, APIRouter
 from fastapi.responses import JSONResponse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
 
@@ -1352,4 +1352,104 @@ def stats_organizations(
         "items": [dict(r) for r in rows],
     }
 
-        
+# ============================================================
+# Flashscore (RapidAPI) - Helpers + Ping Endpoint
+# ============================================================
+
+FLASHSCORE_RAPIDAPI_HOST = os.getenv("FLASHSCORE_RAPIDAPI_HOST", "").strip()
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
+
+FLASHSCORE_BASE_URL = "https://flashscore4.p.rapidapi.com/api/flashscore/v1"
+
+
+def _flashscore_headers() -> dict:
+    return {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": FLASHSCORE_RAPIDAPI_HOST,
+    }
+
+
+def _pick_rate_limit_headers(h: dict) -> dict:
+    """RapidAPI rate-limit header'larını mümkün olduğunca toparla."""
+    wanted = [
+        "x-ratelimit-requests-limit",
+        "x-ratelimit-requests-remaining",
+        "x-ratelimit-requests-reset",
+        "x-ratelimit-rapid-free-plans-hard-limit-limit",
+        "x-ratelimit-rapid-free-plans-hard-limit-remaining",
+        "x-ratelimit-rapid-free-plans-hard-limit-reset",
+        "x-rapidapi-region",
+        "x-rapidapi-version",
+        "x-rapidapi-request-id",
+    ]
+    out = {}
+    for k in wanted:
+        if k in h:
+            out[k] = h.get(k)
+    return out
+
+
+def _flashscore_get(path: str, timeout: int = 20):
+    """
+    Basit GET wrapper. Hem json'ı hem de response header'larını döndürür.
+    """
+    url = f"{FLASHSCORE_BASE_URL}{path}"
+    r = requests.get(url, headers=_flashscore_headers(), timeout=timeout)
+    # bazı cevaplar text olabilir; json parse hata verirse raw text dön
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    return r.status_code, data, dict(r.headers)
+
+
+@app.get("/flashscore/ping")
+def flashscore_ping():
+    """
+    Flashscore API erişimini test eder + rate-limit header'larını döndürür.
+    NOT: /health'e koyma; health genelde dış çağrı yapmamalı.
+    """
+    # env kontrolü
+    env_ok = bool(RAPIDAPI_KEY) and bool(FLASHSCORE_RAPIDAPI_HOST)
+
+    # çok hafif bir istek seçiyoruz: match/list/1/0 (bugün)
+    # istersen sonradan bunu daha "hafif" bir endpoint'e alırız.
+    if not env_ok:
+        return {
+            "ok": False,
+            "error": "Missing RAPIDAPI_KEY or FLASHSCORE_RAPIDAPI_HOST",
+            "flashscore": {
+                "env_ok": False,
+                "host": FLASHSCORE_RAPIDAPI_HOST,
+                "base_url": FLASHSCORE_BASE_URL,
+            },
+        }
+
+    try:
+        status_code, data, headers = _flashscore_get("/match/list/1/0")
+        rate = _pick_rate_limit_headers({k.lower(): v for k, v in headers.items()})
+
+        # ufak özet (devasa json basmayalım)
+        tournaments_count = len(data) if isinstance(data, list) else None
+
+        return {
+            "ok": status_code == 200,
+            "flashscore": {
+                "env_ok": True,
+                "status_code": status_code,
+                "host": FLASHSCORE_RAPIDAPI_HOST,
+                "base_url": FLASHSCORE_BASE_URL,
+                "rate_limits": rate,
+                "tournaments_count": tournaments_count,
+            },
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "flashscore": {
+                "env_ok": True,
+                "host": FLASHSCORE_RAPIDAPI_HOST,
+                "base_url": FLASHSCORE_BASE_URL,
+            },
+            "error": str(e),
+}
