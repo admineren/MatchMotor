@@ -1745,10 +1745,12 @@ def flashscore_db_finished_ms_sync_date(
     except Exception:
         raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
 
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
+
     fetched_at_tr = datetime.now(TR_TZ).isoformat()
 
     data = flashscore_get(f"match/list/1/{date}")
-
     blocks = data if isinstance(data, list) else (data.get("data") or data.get("items") or [])
     if not isinstance(blocks, list):
         blocks = []
@@ -1760,10 +1762,40 @@ def flashscore_db_finished_ms_sync_date(
     skipped = 0
     written = 0
 
-    conn = get_conn()
-    cur = conn.cursor()
+    sql = text("""
+        INSERT INTO flash_finished_ms (
+            flash_match_id, match_datetime_tr, date, time, fetched_at_tr,
+            country_name, tournament_name,
+            home, away, ft_home, ft_away,
+            ms1, ms0, ms2,
+            raw_json, updated_at
+        )
+        VALUES (
+            :flash_match_id, :match_datetime_tr, :date, :time, :fetched_at_tr,
+            :country_name, :tournament_name,
+            :home, :away, :ft_home, :ft_away,
+            :ms1, :ms0, :ms2,
+            :raw_json, NOW()
+        )
+        ON CONFLICT (flash_match_id) DO UPDATE SET
+            match_datetime_tr = EXCLUDED.match_datetime_tr,
+            date = EXCLUDED.date,
+            time = EXCLUDED.time,
+            fetched_at_tr = EXCLUDED.fetched_at_tr,
+            country_name = EXCLUDED.country_name,
+            tournament_name = EXCLUDED.tournament_name,
+            home = EXCLUDED.home,
+            away = EXCLUDED.away,
+            ft_home = EXCLUDED.ft_home,
+            ft_away = EXCLUDED.ft_away,
+            ms1 = EXCLUDED.ms1,
+            ms0 = EXCLUDED.ms0,
+            ms2 = EXCLUDED.ms2,
+            raw_json = EXCLUDED.raw_json,
+            updated_at = NOW()
+    """)
 
-    try:
+    with engine.begin() as conn:
         for blk in blocks:
             matches = blk.get("matches") or []
             if not isinstance(matches, list):
@@ -1795,20 +1827,15 @@ def flashscore_db_finished_ms_sync_date(
                 if not match_id or ts is None:
                     continue
 
-                # timestamp -> TR datetime (ve TR tarih kontrolü)
-                try:
-                    dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
-                except Exception:
-                    skipped += 1
-                    continue
+                dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
 
+                # gerçekten bu gün mü?
                 if dt_tr.date() != target_date:
                     skipped += 1
                     continue
 
                 finished_with_ms += 1
 
-                # DB şişmesin diye opsiyonel limit
                 if limit_write and written >= limit_write:
                     skipped += 1
                     continue
@@ -1816,72 +1843,26 @@ def flashscore_db_finished_ms_sync_date(
                 country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
                 tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name")
 
-                cur.execute(
-                    """
-                    INSERT INTO flash_finished_ms (
-                        flash_match_id, match_datetime_tr, date, time, fetched_at_tr,
-                        country_name, tournament_name,
-                        home, away, ft_home, ft_away,
-                        ms1, ms0, ms2,
-                        raw_json, updated_at
-                    )
-                    VALUES (
-                        %s, %s, %s, %s, %s,
-                        %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s, %s,
-                        %s, NOW()
-                    )
-                    ON CONFLICT (flash_match_id) DO UPDATE SET
-                        match_datetime_tr = EXCLUDED.match_datetime_tr,
-                        date = EXCLUDED.date,
-                        time = EXCLUDED.time,
-                        fetched_at_tr = EXCLUDED.fetched_at_tr,
-                        country_name = EXCLUDED.country_name,
-                        tournament_name = EXCLUDED.tournament_name,
-                        home = EXCLUDED.home,
-                        away = EXCLUDED.away,
-                        ft_home = EXCLUDED.ft_home,
-                        ft_away = EXCLUDED.ft_away,
-                        ms1 = EXCLUDED.ms1,
-                        ms0 = EXCLUDED.ms0,
-                        ms2 = EXCLUDED.ms2,
-                        raw_json = EXCLUDED.raw_json,
-                        updated_at = NOW()
-                    """,
-                    (
-                        match_id,
-                        dt_tr.isoformat(),
-                        dt_tr.date().isoformat(),
-                        dt_tr.time().strftime("%H:%M:%S"),
-                        fetched_at_tr,
-                        country_name,
-                        tournament_name,
-                        ht.get("name"),
-                        at.get("name"),
-                        ft_home,
-                        ft_away,
-                        ms1,
-                        ms0,
-                        ms2,
-                        json.dumps(m, ensure_ascii=False),
-                    ),
-                )
+                conn.execute(sql, {
+                    "flash_match_id": match_id,
+                    "match_datetime_tr": dt_tr.isoformat(),
+                    "date": dt_tr.date().isoformat(),
+                    "time": dt_tr.time().strftime("%H:%M:%S"),
+                    "fetched_at_tr": fetched_at_tr,
+                    "country_name": country_name,
+                    "tournament_name": tournament_name,
+                    "home": ht.get("name"),
+                    "away": at.get("name"),
+                    "ft_home": ft_home,
+                    "ft_away": ft_away,
+                    "ms1": ms1,
+                    "ms0": ms0,
+                    "ms2": ms2,
+                    "raw_json": json.dumps(m, ensure_ascii=False),
+                })
 
                 written += 1
                 upserted += 1
-
-        conn.commit()
-
-    finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
 
     return {
         "ok": True,
@@ -1892,8 +1873,8 @@ def flashscore_db_finished_ms_sync_date(
         "upserted": upserted,
         "skipped": skipped,
         "limit_write": limit_write,
-        "fetched_at_tr": fetched_at_tr,
-    }
+        "fetched_at_tr": fetched_at_tr
+                }
 
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
 def flashscore_finished_ms_list(
