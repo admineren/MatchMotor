@@ -2,11 +2,10 @@ import os
 import requests
 import json
 import datetime as dt
-import time
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta,
 from zoneinfo import ZoneInfo
 from typing import Optional
 
