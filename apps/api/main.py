@@ -1736,12 +1736,14 @@ def flashscore_db_finished_ms_sync_date(
     """
     Tarih bazlı: /match/list/1/{date}
     Sadece Finished + MS odds + FT skor => DB'ye upsert.
+    Not: DB'deki `date` alanı Flashscore günüdür (parametre olan `date`).
+    TR saati `match_datetime_tr` ve `time` ile tutulur.
     """
     ensure_schema()
 
-    # tarih doğrulama
+    # tarih doğrulama (format kontrolü için yeterli)
     try:
-        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        datetime.strptime(date, "%Y-%m-%d")
     except Exception:
         raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
 
@@ -1829,13 +1831,7 @@ def flashscore_db_finished_ms_sync_date(
 
                 dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
 
-                # gerçekten bu gün mü?
-                if dt_tr.date() != target_date:
-                    skipped += 1
-                    continue
-
-                finished_with_ms += 1
-
+                # limit
                 if limit_write and written >= limit_write:
                     skipped += 1
                     continue
@@ -1846,7 +1842,7 @@ def flashscore_db_finished_ms_sync_date(
                 conn.execute(sql, {
                     "flash_match_id": match_id,
                     "match_datetime_tr": dt_tr.isoformat(),
-                    "date": dt_tr.date().isoformat(),
+                    "date": date,  # ✅ Flashscore gününü baz al
                     "time": dt_tr.time().strftime("%H:%M:%S"),
                     "fetched_at_tr": fetched_at_tr,
                     "country_name": country_name,
@@ -1861,6 +1857,7 @@ def flashscore_db_finished_ms_sync_date(
                     "raw_json": json.dumps(m, ensure_ascii=False),
                 })
 
+                finished_with_ms += 1
                 written += 1
                 upserted += 1
 
@@ -1874,8 +1871,8 @@ def flashscore_db_finished_ms_sync_date(
         "skipped": skipped,
         "limit_write": limit_write,
         "fetched_at_tr": fetched_at_tr
-                }
-
+    }
+            
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
 def flashscore_finished_ms_list(
     day: Optional[str] = Query(default=None, description="YYYY-MM-DD (opsiyonel)"),
