@@ -1352,26 +1352,41 @@ def stats_organizations(
         "items": [dict(r) for r in rows],
     }
 
-# ============================================================
-# Flashscore (RapidAPI) - Helpers + Ping Endpoint
-# ============================================================
+# =====================================================================
+# Flashscore (RapidAPI) - Helpers + Endpoints  (NOSY'den ayrı katman)
+# =====================================================================
 
-FLASHSCORE_RAPIDAPI_HOST = os.getenv("FLASHSCORE_RAPIDAPI_HOST", "").strip()
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
+from fastapi import APIRouter, HTTPException
 
-FLASHSCORE_BASE_URL = "https://flashscore4.p.rapidapi.com/api/flashscore/v1"
+flashscore_router = APIRouter(prefix="/flashscore", tags=["Flashscore"])
 
 
-def _flashscore_headers() -> dict:
+def _fs_base_url() -> str:
+    host = (os.getenv("FLASHSCORE_RAPIDAPI_HOST") or "").strip()
+    if not host:
+        raise HTTPException(status_code=500, detail="FLASHSCORE_RAPIDAPI_HOST env set değil")
+    return f"https://{host}/api/flashscore/v1"
+
+
+def _fs_headers() -> dict:
+    key = (os.getenv("RAPIDAPI_KEY") or "").strip()
+    host = (os.getenv("FLASHSCORE_RAPIDAPI_HOST") or "").strip()
+    if not key:
+        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY env set değil")
+    if not host:
+        raise HTTPException(status_code=500, detail="FLASHSCORE_RAPIDAPI_HOST env set değil")
     return {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": FLASHSCORE_RAPIDAPI_HOST,
+        "x-rapidapi-key": key,
+        "x-rapidapi-host": host,
     }
 
 
 def _pick_rate_limit_headers(h: dict) -> dict:
-    """RapidAPI rate-limit header'larını mümkün olduğunca toparla."""
-    wanted = [
+    """
+    RapidAPI / Cloudflare header'larını mümkün olduğunca aynen döndürür.
+    Not: requests header'ları case-insensitive ama burada string key kullanıyoruz.
+    """
+    keys = [
         "x-ratelimit-requests-limit",
         "x-ratelimit-requests-remaining",
         "x-ratelimit-requests-reset",
@@ -1383,73 +1398,193 @@ def _pick_rate_limit_headers(h: dict) -> dict:
         "x-rapidapi-request-id",
     ]
     out = {}
-    for k in wanted:
-        if k in h:
-            out[k] = h.get(k)
+    for k in keys:
+        v = h.get(k) or h.get(k.lower()) or h.get(k.upper())
+        if v is not None:
+            out[k] = str(v)
     return out
 
 
-def _flashscore_get(path: str, timeout: int = 20):
+def _fs_get(path: str, timeout: int = 25):
     """
-    Basit GET wrapper. Hem json'ı hem de response header'larını döndürür.
+    path ör: '/match/list/1/0'
     """
-    url = f"{FLASHSCORE_BASE_URL}{path}"
-    r = requests.get(url, headers=_flashscore_headers(), timeout=timeout)
-    # bazı cevaplar text olabilir; json parse hata verirse raw text dön
+    base = _fs_base_url()
+    url = f"{base}{path}"
+    try:
+        r = requests.get(url, headers=_fs_headers(), timeout=timeout)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Flashscore request error: {e}")
+
+    rate = _pick_rate_limit_headers({k.lower(): v for k, v in r.headers.items()})
+
+    # JSON parse
     try:
         data = r.json()
     except Exception:
         data = {"raw": r.text}
-    return r.status_code, data, dict(r.headers)
+
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Flashscore upstream error",
+                "status_code": r.status_code,
+                "rate_limit": rate,
+                "body": data,
+            },
+        )
+
+    return data, rate, r.status_code, url
 
 
-@app.get("/flashscore/ping")
+def _dt_now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _dt_now_tr_iso() -> str | None:
+    if not TR_TZ:
+        return None
+    return datetime.now(timezone.utc).astimezone(TR_TZ).isoformat()
+
+
+def _ts_to_tr_iso(ts: int | None) -> str | None:
+    if ts is None:
+        return None
+    try:
+        ts_i = int(ts)
+    except Exception:
+        return None
+    dt_utc = datetime.fromtimestamp(ts_i, tz=timezone.utc)
+    if not TR_TZ:
+        return dt_utc.isoformat()
+    return dt_utc.astimezone(TR_TZ).isoformat()
+
+
+@flashscore_router.get("/ping")
 def flashscore_ping():
     """
     Flashscore API erişimini test eder + rate-limit header'larını döndürür.
-    NOT: /health'e koyma; health genelde dış çağrı yapmamalı.
+    Not: /health'e koyma; bu endpoint upstream çağrı yapar.
     """
-    # env kontrolü
-    env_ok = bool(RAPIDAPI_KEY) and bool(FLASHSCORE_RAPIDAPI_HOST)
+    data, rate, status_code, url = _fs_get("/match/list/1/0")  # bugün (day=0)
 
-    # çok hafif bir istek seçiyoruz: match/list/1/0 (bugün)
-    # istersen sonradan bunu daha "hafif" bir endpoint'e alırız.
-    if not env_ok:
-        return {
-            "ok": False,
-            "error": "Missing RAPIDAPI_KEY or FLASHSCORE_RAPIDAPI_HOST",
-            "flashscore": {
-                "env_ok": False,
-                "host": FLASHSCORE_RAPIDAPI_HOST,
-                "base_url": FLASHSCORE_BASE_URL,
-            },
-        }
-
+    tournaments_count = None
     try:
-        status_code, data, headers = _flashscore_get("/match/list/1/0")
-        rate = _pick_rate_limit_headers({k.lower(): v for k, v in headers.items()})
+        if isinstance(data, list):
+            tournaments_count = len(data)
+    except Exception:
+        tournaments_count = None
 
-        # ufak özet (devasa json basmayalım)
-        tournaments_count = len(data) if isinstance(data, list) else None
+    return {
+        "ok": True,
+        "time_utc": _dt_now_utc_iso(),
+        "time_tr": _dt_now_tr_iso(),
+        "flashscore": {
+            "env_ok": True,
+            "status_code": status_code,
+            "host": os.getenv("FLASHSCORE_RAPIDAPI_HOST"),
+            "base_url": _fs_base_url(),
+            "probe_url": url,
+            "rate_limit": rate,
+            "tournaments_count": tournaments_count,
+        },
+    }
 
-        return {
-            "ok": status_code == 200,
-            "flashscore": {
-                "env_ok": True,
-                "status_code": status_code,
-                "host": FLASHSCORE_RAPIDAPI_HOST,
-                "base_url": FLASHSCORE_BASE_URL,
-                "rate_limits": rate,
-                "tournaments_count": tournaments_count,
-            },
-        }
-    except Exception as e:
-        return {
-            "ok": False,
-            "flashscore": {
-                "env_ok": True,
-                "host": FLASHSCORE_RAPIDAPI_HOST,
-                "base_url": FLASHSCORE_BASE_URL,
-            },
-            "error": str(e),
-}
+
+@flashscore_router.get("/matches/day/{day}")
+def flashscore_matches_for_day(day: int = 0):
+    """
+    day=0 bugün, day=1 yarın, day=-1 dün gibi.
+    """
+    data, rate, status_code, url = _fs_get(f"/match/list/1/{day}")
+
+    # timestamp varsa TR ISO ekleyelim
+    try:
+        if isinstance(data, list):
+            for t in data:
+                matches = t.get("matches") if isinstance(t, dict) else None
+                if isinstance(matches, list):
+                    for m in matches:
+                        if isinstance(m, dict) and "timestamp" in m:
+                            m["time_tr"] = _ts_to_tr_iso(m.get("timestamp"))
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "status_code": status_code,
+        "rate_limit": rate,
+        "source_url": url,
+        "data": data,
+    }
+
+
+@flashscore_router.get("/matches/date/{date_str}")
+def flashscore_matches_for_date(date_str: str):
+    """
+    date_str format: YYYY-MM-DD  (ör: 2025-12-22)
+    """
+    # Basit format kontrolü
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="date_str format yanlış. Beklenen: YYYY-MM-DD")
+
+    data, rate, status_code, url = _fs_get(f"/match/list/1/{date_str}")
+
+    # timestamp varsa TR ISO ekleyelim
+    try:
+        if isinstance(data, list):
+            for t in data:
+                matches = t.get("matches") if isinstance(t, dict) else None
+                if isinstance(matches, list):
+                    for m in matches:
+                        if isinstance(m, dict) and "timestamp" in m:
+                            m["time_tr"] = _ts_to_tr_iso(m.get("timestamp"))
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "status_code": status_code,
+        "rate_limit": rate,
+        "source_url": url,
+        "data": data,
+    }
+
+
+@flashscore_router.get("/match/odds/{match_id}")
+def flashscore_match_odds(match_id: str):
+    """
+    Ör match_id: GCxZ2uHc
+    """
+    data, rate, status_code, url = _fs_get(f"/match/odds/{match_id}")
+    return {
+        "ok": True,
+        "status_code": status_code,
+        "rate_limit": rate,
+        "source_url": url,
+        "match_id": match_id,
+        "data": data,
+    }
+
+
+@flashscore_router.get("/match/stats/{match_id}")
+def flashscore_match_stats(match_id: str):
+    """
+    Maç istatistikleri (match / 1st-half / 2nd-half).
+    """
+    data, rate, status_code, url = _fs_get(f"/match/stats/{match_id}")
+    return {
+        "ok": True,
+        "status_code": status_code,
+        "rate_limit": rate,
+        "source_url": url,
+        "match_id": match_id,
+        "data": data,
+    }
+
+
+# Router'ı uygulamaya bağla (dosyanın en sonunda tek satır yeter)
+app.include_router(flashscore_router)
