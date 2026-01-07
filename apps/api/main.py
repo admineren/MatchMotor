@@ -1517,3 +1517,97 @@ def flashscore_countries():
     # /general/1/countries
     return flashscore_get("general/1/countries")
 
+@app.get("/flashscore/tournaments/{country_id}", tags=["Flashscore"])
+def flashscore_country_tournaments(
+    country_id: int,
+    sport_id: int = Query(1, description="Sport ID (football=1)")
+):
+    # Upstream path: /general/{sport_id}/{country_id}/tournaments
+    path = f"general/{sport_id}/{country_id}/tournaments"
+    return flashscore_get(path)
+
+@app.get("/flashscore/matches/{date}", tags=["Flashscore"])
+def flashscore_matches_by_date(date: str):
+    """
+    Tarihe göre maç listesi çeker.
+    Upstream: /match/list/1/{date}
+    """
+    sport_id = 1  # futbol
+
+    # API URL’de futbol için ilk 1 sabit:
+    path = f"match/list/{sport_id}/{date}"
+
+    return flashscore_get(path)
+
+@app.get("/flashscore/matches/day/{offset}", tags=["Flashscore"])
+def flashscore_matches_for_offset(offset: int):
+    """
+    -7 to 7 arası gün offsetine göre maç listesi.
+    Upstream: /match/list/1/{offset}
+    """
+    if offset < -7 or offset > 7:
+        raise HTTPException(status_code=400, detail="Offset -7 ile 7 arasında olmalı.")
+
+    sport_id = 1
+
+    return flashscore_get(f"match/list/{sport_id}/{offset}")
+
+@app.get("/flashscore/match/{match_id}", tags=["Flashscore"])
+def flashscore_match(match_id: str):
+    return flashscore_get(f"match/details/{match_id}")
+
+@app.get("/flashscore/match-odds/{match_id}", tags=["Flashscore"])
+def flashscore_match_odds(match_id: str):
+    """
+    Tek maça ait oranları çeker.
+    Upstream: /match/odds/{match_id}
+    Örn match_id: GCxZ2uHc
+    """
+    return flashscore_get(f"match/odds/{match_id}")
+
+@app.get("/flashscore/match-stats/{match_id}", tags=["Flashscore"])
+def flashscore_match_stats(match_id: str):
+    """
+    Tek maça ait istatistikleri çeker.
+    Upstream: /match/stats/{match_id}
+    Örn match_id: GCxZ2uHc
+    """
+    return flashscore_get(f"match/stats/{match_id}")
+
+@app.get("/flashscore/match-commentary/{match_id}", tags=["Flashscore"])
+def flashscore_match_commentary(match_id: str):
+    """
+    Tek maça ait anlatım verilerini çeker.
+    Upstream: /match/comumentary/{match_id}
+    Örn match_id: GCxZ2uHc
+    """
+    return flashscore_get(f"match/comumentary/{match_id}")
+
+@app.get("/flashscore/match-standings/{match_id}/{type}", tags=["Flashscore"])
+def flashscore_match_standings(match_id: str, type: str):
+    """
+    Maça göre puan durumu tablosunu çeker.
+    type enum: overall, home, away
+    """
+    type = type.lower()
+
+    if type not in ["overall", "home", "away"]:
+        raise HTTPException(status_code=400, detail="Type overall, home veya away olmalı.")
+
+    # Upstream path:
+    # match/standings-table/{match_id}/{type}
+    return flashscore_get(f"match/standings-table/{match_id}/{type}")
+
+@app.get("/flashscore/match-standings-form/{match_id}/{type}", tags=["Flashscore"])
+def flashscore_standings_form(match_id: str, type: str):
+    """
+    Maçın form (son maçlar performansı) istatistiklerini çeker.
+    type enum: overall, home, away
+    """
+    type = type.lower()
+
+    if type not in ["overall", "home", "away"]:
+        raise HTTPException(status_code=400, detail="Type overall, home veya away olmalı.")
+
+    return flashscore_get(f"match/standings-form/{match_id}/{type}")
+
