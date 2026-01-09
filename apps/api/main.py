@@ -1558,7 +1558,7 @@ def flashscore_country_tournaments(
     path = f"general/{sport_id}/{country_id}/tournaments"
     return flashscore_get(path)
 
-@app.get("/flashscore/matches/{date}", tags=["Flashscore"])
+@app.get("/flashscore/matches-details/{date}", tags=["Flashscore"])
 def flashscore_matches_by_date(date: str):
     """
     Tarihe göre maç listesi çeker.
@@ -1733,17 +1733,10 @@ def flashscore_db_finished_ms_sync_date(
     date: str = Query(..., description="YYYY-MM-DD"),
     limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz, >0 ise en fazla bu kadar maç DB'ye yaz")
 ):
-    """
-    Tarih bazlı: /match/list/1/{date}
-    Sadece Finished + MS odds + FT skor => DB'ye upsert.
-    Not: DB'deki `date` alanı Flashscore günüdür (parametre olan `date`).
-    TR saati `match_datetime_tr` ve `time` ile tutulur.
-    """
     ensure_schema()
 
-    # tarih doğrulama (format kontrolü için yeterli)
     try:
-        datetime.strptime(date, "%Y-%m-%d")
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
     except Exception:
         raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
 
@@ -1757,10 +1750,7 @@ def flashscore_db_finished_ms_sync_date(
     if not isinstance(blocks, list):
         blocks = []
 
-    received = 0
-    finished = 0
-    finished_with_ms = 0
-    upserted = 0
+    received = finished = finished_with_ms = 0
     skipped = 0
     written = 0
 
@@ -1797,6 +1787,8 @@ def flashscore_db_finished_ms_sync_date(
             updated_at = NOW()
     """)
 
+    upserted_this_run = 0  # <-- önemli
+
     with engine.begin() as conn:
         for blk in blocks:
             matches = blk.get("matches") or []
@@ -1831,7 +1823,13 @@ def flashscore_db_finished_ms_sync_date(
 
                 dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
 
-                # limit
+                # İstersen TR tarih filtresi açık kalsın:
+                # if dt_tr.date() != target_date:
+                #     skipped += 1
+                #     continue
+
+                finished_with_ms += 1
+
                 if limit_write and written >= limit_write:
                     skipped += 1
                     continue
@@ -1842,7 +1840,7 @@ def flashscore_db_finished_ms_sync_date(
                 conn.execute(sql, {
                     "flash_match_id": match_id,
                     "match_datetime_tr": dt_tr.isoformat(),
-                    "date": date,  # ✅ Flashscore gününü baz al
+                    "date": dt_tr.date().isoformat(),
                     "time": dt_tr.time().strftime("%H:%M:%S"),
                     "fetched_at_tr": fetched_at_tr,
                     "country_name": country_name,
@@ -1857,9 +1855,14 @@ def flashscore_db_finished_ms_sync_date(
                     "raw_json": json.dumps(m, ensure_ascii=False),
                 })
 
-                finished_with_ms += 1
                 written += 1
-                upserted += 1
+                upserted_this_run += 1  # <-- sadece bu run
+
+        # bu tarih için DB toplamı (stabil sayı)
+        total_in_db_for_date = conn.execute(
+            text("SELECT COUNT(*) FROM flash_finished_ms WHERE date = :d"),
+            {"d": date}
+        ).scalar() or 0
 
     return {
         "ok": True,
@@ -1867,10 +1870,11 @@ def flashscore_db_finished_ms_sync_date(
         "received": received,
         "finished": finished,
         "finished_with_ms": finished_with_ms,
-        "upserted": upserted,
+        "upserted_this_run": upserted_this_run,
         "skipped": skipped,
         "limit_write": limit_write,
-        "fetched_at_tr": fetched_at_tr
+        "total_in_db_for_date": int(total_in_db_for_date),
+        "fetched_at_tr": fetched_at_tr,
     }
             
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
