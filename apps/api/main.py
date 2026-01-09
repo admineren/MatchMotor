@@ -1876,80 +1876,106 @@ def flashscore_db_finished_ms_sync_date(
         "total_in_db_for_date": int(total_in_db_for_date),
         "fetched_at_tr": fetched_at_tr,
     }
-            
+
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
-def flashscore_finished_ms_list(
-    day: Optional[str] = Query(default=None, description="YYYY-MM-DD (opsiyonel)"),
-    which: str = Query(default="latest", description="latest | oldest"),
-    limit: int = Query(default=50, ge=1, le=500),
+def flashscore_db_finished_ms(
+    # Kullanıcı filtreleri
+    date: Optional[str] = Query(None, description="YYYY-MM-DD (opsiyonel)"),
+    country: Optional[str] = Query(None, description="Örn: Brazil"),
+    tournament: Optional[str] = Query(None, description="Örn: BRAZIL: Copinha"),
+
+    # Panel arka plan modu
+    mode: str = Query(
+        "matches",
+        pattern="^(matches|countries|tournaments)$",
+        description="countries=ülke listesi, tournaments=ülkeye göre lig listesi, matches=maç listesi"
+    ),
+
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0, le=200000),
 ):
-    """
-    flash_finished_ms listesini DB'den döner.
-    - day verilirse: o günün kayıtları
-    - day yoksa: snapshot (fetched_at_tr) bazlı latest/oldest
-    """
     ensure_schema()
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
 
-    which = (which or "latest").lower().strip()
-    if which not in ("latest", "oldest"):
-        which = "latest"
-
-    snap_sql = "MAX" if which == "latest" else "MIN"
+    # date format kontrolü (opsiyonel)
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except Exception:
+            raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
 
     with engine.begin() as conn:
-        if day:
-            rows = conn.execute(
-                text("""
-                    SELECT
-                        flash_match_id,
-                        match_datetime_tr, date, time,
-                        country_name, tournament_name,
-                        home, away,
-                        ft_home, ft_away,
-                        ms1, ms0, ms2,
-                        fetched_at_tr,
-                        updated_at
-                    FROM flash_finished_ms
-                    WHERE date = :day
-                    ORDER BY match_datetime_tr NULLS LAST, flash_match_id
-                    LIMIT :limit
-                """),
-                {"day": day, "limit": limit},
-            ).mappings().all()
 
-            return {"ok": True, "day": day, "which": None, "count": len(rows), "items": [dict(r) for r in rows]}
-
-        snapshot = conn.execute(text(f"SELECT {snap_sql}(fetched_at_tr) AS snap FROM flash_finished_ms")).scalar()
-
-        if not snapshot:
-            return {"ok": True, "day": None, "which": which, "snapshot": None, "count": 0, "items": []}
-
-        rows = conn.execute(
-            text("""
-                SELECT
-                    flash_match_id,
-                    match_datetime_tr, date, time,
-                    country_name, tournament_name,
-                    home, away,
-                    ft_home, ft_away,
-                    ms1, ms0, ms2,
-                    fetched_at_tr,
-                    updated_at
+        # 1) Ülke dropdown: DB’de hangi ülkeler var?
+        if mode == "countries":
+            rows = conn.execute(text("""
+                SELECT country_name, COUNT(*)::int AS match_count
                 FROM flash_finished_ms
-                WHERE fetched_at_tr = :snapshot
-                ORDER BY match_datetime_tr NULLS LAST, flash_match_id
-                LIMIT :limit
-            """),
-            {"snapshot": snapshot, "limit": limit},
-        ).mappings().all()
+                WHERE country_name IS NOT NULL AND country_name <> ''
+                GROUP BY country_name
+                ORDER BY match_count DESC, country_name ASC
+            """)).mappings().all()
+            return {"ok": True, "mode": "countries", "items": rows}
 
-    return {
-        "ok": True,
-        "day": None,
-        "which": which,
-        "snapshot": snapshot,
-        "count": len(rows),
-        "items": [dict(r) for r in rows],
+        # 2) Lig dropdown: seçilen ülkeye göre hangi ligler var?
+        if mode == "tournaments":
+            if not country:
+                raise HTTPException(status_code=400, detail="mode=tournaments için country zorunlu")
+            rows = conn.execute(text("""
+                SELECT tournament_name, COUNT(*)::int AS match_count
+                FROM flash_finished_ms
+                WHERE country_name = :country
+                  AND tournament_name IS NOT NULL AND tournament_name <> ''
+                GROUP BY tournament_name
+                ORDER BY match_count DESC, tournament_name ASC
+            """), {"country": country}).mappings().all()
+            return {"ok": True, "mode": "tournaments", "country": country, "items": rows}
+
+        # 3) Maç listesi: (date/country/tournament filtreleriyle)
+        where = ["1=1"]
+        params = {"limit": limit, "offset": offset}
+
+        if date:
+            where.append("date = :date")
+            params["date"] = date
+
+        if country:
+            where.append("country_name = :country")
+            params["country"] = country
+
+        if tournament:
+            where.append("tournament_name = :tournament")
+            params["tournament"] = tournament
+
+        total = conn.execute(text(f"""
+            SELECT COUNT(*)::int
+            FROM flash_finished_ms
+            WHERE {" AND ".join(where)}
+        """), params).scalar() or 0
+
+        rows = conn.execute(text(f"""
+            SELECT
+                flash_match_id,
+                match_datetime_tr,
+                date, time,
+                country_name, tournament_name,
+                home, away, ft_home, ft_away,
+                ms1, ms0, ms2
+            FROM flash_finished_ms
+            WHERE {" AND ".join(where)}
+            ORDER BY match_datetime_tr DESC
+            LIMIT :limit OFFSET :offset
+        """), params).mappings().all()
+
+        return {
+            "ok": True,
+            "mode": "matches",
+            "filters": {"date": date, "country": country, "tournament": tournament},
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+            "items": rows
         }
 
 @app.get("/flashscore/db/finished-ms/summary", tags=["Flashscore DB"])
