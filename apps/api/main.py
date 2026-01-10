@@ -1731,12 +1731,18 @@ def _fs_pick_ms_odds(m: Dict[str, Any]) -> Tuple[Optional[float], Optional[float
 @app.post("/flashscore/db/finished-ms/sync-date", tags=["Flashscore DB"])
 def flashscore_db_finished_ms_sync_date(
     date: str = Query(..., description="YYYY-MM-DD"),
-    limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz, >0 ise en fazla bu kadar maç DB'ye yaz")
+    limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz, >0 ise en fazla bu kadar insert dene")
 ):
+    """
+    /match/list/1/{date}
+    Sadece Finished + MS odds + FT skor => DB'ye INSERT.
+    Aynı flash_match_id zaten varsa: DOKUNMA (final kayıt).
+    """
     ensure_schema()
 
+    # tarih format kontrolü
     try:
-        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        datetime.strptime(date, "%Y-%m-%d")
     except Exception:
         raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
 
@@ -1750,44 +1756,36 @@ def flashscore_db_finished_ms_sync_date(
     if not isinstance(blocks, list):
         blocks = []
 
-    received = finished = finished_with_ms = 0
-    skipped = 0
-    written = 0
+    # sayaçlar (sade)
+    received = 0
+    not_finished = 0
+    skipped_no_ms = 0
+    skipped_no_score = 0
+    inserted_new = 0
+    already_in_db = 0
+    limited = 0
 
     sql = text("""
         INSERT INTO flash_finished_ms (
-            flash_match_id, match_datetime_tr, date, time, fetched_at_tr,
+            flash_match_id,
+            match_datetime_tr, date, time,
+            fetched_at_tr,
             country_name, tournament_name,
             home, away, ft_home, ft_away,
             ms1, ms0, ms2,
             raw_json, updated_at
         )
         VALUES (
-            :flash_match_id, :match_datetime_tr, :date, :time, :fetched_at_tr,
+            :flash_match_id,
+            :match_datetime_tr, :date, :time,
+            :fetched_at_tr,
             :country_name, :tournament_name,
             :home, :away, :ft_home, :ft_away,
             :ms1, :ms0, :ms2,
             :raw_json, NOW()
         )
-        ON CONFLICT (flash_match_id) DO UPDATE SET
-            match_datetime_tr = EXCLUDED.match_datetime_tr,
-            date = EXCLUDED.date,
-            time = EXCLUDED.time,
-            fetched_at_tr = EXCLUDED.fetched_at_tr,
-            country_name = EXCLUDED.country_name,
-            tournament_name = EXCLUDED.tournament_name,
-            home = EXCLUDED.home,
-            away = EXCLUDED.away,
-            ft_home = EXCLUDED.ft_home,
-            ft_away = EXCLUDED.ft_away,
-            ms1 = EXCLUDED.ms1,
-            ms0 = EXCLUDED.ms0,
-            ms2 = EXCLUDED.ms2,
-            raw_json = EXCLUDED.raw_json,
-            updated_at = NOW()
+        ON CONFLICT (flash_match_id) DO NOTHING
     """)
-
-    upserted_this_run = 0  # <-- önemli
 
     with engine.begin() as conn:
         for blk in blocks:
@@ -1799,14 +1797,15 @@ def flashscore_db_finished_ms_sync_date(
                 received += 1
 
                 if (m.get("stage") or "").lower() != "finished":
+                    not_finished += 1
                     continue
-                finished += 1
 
                 odds = m.get("odds") or {}
                 ms1 = _safe_float(odds.get("1"))
                 ms0 = _safe_float(odds.get("X"))
                 ms2 = _safe_float(odds.get("2"))
                 if ms1 is None or ms0 is None or ms2 is None:
+                    skipped_no_ms += 1
                     continue
 
                 ht = m.get("home_team") or {}
@@ -1814,30 +1813,27 @@ def flashscore_db_finished_ms_sync_date(
                 ft_home = _safe_int(ht.get("score"))
                 ft_away = _safe_int(at.get("score"))
                 if ft_home is None or ft_away is None:
+                    skipped_no_score += 1
                     continue
 
                 match_id = m.get("match_id")
                 ts = m.get("timestamp")
                 if not match_id or ts is None:
+                    # bunlar çok nadir ama gelirse pas geç
                     continue
 
+                # TR datetime (başlangıç timestamp’i)
                 dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
 
-                # İstersen TR tarih filtresi açık kalsın:
-                # if dt_tr.date() != target_date:
-                #     skipped += 1
-                #     continue
-
-                finished_with_ms += 1
-
-                if limit_write and written >= limit_write:
-                    skipped += 1
+                # limit
+                if limit_write and (inserted_new + already_in_db) >= limit_write:
+                    limited += 1
                     continue
 
-                country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
-                tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name")
+                country_name = (m.get("country") or {}).get("name") or (blk.get("country_name"))
+                tournament_name = (m.get("tournament") or {}).get("name") or (blk.get("name"))
 
-                conn.execute(sql, {
+                res = conn.execute(sql, {
                     "flash_match_id": match_id,
                     "match_datetime_tr": dt_tr.isoformat(),
                     "date": dt_tr.date().isoformat(),
@@ -1855,27 +1851,26 @@ def flashscore_db_finished_ms_sync_date(
                     "raw_json": json.dumps(m, ensure_ascii=False),
                 })
 
-                written += 1
-                upserted_this_run += 1  # <-- sadece bu run
-
-        # bu tarih için DB toplamı (stabil sayı)
-        total_in_db_for_date = conn.execute(
-            text("SELECT COUNT(*) FROM flash_finished_ms WHERE date = :d"),
-            {"d": date}
-        ).scalar() or 0
+                # rowcount: 1 => yeni insert, 0 => zaten vardı
+                if res.rowcount == 1:
+                    inserted_new += 1
+                else:
+                    already_in_db += 1
 
     return {
         "ok": True,
-        "date": date,
+        "request_date": date,
         "received": received,
-        "finished": finished,
-        "finished_with_ms": finished_with_ms,
-        "upserted_this_run": upserted_this_run,
-        "skipped": skipped,
-        "limit_write": limit_write,
-        "total_in_db_for_date": int(total_in_db_for_date),
+        "inserted_new": inserted_new,
+        "already_in_db": already_in_db,
+        "skipped": {
+            "not_finished": not_finished,
+            "no_ms_odds": skipped_no_ms,
+            "no_ft_score": skipped_no_score,
+            "limited": limited,
+        },
         "fetched_at_tr": fetched_at_tr,
-    }
+                }
 
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
 def flashscore_db_finished_ms(
