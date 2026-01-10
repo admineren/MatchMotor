@@ -1879,26 +1879,21 @@ def flashscore_db_finished_ms_sync_date(
 
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
 def flashscore_db_finished_ms(
-    # Kullanıcı filtreleri
-    date: Optional[str] = Query(None, description="YYYY-MM-DD (opsiyonel)"),
+    # Kullanıcı filtreleri (panelde görünenler)
+    date: Optional[str] = Query(None, description="YYYY-MM-DD"),
     country: Optional[str] = Query(None, description="Örn: Brazil"),
     tournament: Optional[str] = Query(None, description="Örn: BRAZIL: Copinha"),
 
-    # Panel arka plan modu
-    mode: str = Query(
-        "matches",
-        pattern="^(matches|countries|tournaments)$",
-        description="countries=ülke listesi, tournaments=ülkeye göre lig listesi, matches=maç listesi"
-    ),
+    # Panel arka plan modu (UI'da göstermeyebilirsin)
+    mode: str = Query("matches", pattern="^(matches|countries|tournaments)$"),
 
-    limit: int = Query(200, ge=1, le=2000),
-    offset: int = Query(0, ge=0, le=200000),
+    # Offset yok; date verilince zaten makul sayıda döner
+    limit: int = Query(500, ge=1, le=5000),
 ):
     ensure_schema()
     if engine is None:
         raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
 
-    # date format kontrolü (opsiyonel)
     if date:
         try:
             datetime.strptime(date, "%Y-%m-%d")
@@ -1907,7 +1902,7 @@ def flashscore_db_finished_ms(
 
     with engine.begin() as conn:
 
-        # 1) Ülke dropdown: DB’de hangi ülkeler var?
+        # 1) Ülke listesi (dropdown)
         if mode == "countries":
             rows = conn.execute(text("""
                 SELECT country_name, COUNT(*)::int AS match_count
@@ -1918,7 +1913,7 @@ def flashscore_db_finished_ms(
             """)).mappings().all()
             return {"ok": True, "mode": "countries", "items": rows}
 
-        # 2) Lig dropdown: seçilen ülkeye göre hangi ligler var?
+        # 2) Lig listesi (ülkeye göre dropdown)
         if mode == "tournaments":
             if not country:
                 raise HTTPException(status_code=400, detail="mode=tournaments için country zorunlu")
@@ -1932,27 +1927,19 @@ def flashscore_db_finished_ms(
             """), {"country": country}).mappings().all()
             return {"ok": True, "mode": "tournaments", "country": country, "items": rows}
 
-        # 3) Maç listesi: (date/country/tournament filtreleriyle)
+        # 3) Maç listesi (default: oldest -> latest)
         where = ["1=1"]
-        params = {"limit": limit, "offset": offset}
+        params = {"limit": limit}
 
         if date:
             where.append("date = :date")
             params["date"] = date
-
         if country:
             where.append("country_name = :country")
             params["country"] = country
-
         if tournament:
             where.append("tournament_name = :tournament")
             params["tournament"] = tournament
-
-        total = conn.execute(text(f"""
-            SELECT COUNT(*)::int
-            FROM flash_finished_ms
-            WHERE {" AND ".join(where)}
-        """), params).scalar() or 0
 
         rows = conn.execute(text(f"""
             SELECT
@@ -1964,18 +1951,16 @@ def flashscore_db_finished_ms(
                 ms1, ms0, ms2
             FROM flash_finished_ms
             WHERE {" AND ".join(where)}
-            ORDER BY match_datetime_tr DESC
-            LIMIT :limit OFFSET :offset
+            ORDER BY match_datetime_tr ASC
+            LIMIT :limit
         """), params).mappings().all()
 
         return {
             "ok": True,
             "mode": "matches",
             "filters": {"date": date, "country": country, "tournament": tournament},
-            "total": int(total),
-            "limit": limit,
-            "offset": offset,
-            "items": rows
+            "count": len(rows),
+            "items": rows,
         }
 
 @app.get("/flashscore/db/finished-ms/summary", tags=["Flashscore DB"])
@@ -2065,4 +2050,29 @@ def flashscore_db_finished_ms_by_tournament(
         ]
 
     return {"ok": True, "count": len(items), "items": items}
+
+@app.get("/flashscore/db/finished-ms/daily-counts", tags=["Flashscore DB"])
+def flashscore_db_finished_ms_daily_counts():
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
+
+    sql = text("""
+        SELECT
+            date,
+            COUNT(*) AS match_count
+        FROM flash_finished_ms
+        GROUP BY date
+        ORDER BY date
+    """)
+
+    with engine.begin() as conn:
+        rows = conn.execute(sql).fetchall()
+
+    return {
+        "ok": True,
+        "items": [
+            {"date": r.date, "count": r.match_count}
+            for r in rows
+        ]
+    }
 
