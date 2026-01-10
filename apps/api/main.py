@@ -1558,7 +1558,7 @@ def flashscore_country_tournaments(
     path = f"general/{sport_id}/{country_id}/tournaments"
     return flashscore_get(path)
 
-@app.get("/flashscore/matches-details/{date}", tags=["Flashscore"])
+@app.get("/flashscore/matches/{date}", tags=["Flashscore"])
 def flashscore_matches_by_date(date: str):
     """
     Tarihe göre maç listesi çeker.
@@ -1584,7 +1584,7 @@ def flashscore_matches_for_offset(offset: int):
 
     return flashscore_get(f"match/list/{sport_id}/{offset}")
 
-@app.get("/flashscore/match/{match_id}", tags=["Flashscore"])
+@app.get("/flashscore/match-details/{match_id}", tags=["Flashscore"])
 def flashscore_match(match_id: str):
     return flashscore_get(f"match/details/{match_id}")
 
