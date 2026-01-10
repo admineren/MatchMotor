@@ -7,10 +7,10 @@ import datetime as dt
 from fastapi import FastAPI, HTTPException, Query, APIRouter, Path
 from fastapi.responses import JSONResponse
 
-
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter
 
 from sqlalchemy import create_engine, text
 
@@ -1543,6 +1543,24 @@ def flashscore_get(path: str):
     except Exception:
         raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
 
+def classify_stage(stage: str | None) -> str:
+    s = (stage or "").strip().lower()
+
+    # finished ayrı ele alınıyor zaten
+    if s in ("inprogress", "in progress", "live", "playing"):
+        return "in_progress"
+
+    if s in ("notstarted", "not started", "scheduled", "upcoming", "fixture"):
+        return "not_started"
+
+    if s in ("postponed", "canceled", "cancelled", "abandoned", "interrupted", "suspended", "walkover", "awarded"):
+        return "postponed_or_cancelled"
+
+    if s == "":
+        return "unknown_stage"
+
+    return f"other:{s}"
+
 @app.get("/flashscore/country", tags=["Flashscore"])
 def flashscore_countries():
     # Senin verdiğin gerçek endpoint:
@@ -1731,18 +1749,19 @@ def _fs_pick_ms_odds(m: Dict[str, Any]) -> Tuple[Optional[float], Optional[float
 @app.post("/flashscore/db/finished-ms/sync-date", tags=["Flashscore DB"])
 def flashscore_db_finished_ms_sync_date(
     date: str = Query(..., description="YYYY-MM-DD"),
-    limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz, >0 ise en fazla bu kadar insert dene")
+    limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz, >0 ise en fazla bu kadar insert dene"),
+    debug: int = Query(0, ge=0, le=1, description="1=örnekleri (examples) döndür")
 ):
     """
     /match/list/1/{date}
-    Sadece Finished + MS odds + FT skor => DB'ye INSERT.
+    Sadece: Finished + MS odds + FT skor => DB'ye INSERT.
     Aynı flash_match_id zaten varsa: DOKUNMA (final kayıt).
     """
     ensure_schema()
 
-    # tarih format kontrolü
+    # tarih doğrulama
     try:
-        datetime.strptime(date, "%Y-%m-%d")
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
     except Exception:
         raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
 
@@ -1756,29 +1775,50 @@ def flashscore_db_finished_ms_sync_date(
     if not isinstance(blocks, list):
         blocks = []
 
-    # sayaçlar (sade)
     received = 0
-    not_finished = 0
-    skipped_no_ms = 0
-    skipped_no_score = 0
     inserted_new = 0
     already_in_db = 0
-    limited = 0
 
-    sql = text("""
+    skip = Counter()
+    stage_counts = Counter()
+
+    examples = {
+        "not_started": [],
+        "in_progress": [],
+        "postponed_or_cancelled": [],
+        "unknown_stage": [],
+        "other": [],
+        "no_ms_odds": [],
+        "no_ft_score": [],
+        "missing_id_ts": [],
+        "limited": [],
+    }
+
+    def add_example(key: str, m: dict):
+        if debug != 1:
+            return
+        if key not in examples:
+            return
+        if len(examples[key]) >= 5:
+            return
+        examples[key].append({
+            "match_id": m.get("match_id"),
+            "stage": m.get("stage"),
+            "timestamp": m.get("timestamp"),
+            "country": (m.get("country") or {}).get("name"),
+            "tournament": (m.get("tournament") or {}).get("name"),
+        })
+
+    sql_insert = text("""
         INSERT INTO flash_finished_ms (
-            flash_match_id,
-            match_datetime_tr, date, time,
-            fetched_at_tr,
+            flash_match_id, match_datetime_tr, date, time, fetched_at_tr,
             country_name, tournament_name,
             home, away, ft_home, ft_away,
             ms1, ms0, ms2,
             raw_json, updated_at
         )
         VALUES (
-            :flash_match_id,
-            :match_datetime_tr, :date, :time,
-            :fetched_at_tr,
+            :flash_match_id, :match_datetime_tr, :date, :time, :fetched_at_tr,
             :country_name, :tournament_name,
             :home, :away, :ft_home, :ft_away,
             :ms1, :ms0, :ms2,
@@ -1786,6 +1826,8 @@ def flashscore_db_finished_ms_sync_date(
         )
         ON CONFLICT (flash_match_id) DO NOTHING
     """)
+
+    written = 0
 
     with engine.begin() as conn:
         for blk in blocks:
@@ -1796,44 +1838,66 @@ def flashscore_db_finished_ms_sync_date(
             for m in matches:
                 received += 1
 
-                if (m.get("stage") or "").lower() != "finished":
-                    not_finished += 1
+                stage = m.get("stage")
+                stage_key = (stage or "").strip() or "(empty)"
+                stage_counts[stage_key] += 1
+
+                # sadece finished
+                if (stage or "").strip().lower() != "finished":
+                    cat = classify_stage(stage)
+                    skip[cat] += 1
+                    if cat.startswith("other:"):
+                        add_example("other", m)
+                    else:
+                        add_example(cat, m)
                     continue
 
+                # MS odds
                 odds = m.get("odds") or {}
                 ms1 = _safe_float(odds.get("1"))
                 ms0 = _safe_float(odds.get("X"))
                 ms2 = _safe_float(odds.get("2"))
                 if ms1 is None or ms0 is None or ms2 is None:
-                    skipped_no_ms += 1
+                    skip["no_ms_odds"] += 1
+                    add_example("no_ms_odds", m)
                     continue
 
+                # FT skor
                 ht = m.get("home_team") or {}
                 at = m.get("away_team") or {}
                 ft_home = _safe_int(ht.get("score"))
                 ft_away = _safe_int(at.get("score"))
                 if ft_home is None or ft_away is None:
-                    skipped_no_score += 1
+                    skip["no_ft_score"] += 1
+                    add_example("no_ft_score", m)
                     continue
 
+                # id + timestamp
                 match_id = m.get("match_id")
                 ts = m.get("timestamp")
                 if not match_id or ts is None:
-                    # bunlar çok nadir ama gelirse pas geç
+                    skip["missing_id_ts"] += 1
+                    add_example("missing_id_ts", m)
                     continue
 
-                # TR datetime (başlangıç timestamp’i)
+                # TR datetime
                 dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
 
+                # (Opsiyonel) TR tarih kontrolü istersen aç:
+                # if dt_tr.date() != target_date:
+                #     skip["wrong_tr_date"] += 1
+                #     continue
+
                 # limit
-                if limit_write and (inserted_new + already_in_db) >= limit_write:
-                    limited += 1
+                if limit_write and written >= limit_write:
+                    skip["limited"] += 1
+                    add_example("limited", m)
                     continue
 
-                country_name = (m.get("country") or {}).get("name") or (blk.get("country_name"))
-                tournament_name = (m.get("tournament") or {}).get("name") or (blk.get("name"))
+                country_name = (m.get("country") or {}).get("name") or blk.get("country_name") or ""
+                tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name") or ""
 
-                res = conn.execute(sql, {
+                res = conn.execute(sql_insert, {
                     "flash_match_id": match_id,
                     "match_datetime_tr": dt_tr.isoformat(),
                     "date": dt_tr.date().isoformat(),
@@ -1851,26 +1915,27 @@ def flashscore_db_finished_ms_sync_date(
                     "raw_json": json.dumps(m, ensure_ascii=False),
                 })
 
-                # rowcount: 1 => yeni insert, 0 => zaten vardı
+                written += 1
                 if res.rowcount == 1:
                     inserted_new += 1
                 else:
                     already_in_db += 1
 
-    return {
+    out = {
         "ok": True,
         "request_date": date,
         "received": received,
         "inserted_new": inserted_new,
         "already_in_db": already_in_db,
-        "skipped": {
-            "not_finished": not_finished,
-            "no_ms_odds": skipped_no_ms,
-            "no_ft_score": skipped_no_score,
-            "limited": limited,
-        },
+        "skipped": dict(skip),
+        "stage_counts": dict(stage_counts),
+        "limit_write": limit_write,
         "fetched_at_tr": fetched_at_tr,
-                }
+    }
+    if debug == 1:
+        out["examples"] = examples
+
+    return out
 
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
 def flashscore_db_finished_ms(
@@ -1882,10 +1947,11 @@ def flashscore_db_finished_ms(
     # Panel arka plan modu (UI'da göstermeyebilirsin)
     mode: str = Query("matches", pattern="^(matches|countries|tournaments)$"),
 
-    # Offset yok; date verilince zaten makul sayıda döner
+    # date verilince zaten makul sayıda döner
     limit: int = Query(500, ge=1, le=5000),
 ):
     ensure_schema()
+
     if engine is None:
         raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
 
@@ -1922,16 +1988,18 @@ def flashscore_db_finished_ms(
             """), {"country": country}).mappings().all()
             return {"ok": True, "mode": "tournaments", "country": country, "items": rows}
 
-        # 3) Maç listesi (default: oldest -> latest)
+        # 3) Maç listesi
         where = ["1=1"]
         params = {"limit": limit}
 
         if date:
             where.append("date = :date")
             params["date"] = date
+
         if country:
             where.append("country_name = :country")
             params["country"] = country
+
         if tournament:
             where.append("tournament_name = :tournament")
             params["tournament"] = tournament
