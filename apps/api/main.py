@@ -38,7 +38,7 @@ FLASHSCORE_RAPIDAPI_HOST = os.getenv(
 # Default guess: football/matches/{YYYY-MM-DD}
 FLASHSCORE_MATCHES_PATH_TEMPLATE = os.getenv(
     "FLASHSCORE_MATCHES_PATH_TEMPLATE",
-    "football/matches/{date}"
+    "match/list/1/{date}"
 ).strip().lstrip("/")
 
 # ==========================================================
