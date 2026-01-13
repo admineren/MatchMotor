@@ -300,7 +300,7 @@ def ensure_schema():
             CREATE TABLE IF NOT EXISTS finished_matches (
                 id BIGSERIAL PRIMARY KEY,
                 nosy_match_id BIGINT NOT NULL UNIQUE,
-                match_id BIGNIT,
+                match_id BIGINT,
 
                 match_datetime TEXT,
                 date TEXT,
