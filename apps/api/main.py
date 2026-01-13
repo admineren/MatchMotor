@@ -1,356 +1,214 @@
 import os
-import requests
 import json
-import math
-import datetime as dt
+import requests
 
-from fastapi import FastAPI, HTTPException, Query, APIRouter, Path
-from fastapi.responses import JSONResponse
-
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from collections import Counter
 
+from fastapi import FastAPI, HTTPException, Query
 from sqlalchemy import create_engine, text
 
 # ==========================================================
-# DATABASE
+# CONFIG
 # ==========================================================
+TR_TZ = ZoneInfo("Europe/Istanbul")
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# IMPORTANT:
+# - Neon connection strings are usually already in the correct form.
+# - If you use a Postgres URL, prefer: postgresql+psycopg://...
+#   (psycopg3). If you use psycopg2 then: postgresql+psycopg2://...
+engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True
-) if DATABASE_URL else None
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
 
-
-# ---------------------------
-# Config (ENV)
-# ---------------------------
-NOSY_API_KEY = os.getenv("NOSY_API_KEY", "").strip()
-
-# Tüm veri endpointleri buradan çağrılır (service zorunlu)
-NOSY_SERVICE_BASE_URL = os.getenv(
-    "NOSY_SERVICE_BASE_URL",
-    "https://www.nosyapi.com/apiv2/service"
+FLASHSCORE_BASE_URL = os.getenv(
+    "FLASHSCORE_BASE_URL",
+    "https://flashscore4.p.rapidapi.com/api/flashscore/v1"
 ).strip().rstrip("/")
 
-# Sadece check endpointi buradan çağrılır (service içermez)
-NOSY_CHECK_BASE_URL = os.getenv(
-    "NOSY_CHECK_BASE_URL",
-    "https://www.nosyapi.com/apiv2"
-).strip().rstrip("/")
+FLASHSCORE_RAPIDAPI_HOST = os.getenv(
+    "FLASHSCORE_RAPIDAPI_HOST",
+    "flashscore4.p.rapidapi.com"
+).strip()
 
-# Check için API ID'ler (zorunlu değil; sadece check endpointlerini açacaksan gerekli)
-NOSY_CHECK_API_ID_ODDS = os.getenv("NOSY_CHECK_API_ID_ODDS", "").strip()
-NOSY_CHECK_API_ID_BETTABLE_RESULT = os.getenv("NOSY_CHECK_API_ID_BETTABLE_RESULT", "").strip()
-NOSY_CHECK_API_ID_MATCHES_RESULT = os.getenv("NOSY_CHECK_API_ID_MATCHES_RESULT", "").strip()
+# Flashscore matches endpoint path (in case RapidAPI changes / you use a different provider)
+# Default guess: football/matches/{YYYY-MM-DD}
+FLASHSCORE_MATCHES_PATH_TEMPLATE = os.getenv(
+    "FLASHSCORE_MATCHES_PATH_TEMPLATE",
+    "football/matches/{date}"
+).strip().lstrip("/")
 
-# ---------------------------
-# Timezone (Türkiye saati)
-# ---------------------------
-try:
-    from zoneinfo import ZoneInfo  # Py3.9+
-    TR_TZ = ZoneInfo("Europe/Istanbul")
-except Exception:
-    TR_TZ = None  # zoneinfo yoksa health'ta sadece UTC döneceğiz
+# ==========================================================
+# HELPERS
+# ==========================================================
+def _require_db():
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL env eksik veya engine kurulamadı.")
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _dump_json(obj) -> str:
+def _require_rapidapi_key():
+    if not RAPIDAPI_KEY:
+        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY env eksik.")
+
+def _dump_json(obj: Any) -> str:
     try:
         return json.dumps(obj, ensure_ascii=False)
     except Exception:
         return "{}"
 
-def _to_int_score(x):
-    """Skor/kart/korner gibi alanlarda: '-' boş/null => None, '0' => 0"""
-    if x is None:
-        return None
-    s = str(x).strip()
-    if s == "" or s == "-" or s.lower() == "null":
-        return None
-    try:
-        return int(s)
-    except Exception:
-        return None
-
-def _meta_map(match_result_list) -> dict:
-    m = {}
-    if isinstance(match_result_list, list):
-        for it in match_result_list:
-            if not isinstance(it, dict):
-                continue
-            k = it.get("metaName")
-            v = it.get("value")
-            if k is not None:
-                m[str(k)] = v
-    return m
-
-def _meta_ci_get(match_result, wanted_key: str):
-    if not match_result:
-        return None
-    w = wanted_key.lower()
-
-    if isinstance(match_result, dict):
-        for k, v in match_result.items():
-            if isinstance(k, str) and k.lower() == w:
-                if isinstance(v, dict) and "value" in v:
-                    return v.get("value")
-                return v
-        return None
-
-    if isinstance(match_result, list):
-        for row in match_result:
-            if not isinstance(row, dict):
-                continue
-            name = row.get("metaName") or row.get("MetaName") or row.get("metaname")
-            if isinstance(name, str) and name.lower() == w:
-                return row.get("value") or row.get("Value")
-    return None
-
-def _pick_int_from_match_result(match_result, *keys):
+def flashscore_get(path: str, *, params: Optional[dict] = None) -> dict:
     """
-    keys: ("msHomeScore", "mshomescore", ...)
-    döner: (int|None, used_key|None, raw_value)
+    Flashscore RapidAPI GET helper.
+    path örn: 'general/1/countries'
     """
-    for k in keys:
-        raw = _meta_ci_get(match_result, k)
-        iv = _to_int_score(raw)
-        if iv is not None:
-            return iv, k, raw
-    return None, None, None
+    _require_rapidapi_key()
 
-def _debug_no_score(reason: str, mid: int, item: dict, keys_tried: dict):
-    mr = item.get("matchResult") or []
-    sample = mr[:6] if isinstance(mr, list) else list(mr.items())[:6] if isinstance(mr, dict) else []
-    return {
-        "match_id": mid,
-        "reason": reason,
-        "GameResult": item.get("GameResult"),
-        "Result": item.get("Result"),
-        "LiveStatus": item.get("LiveStatus"),
-        "keys_tried": keys_tried,
-        "matchResult_sample": sample,
+    url = f"{FLASHSCORE_BASE_URL}/{path.lstrip('/')}"
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": FLASHSCORE_RAPIDAPI_HOST,
     }
 
-def _gr_int(item: dict):
-        gr = item.get("GameResult")
+    try:
+        r = requests.get(url, headers=headers, params=(params or {}), timeout=30)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Flashscore bağlantı hatası: {e}")
+
+    if r.status_code >= 400:
         try:
-            return int(str(gr).strip())
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
+
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
+
+def classify_stage(stage: Optional[str]) -> str:
+    # Normalize "Finished", "Live", "Postponed", etc.
+    s = (stage or "").strip()
+    if not s:
+        return "Unknown"
+    # Keep original if it looks meaningful, else Title-case
+    return s[:1].upper() + s[1:]
+
+def _fs_ts_to_tr(ts: Any) -> Optional[datetime]:
+    """
+    Flashscore timestamps are commonly epoch seconds.
+    Return Turkey-aware datetime.
+    """
+    if ts is None:
+        return None
+    try:
+        ts_i = int(str(ts).strip())
+    except Exception:
+        return None
+    return datetime.fromtimestamp(ts_i, tz=timezone.utc).astimezone(TR_TZ)
+
+def _fs_is_finished(match_obj: dict) -> bool:
+    """
+    Decide if a match is finished.
+    We primarily use stage / status fields if available.
+    """
+    stage = (
+        match_obj.get("stage")
+        or match_obj.get("status")
+        or match_obj.get("stageName")
+        or match_obj.get("eventStage")
+        or ""
+    )
+    s = str(stage).strip().lower()
+    return s == "finished" or s == "ft" or s == "ended"
+
+def _fs_extract_score(match_obj: dict) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Extract full-time score if present.
+    Tries common shapes:
+      - match['result']['home'], match['result']['away']
+      - match['homeScore'], match['awayScore']
+      - match['score']['home'], match['score']['away']
+      - match['result']['ft']['home'], match['result']['ft']['away']
+    """
+    def to_int(x):
+        try:
+            if x is None:
+                return None
+            s = str(x).strip()
+            if s == "" or s == "-":
+                return None
+            return int(float(s))
         except Exception:
             return None
 
-def _take_details_data(details_payload):
-        dd = (details_payload or {}).get("data")
-        if isinstance(dd, list) and dd:
-            return dd[0]
-        if isinstance(dd, dict):
-            return dd
-        return None
+    # flat
+    ft_home = to_int(match_obj.get("homeScore"))
+    ft_away = to_int(match_obj.get("awayScore"))
+    if ft_home is not None and ft_away is not None:
+        return ft_home, ft_away
 
-def _require_api_key():
-    if not NOSY_API_KEY:
-        raise HTTPException(status_code=500, detail="NOSY_API_KEY env eksik.")
+    # score dict
+    sc = match_obj.get("score") or {}
+    if isinstance(sc, dict):
+        ft_home = to_int(sc.get("home"))
+        ft_away = to_int(sc.get("away"))
+        if ft_home is not None and ft_away is not None:
+            return ft_home, ft_away
 
-def _join_url(base: str, endpoint: str) -> str:
-    base = (base or "").rstrip("/")
-    endpoint = (endpoint or "").lstrip("/")
-    return f"{base}/{endpoint}"
+    # result dict
+    res = match_obj.get("result") or {}
+    if isinstance(res, dict):
+        # direct
+        ft_home = to_int(res.get("home"))
+        ft_away = to_int(res.get("away"))
+        if ft_home is not None and ft_away is not None:
+            return ft_home, ft_away
+        # nested ft
+        ft = res.get("ft") or {}
+        if isinstance(ft, dict):
+            ft_home = to_int(ft.get("home"))
+            ft_away = to_int(ft.get("away"))
+            if ft_home is not None and ft_away is not None:
+                return ft_home, ft_away
 
-def nosy_service_call(endpoint: str, *, params: dict | None = None) -> dict:
-    _require_api_key()
-    url = _join_url(NOSY_SERVICE_BASE_URL, endpoint)
+    return None, None
 
-    q = dict(params or {})
-    q["apiKey"] = NOSY_API_KEY
-
-    try:
-        r = requests.get(url, params=q, timeout=30)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Nosy bağlantı hatası: {e}")
-
-    if r.status_code >= 400:
+def _fs_pick_ms_odds(match_obj: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Pull 1X2 odds if present in the match payload.
+    (Some providers include it; if not, keep None.)
+    """
+    def to_float(x):
         try:
-            body = r.json()
+            if x is None:
+                return None
+            s = str(x).strip()
+            if s == "" or s == "-":
+                return None
+            return float(s)
         except Exception:
-            body = {"raw": r.text}
-        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
+            return None
 
-    try:
-        return r.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
+    odds = match_obj.get("odds") or match_obj.get("1x2") or match_obj.get("ms") or {}
+    if isinstance(odds, dict):
+        ms1 = to_float(odds.get("home") or odds.get("1") or odds.get("ms1"))
+        ms0 = to_float(odds.get("draw") or odds.get("x") or odds.get("ms0"))
+        ms2 = to_float(odds.get("away") or odds.get("2") or odds.get("ms2"))
+        if ms1 is not None or ms0 is not None or ms2 is not None:
+            return ms1, ms0, ms2
 
-def nosy_check_call(api_id: str) -> dict:
-    _require_api_key()
-    if not api_id:
-        raise HTTPException(status_code=500, detail="Check için apiID env eksik.")
-
-    url = _join_url(NOSY_CHECK_BASE_URL, "nosy-service/check")
-    q = {"apiKey": NOSY_API_KEY, "apiID": api_id}
-
-    try:
-        r = requests.get(url, params=q, timeout=30)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Nosy check bağlantı hatası: {e}")
-
-    if r.status_code >= 400:
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text}
-        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
-
-    try:
-        return r.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
-
-def make_aware(dt, tz):
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=tz)
-    return dt
-
+    # Sometimes odds are under bookmakers[0]['markets'][...]
+    return None, None, None
 
 # ==========================================================
-# APP
+# DB SCHEMA
 # ==========================================================
-app = FastAPI(
-    title="MatchMotor API",
-    version="0.1.0",
-    description="NosyAPI proxy (DB yok, sadece altyapı ve test endpointleri).",
-)
-
-@app.on_event("startup")
-def _startup():
-    if engine is not None:
-        ensure_schema()
-
-@app.get("/health")
-def health():
-    now_utc = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-    now_tr = now_utc.astimezone(TR_TZ) if TR_TZ else None
-
-    return {
-        "ok": True,
-        "time_utc": now_utc.isoformat(),
-        "time_tr": now_tr.isoformat() if now_tr else None,
-        "tz": "Europe/Istanbul" if TR_TZ else None,
-        "nosy": {
-            "service_base": NOSY_SERVICE_BASE_URL,
-            "check_base": NOSY_CHECK_BASE_URL,
-            "api_key_set": bool(NOSY_API_KEY),
-            "check_ids_set": {
-                "odds": bool(NOSY_CHECK_API_ID_ODDS),
-                "bettable_result": bool(NOSY_CHECK_API_ID_BETTABLE_RESULT),
-                "matches_result": bool(NOSY_CHECK_API_ID_MATCHES_RESULT),
-            },
-        },
-    }
-
-
-# ==========================================================
-# DATABASE SCHEMA
-# ==========================================================
-
 def ensure_schema():
-    if engine is None:
-        raise RuntimeError("DATABASE_URL env eksik")
-
+    _require_db()
     with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS pool_matches (
-                id BIGSERIAL PRIMARY KEY,
-                nosy_match_id BIGINT NOT NULL UNIQUE,
-                match_id BIGINT,
-                match_datetime TEXT,
-                date TEXT,
-                time TEXT,
-                league TEXT,
-                country TEXT,
-                team1 TEXT,
-                team2 TEXT,
-                betcount INT,
-                ms1 DOUBLE PRECISION,
-                ms0 DOUBLE PRECISION,
-                ms2 DOUBLE PRECISION,
-                alt25 DOUBLE PRECISION,
-                ust25 DOUBLE PRECISION,
-                fetched_at_tr TEXT,
-                raw_json TEXT
-            );
-        """))
-
-        # 🔧 telefon kurtarıcı patch
-        conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS fetched_at_tr TEXT;"""))
-        conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS raw_json TEXT;"""))
-        conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS game_result INTEGER;"""))
-        conn.execute(text("""ALTER TABLE pool_matches ADD COLUMN IF NOT EXISTS match_id BIGINT;"""))
-        conn.execute(text("""CREATE INDEX IF NOT EXISTS idx_pool_matches_match_id ON pool_matches(match_id);"""))
-
-# -----------------------------
-# FINISHED MATCHES (matches-result snapshot)
-# -----------------------------
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS finished_matches (
-                id BIGSERIAL PRIMARY KEY,
-                nosy_match_id BIGINT NOT NULL UNIQUE,
-                match_id BIGINT,
-
-                match_datetime TEXT,
-                date TEXT,
-                time TEXT,
-
-                league_code TEXT,
-                league TEXT,
-                country TEXT,
-                team1 TEXT,
-                team2 TEXT,
-
-                betcount INT,
-                ms1 DOUBLE PRECISION,
-                ms0 DOUBLE PRECISION,
-                ms2 DOUBLE PRECISION,
-                alt25 DOUBLE PRECISION,
-                ust25 DOUBLE PRECISION,
-
-                ft_home INT,
-                ft_away INT,
-                ht_home INT,
-                ht_away INT,
-
-                mb INT,
-                result INT,
-                game_result INT,
-                live_status INT,
-
-                fetched_at_tr TEXT,
-                raw_json TEXT,
-
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-        """))
-
-        conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS ux_finished_matches_mid ON finished_matches (nosy_match_id);"""))
-        
-        # finished_matches: corner + kart kolonları
-        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS home_corner INTEGER"))
-        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS away_corner INTEGER"))
-
-        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS home_yellow INTEGER"))
-        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS away_yellow INTEGER"))
-
-        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS home_red INTEGER"))
-        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS away_red INTEGER"))
-        
-        conn.execute(text("ALTER TABLE finished_matches ADD COLUMN IF NOT EXISTS match_id BIGINT"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finished_matches_match_id ON finished_matches(match_id)"))
-
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS flash_finished_ms (
                 id BIGSERIAL PRIMARY KEY,
@@ -379,1081 +237,49 @@ def ensure_schema():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """))
-        
         conn.execute(text("""CREATE INDEX IF NOT EXISTS idx_flash_finished_ms_date ON flash_finished_ms(date);"""))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS idx_flash_finished_ms_fetched ON flash_finished_ms(fetched_at_tr);"""))
 
-# ---------------------------
-# Nosy CHECK endpoints (root base)
-# ---------------------------
-
-@app.get("/nosy/check/odds")
-def nosy_check_odds():
-    return nosy_check_call(NOSY_CHECK_API_ID_ODDS)
-
-@app.get("/nosy/check/bettable-result")
-def nosy_check_bettable_result():
-    return nosy_check_call(NOSY_CHECK_API_ID_BETTABLE_RESULT)
-
-@app.get("/nosy/check/matches-result")
-def nosy_check_matches_result():
-    return nosy_check_call(NOSY_CHECK_API_ID_MATCHES_RESULT)
-
-# ---------------------------
-# Nosy SERVICE proxy endpoints
-# ---------------------------
-
-@app.get("/nosy/bettable-matches")
-def nosy_bettable_matches():
-    # İddaa programını listeler
-    return nosy_service_call("bettable-matches")
-
-@app.get("/nosy/bettable-matches/date")
-def nosy_bettable_matches_date():
-    # Sistemde kayıtlı oyunların tarih bilgisini grup halinde döndürür (dokümandaki gibi)
-    return nosy_service_call("bettable-matches/date")
-
-@app.get("/nosy/bettable-matches/details")
-def nosy_bettable_matches_details(matchID: int = Query(..., description="Nosy MatchID")):
-    # İlgili maçın tüm market oranları (details)
-    return nosy_service_call("bettable-matches/details", params={"matchID": matchID})
-
-@app.get("/nosy/matches-result")
-def nosy_matches_result():
-    # Maç sonuçlarını toplu görüntülemek için
-    return nosy_service_call("matches-result")
-
-@app.get("/nosy/matches-result/details")
-def nosy_matches_result_details(matchID: int = Query(..., description="Nosy MatchID")):
-    # Tek maça ait maç sonucu
-    return nosy_service_call("matches-result/details", params={"matchID": matchID})
-
-@app.get("/nosy/bettable-result")
-def nosy_bettable_result(matchID: int = Query(..., description="Nosy MatchID")):
-    # İlgili maça ait oyun sonuçları (market sonuçları)
-    return nosy_service_call("bettable-result", params={"matchID": matchID})
-
-@app.get("/nosy/bettable-result/details")
-def nosy_bettable_result_details(gameID: int = Query(..., description="Nosy gameID")):
-    # Tekil oyun sonucu (game bazlı)
-    return nosy_service_call("bettable-result/details", params={"gameID": gameID})
-    
-
-@app.get("/nosy/bettable-matches/opening-odds")
-def nosy_bettable_matches_opening_odds(
-    matchID: int = Query(..., description="Nosy MatchID (zorunlu)")
-):
-    # Açılış oranları (tek maç) - matchID şart
-    return nosy_service_call("bettable-matches/opening-odds", params={"matchID": matchID})
-
-# --- POOL SYNC ENDPOINTS ---
-# Gerekenler: engine (SQLAlchemy), text (sqlalchemy.sql), datetime, timezone/ZoneInfo (TR saati), nosy_service_get(), _dump_json()
-@app.post("/pool/bettable-matches/sync")
-def sync_pool_bettable_matches():
-    """
-    NosyAPI -> bettable-matches
-    Günün bültenini çekip pool_matches tablosuna upsert eder.
-    """
-    payload = nosy_service_call("bettable-matches")
-    data = payload.get("data") or []
-    received = len(data)
-
-    fetched_at_tr = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
-
-    upserted = 0
-    skipped = 0
-
-    with engine.begin() as conn:
-        for item in data:
-            if not isinstance(item, dict):
-                skipped += 1
-                continue
-
-            mid = item.get("MatchID")
-            try:
-                mid = int(mid)
-            except Exception:
-                skipped += 1
-                continue
-
-            # Temel alanlar
-            date_val = str(item.get("Date") or "")
-            time_val = str(item.get("Time") or "")
-            dt_val   = str(item.get("DateTime") or "")
-
-            league  = str(item.get("League") or "")
-            country = str(item.get("Country") or "")
-            team1   = str(item.get("Team1") or "")
-            team2   = str(item.get("Team2") or "")
-
-            ms1 = item.get("HomeWin")
-            ms0 = item.get("Draw")
-            ms2 = item.get("AwayWin")
-            alt25 = item.get("Under25")
-            ust25 = item.get("Over25")
-            betcount = item.get("BetCount")
-            game_result = item.get("GameResult")
-
-            conn.execute(
-                text("""
-                    INSERT INTO pool_matches(
-                        nosy_match_id,
-                        match_datetime, date, time,
-                        league, country, team1, team2,
-                        betcount, ms1, ms0, ms2, alt25, ust25,
-                        fetched_at_tr, raw_json, game_result
-                    )
-                    VALUES(
-                        :mid,
-                        :dt, :date, :time,
-                        :league, :country, :team1, :team2,
-                        :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
-                        :fetched_at_tr, :raw_json, :game_result
-                    )
-                    ON CONFLICT(nosy_match_id) DO UPDATE SET
-                        match_datetime = EXCLUDED.match_datetime,
-                        date = EXCLUDED.date,
-                        time = EXCLUDED.time,
-                        league = EXCLUDED.league,
-                        country = EXCLUDED.country,
-                        team1 = EXCLUDED.team1,
-                        team2 = EXCLUDED.team2,
-                        betcount = EXCLUDED.betcount,
-                        ms1 = EXCLUDED.ms1,
-                        ms0 = EXCLUDED.ms0,
-                        ms2 = EXCLUDED.ms2,
-                        alt25 = EXCLUDED.alt25,
-                        ust25 = EXCLUDED.ust25,
-                        fetched_at_tr = EXCLUDED.fetched_at_tr,
-                        raw_json = EXCLUDED.raw_json,
-                        game_result = EXCLUDED.game_result
-                """),
-                {
-                    "mid": mid,
-                    "dt": dt_val,
-                    "date": date_val,
-                    "time": time_val,
-                    "league": league,
-                    "country": country,
-                    "team1": team1,
-                    "team2": team2,
-                    "betcount": betcount,
-                    "ms1": ms1,
-                    "ms0": ms0,
-                    "ms2": ms2,
-                    "alt25": alt25,
-                    "ust25": ust25,
-                    "fetched_at_tr": fetched_at_tr,
-                    "raw_json": _dump_json(item),
-                    "game_result": game_result,
-                }
-            )
-            upserted += 1
-
-    return {
-        "ok": True,
-        "endpoint": "bettable-matches",
-        "received": received,
-        "upserted": upserted,
-        "skipped": skipped,
-        "fetched_at_tr": fetched_at_tr,
-        "rowCount": payload.get("rowCount"),
-        "creditUsed": payload.get("creditUsed"),
-    }                 
-
-@app.get("/pool/bettable-matches")
-def get_pool_bettable_matches(
-    day: Optional[str] = Query(None, description="YYYY-MM-DD. Boşsa en son bülten."),
-    which: str = Query("latest", description="latest | oldest"),
-    limit: int = Query(50, ge=1, le=500)
-):
-    """
-    Pool'dan bülten listeler.
-    - day yoksa: en son kaydedilen bülten (MAX fetched_at_tr)
-    - day varsa: o günün en son bülteni (MAX fetched_at_tr WHERE fetched_at_tr LIKE 'YYYY-MM-DD%')
-    - which=oldest: MIN fetched_at_tr (veya gün içindeki MIN)
-    """
-    with engine.begin() as conn:
-        # 1) Hangi snapshot (fetched_at_tr) gösterilecek?
-        if day:
-            # Gün içindeki en son/en eski snapshot
-            if which == "oldest":
-                snap = conn.execute(text("""
-                    SELECT MIN(fetched_at_tr) AS snap
-                    FROM pool_matches
-                    WHERE fetched_at_tr LIKE :daypat
-                """), {"daypat": f"{day}%"}).mappings().first()
-            else:
-                snap = conn.execute(text("""
-                    SELECT MAX(fetched_at_tr) AS snap
-                    FROM pool_matches
-                    WHERE fetched_at_tr LIKE :daypat
-                """), {"daypat": f"{day}%"}).mappings().first()
-        else:
-            # Tüm zamanların en son/en eski snapshot
-            if which == "oldest":
-                snap = conn.execute(text("""
-                    SELECT MIN(fetched_at_tr) AS snap
-                    FROM pool_matches
-                """)).mappings().first()
-            else:
-                snap = conn.execute(text("""
-                    SELECT MAX(fetched_at_tr) AS snap
-                    FROM pool_matches
-                """)).mappings().first()
-
-        snap_val = (snap or {}).get("snap")
-        if not snap_val:
-            return {"ok": True, "snapshot": None, "count": 0, "items": []}
-
-        # 2) O snapshot'a ait maçları getir
-        rows = conn.execute(text("""
-            SELECT
-                nosy_match_id,
-                match_datetime, date, time,
-                league, country, team1, team2,
-                betcount, game_result, ms1, ms0, ms2, alt25, ust25,
-                fetched_at_tr
-            FROM pool_matches
-            WHERE fetched_at_tr = :snap
-            ORDER BY league, time, team1
-            LIMIT :limit
-        """), {"snap": snap_val, "limit": limit}).mappings().all()
-
-    return {
-        "ok": True,
-        "day": day,
-        "which": which,
-        "snapshot": snap_val,
-        "count": len(rows),
-        "items": [dict(r) for r in rows],
-    }
-
-@app.post("/db/finished-matches/sync")
-def sync_finished_matches(
-    backfill: int = Query(default=0, description="1 ise gece sarkan maçlar için details backfill yapar"),
-    max_details: int = Query(default=25, ge=0, le=200, description="Backfill'de en fazla kaç maça details denenecek"),
-):
-    """
-    NosyAPI -> matches-result (bulk)
-    + opsiyonel: matches-result/details (backfill)
-
-    KURAL:
-    - SADECE GameResult belirleyici.
-    - GameResult != 1 ise skor/kart/korner parse edilmez, DB'ye yazılmaz.
-    - GameResult == 1 ise skor + diğer metalar parse edilir ve upsert edilir.
-    - Result / LiveStatus güvenilmez; karar mekanizmasında kullanılmaz.
-    """
-
-    # -------------------------
-    # SQL (tek yerde)
-    # -------------------------
-    UPSERT_SQL = text("""
-        INSERT INTO finished_matches(
-            nosy_match_id,
-            match_datetime, date, time,
-            league_code, league, country, team1, team2,
-            betcount, ms1, ms0, ms2, alt25, ust25,
-            ft_home, ft_away, ht_home, ht_away,
-            home_corner, away_corner,
-            home_yellow, away_yellow,
-            home_red, away_red,
-            mb, result, game_result, live_status,
-            fetched_at_tr, raw_json,
-            updated_at
-        )
-        VALUES(
-            :mid,
-            :dt, :date, :time,
-            :league_code, :league, :country, :team1, :team2,
-            :betcount, :ms1, :ms0, :ms2, :alt25, :ust25,
-            :ft_home, :ft_away, :ht_home, :ht_away,
-            :home_corner, :away_corner,
-            :home_yellow, :away_yellow,
-            :home_red, :away_red,
-            :mb, :result, :game_result, :live_status,
-            :fetched_at_tr, :raw_json,
-            NOW()
-        )
-        ON CONFLICT(nosy_match_id) DO UPDATE SET
-            match_datetime = EXCLUDED.match_datetime,
-            date = EXCLUDED.date,
-            time = EXCLUDED.time,
-            league_code = EXCLUDED.league_code,
-            league = EXCLUDED.league,
-            country = EXCLUDED.country,
-            team1 = EXCLUDED.team1,
-            team2 = EXCLUDED.team2,
-            betcount = EXCLUDED.betcount,
-            ms1 = EXCLUDED.ms1,
-            ms0 = EXCLUDED.ms0,
-            ms2 = EXCLUDED.ms2,
-            alt25 = EXCLUDED.alt25,
-            ust25 = EXCLUDED.ust25,
-            ft_home = EXCLUDED.ft_home,
-            ft_away = EXCLUDED.ft_away,
-            ht_home = EXCLUDED.ht_home,
-            ht_away = EXCLUDED.ht_away,
-            home_corner = EXCLUDED.home_corner,
-            away_corner = EXCLUDED.away_corner,
-            home_yellow = EXCLUDED.home_yellow,
-            away_yellow = EXCLUDED.away_yellow,
-            home_red = EXCLUDED.home_red,
-            away_red = EXCLUDED.away_red,
-            mb = EXCLUDED.mb,
-            result = EXCLUDED.result,
-            game_result = EXCLUDED.game_result,
-            live_status = EXCLUDED.live_status,
-            fetched_at_tr = EXCLUDED.fetched_at_tr,
-            raw_json = EXCLUDED.raw_json,
-            updated_at = NOW()
-    """)
-
-    # -----------------------
-    # 1) BULK: matches-result
-    # -----------------------
-    payload = nosy_service_call("matches-result")
-    data = payload.get("data") or []
-    received = len(data)
-
-    fetched_at_tr = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
-
-    bulk_report = {
-        "received": received,
-        "upserted": 0,
-        "skipped": 0,
-        "not_finished_gr0": 0,      # GameResult != 1 => işlem yapılmadı
-        "gr1_but_no_score": 0,      # GameResult==1 ama FT skor yok
-        "gr1_but_empty_matchResult": 0,
-        "fetched_at_tr": fetched_at_tr,
-        "rowCount": payload.get("rowCount"),
-        "creditUsed": payload.get("creditUsed"),
-    }
-    bulk_debug = []  # ilk 10 örnek
-    MAX_DEBUG = 10
-
-    # -----------------------
-    # 2) BACKFILL REPORT
-    # -----------------------
-    backfill_report = {
-        "enabled": bool(backfill),
-        "window": None,
-        "candidates": 0,
-        "requested": 0,
-        "upserted": 0,
-        "details_failed": 0,        # details data gelmedi
-        "not_finished_gr0": 0,      # GameResult != 1 => işlem yapılmadı
-        "gr1_but_no_score": 0,      # GameResult==1 ama FT skor yok
-        "gr1_but_empty_matchResult": 0,
-    }
-    backfill_debug = []  # ilk 10 örnek
-
-    with engine.begin() as conn:
-        # -------- BULK LOOP --------
-        for item in data:
-            if not isinstance(item, dict):
-                bulk_report["skipped"] += 1
-                continue
-
-            mid = item.get("MatchID")
-            try:
-                mid = int(mid)
-            except Exception:
-                bulk_report["skipped"] += 1
-                continue
-
-            gr_i = _gr_int(item)
-
-            # >>>>> SADECE GameResult belirleyici <<<<<
-            if gr_i != 1:
-                bulk_report["not_finished_gr0"] += 1
-                if len(bulk_debug) < MAX_DEBUG:
-                    bulk_debug.append({
-                        "stage": "bulk",
-                        "mid": mid,
-                        "why": "GameResult!=1 => parse yok",
-                        "GameResult": item.get("GameResult"),
-                        "matchResult_len": len(item.get("matchResult") or []),
-                    })
-                continue
-
-            mr = item.get("matchResult") or []
-            if not mr:
-                bulk_report["gr1_but_empty_matchResult"] += 1
-                if len(bulk_debug) < MAX_DEBUG:
-                    bulk_debug.append({
-                        "stage": "bulk",
-                        "mid": mid,
-                        "why": "GameResult==1 ama matchResult boş",
-                        "GameResult": item.get("GameResult"),
-                    })
-                continue
-
-            ft_home = _to_int_score(_meta_ci_get(mr, "msHomeScore"))
-            ft_away = _to_int_score(_meta_ci_get(mr, "msAwayScore"))
-
-            # GameResult==1 ama skor yoksa yazma
-            if ft_home is None or ft_away is None:
-                bulk_report["gr1_but_no_score"] += 1
-                if len(bulk_debug) < MAX_DEBUG:
-                    bulk_debug.append({
-                        "stage": "bulk",
-                        "mid": mid,
-                        "why": "GameResult==1 ama FT skor yok",
-                        "GameResult": item.get("GameResult"),
-                        "sample_matchResult_first3": (mr[:3] if isinstance(mr, list) else []),
-                    })
-                continue
-
-            # diğer metalar (opsiyonel)
-            ht_home = _to_int_score(_meta_ci_get(mr, "htHomeScore"))
-            ht_away = _to_int_score(_meta_ci_get(mr, "htAwayScore"))
-
-            home_corner = _to_int_score(_meta_ci_get(mr, "homeCorner"))
-            away_corner = _to_int_score(_meta_ci_get(mr, "awayCorner"))
-            home_yellow = _to_int_score(_meta_ci_get(mr, "homeYellowCard"))
-            away_yellow = _to_int_score(_meta_ci_get(mr, "awayYellowCard"))
-            home_red = _to_int_score(_meta_ci_get(mr, "homeRedCard"))
-            away_red = _to_int_score(_meta_ci_get(mr, "awayRedCard"))
-
-            conn.execute(
-                UPSERT_SQL,
-                {
-                    "mid": mid,
-                    "dt": str(item.get("DateTime") or ""),
-                    "date": str(item.get("Date") or ""),
-                    "time": str(item.get("Time") or ""),
-                    "league_code": str(item.get("LeagueCode") or ""),
-                    "league": str(item.get("League") or ""),
-                    "country": str(item.get("Country") or ""),
-                    "team1": str(item.get("Team1") or ""),
-                    "team2": str(item.get("Team2") or ""),
-                    "betcount": item.get("BetCount"),
-                    "ms1": item.get("HomeWin"),
-                    "ms0": item.get("Draw"),
-                    "ms2": item.get("AwayWin"),
-                    "alt25": item.get("Under25"),
-                    "ust25": item.get("Over25"),
-                    "ft_home": ft_home,
-                    "ft_away": ft_away,
-                    "ht_home": ht_home,
-                    "ht_away": ht_away,
-                    "home_corner": home_corner,
-                    "away_corner": away_corner,
-                    "home_yellow": home_yellow,
-                    "away_yellow": away_yellow,
-                    "home_red": home_red,
-                    "away_red": away_red,
-                    "mb": item.get("MB"),
-                    "result": item.get("Result"),       # zorunlu değil
-                    "game_result": gr_i,               # zorunlu (1)
-                    "live_status": item.get("LiveStatus"),  # karar için kullanılmaz
-                    "fetched_at_tr": fetched_at_tr,
-                    "raw_json": _dump_json(item),
-                }
-            )
-            bulk_report["upserted"] += 1
-
-        # -------- BACKFILL (optional) --------
-        if int(backfill) == 1 and int(max_details) > 0:
-            now_tr = datetime.now(TR_TZ) if TR_TZ else datetime.utcnow()
-            yesterday = (now_tr.date() - timedelta(days=1)).isoformat()
-            t_from = "22:00:00"
-            t_to = "23:59:59"
-            backfill_report["window"] = {"day": yesterday, "time_from": t_from, "time_to": t_to}
-
-            mids = (
-                conn.execute(
-                    text("""
-                        SELECT p.nosy_match_id
-                        FROM pool_matches p
-                        LEFT JOIN finished_matches f
-                          ON f.nosy_match_id = p.nosy_match_id
-                        WHERE
-                          p.date = :day
-                          AND p.time >= :t_from
-                          AND p.time <= :t_to
-                          AND (
-                            f.nosy_match_id IS NULL
-                            OR f.ft_home IS NULL
-                            OR f.ft_away IS NULL
-                          )
-                        ORDER BY p.time ASC, p.nosy_match_id
-                        LIMIT :lim
-                    """),
-                    {"day": yesterday, "t_from": t_from, "t_to": t_to, "lim": int(max_details)},
-                )
-                .scalars()
-                .all()
-            )
-
-            backfill_report["candidates"] = len(mids)
-
-            for mid in mids:
-                backfill_report["requested"] += 1
-
-                details_payload = nosy_service_call(
-                    "matches-result/details",
-                    params={"matchID": int(mid), "match_id": int(mid)},
-                )
-                item = _take_details_data(details_payload)
-
-                if not isinstance(item, dict):
-                    backfill_report["details_failed"] += 1
-                    if len(backfill_debug) < MAX_DEBUG:
-                        backfill_debug.append({"stage": "backfill", "mid": int(mid), "why": "details_failed"})
-                    continue
-
-                gr_i = _gr_int(item)
-
-                # >>>>> SADECE GameResult belirleyici <<<<<
-                if gr_i != 1:
-                    backfill_report["not_finished_gr0"] += 1
-                    if len(backfill_debug) < MAX_DEBUG:
-                        backfill_debug.append({
-                            "stage": "backfill",
-                            "mid": int(mid),
-                            "why": "GameResult!=1 => parse yok",
-                            "GameResult": item.get("GameResult"),
-                            "matchResult_len": len(item.get("matchResult") or []),
-                        })
-                    continue
-
-                mr = item.get("matchResult") or []
-                if not mr:
-                    backfill_report["gr1_but_empty_matchResult"] += 1
-                    if len(backfill_debug) < MAX_DEBUG:
-                        backfill_debug.append({
-                            "stage": "backfill",
-                            "mid": int(mid),
-                            "why": "GameResult==1 ama matchResult boş",
-                            "GameResult": item.get("GameResult"),
-                        })
-                    continue
-
-                ft_home = _to_int_score(_meta_ci_get(mr, "msHomeScore"))
-                ft_away = _to_int_score(_meta_ci_get(mr, "msAwayScore"))
-
-                if ft_home is None or ft_away is None:
-                    backfill_report["gr1_but_no_score"] += 1
-                    if len(backfill_debug) < MAX_DEBUG:
-                        backfill_debug.append({
-                            "stage": "backfill",
-                            "mid": int(mid),
-                            "why": "GameResult==1 ama FT skor yok",
-                            "GameResult": item.get("GameResult"),
-                            "sample_matchResult_first3": (mr[:3] if isinstance(mr, list) else []),
-                        })
-                    continue
-
-                # diğer metalar (opsiyonel)
-                ht_home = _to_int_score(_meta_ci_get(mr, "htHomeScore"))
-                ht_away = _to_int_score(_meta_ci_get(mr, "htAwayScore"))
-
-                home_corner = _to_int_score(_meta_ci_get(mr, "homeCorner"))
-                away_corner = _to_int_score(_meta_ci_get(mr, "awayCorner"))
-                home_yellow = _to_int_score(_meta_ci_get(mr, "homeYellowCard"))
-                away_yellow = _to_int_score(_meta_ci_get(mr, "awayYellowCard"))
-                home_red = _to_int_score(_meta_ci_get(mr, "homeRedCard"))
-                away_red = _to_int_score(_meta_ci_get(mr, "awayRedCard"))
-
-                fetched_at_tr_bf = datetime.now(TR_TZ).isoformat() if TR_TZ else datetime.utcnow().isoformat()
-
-                conn.execute(
-                    UPSERT_SQL,
-                    {
-                        "mid": int(mid),
-                        "dt": str(item.get("DateTime") or ""),
-                        "date": str(item.get("Date") or ""),
-                        "time": str(item.get("Time") or ""),
-                        "league_code": str(item.get("LeagueCode") or ""),
-                        "league": str(item.get("League") or ""),
-                        "country": str(item.get("Country") or ""),
-                        "team1": str(item.get("Team1") or ""),
-                        "team2": str(item.get("Team2") or ""),
-                        "betcount": item.get("BetCount"),
-                        "ms1": item.get("HomeWin"),
-                        "ms0": item.get("Draw"),
-                        "ms2": item.get("AwayWin"),
-                        "alt25": item.get("Under25"),
-                        "ust25": item.get("Over25"),
-                        "ft_home": ft_home,
-                        "ft_away": ft_away,
-                        "ht_home": ht_home,
-                        "ht_away": ht_away,
-                        "home_corner": home_corner,
-                        "away_corner": away_corner,
-                        "home_yellow": home_yellow,
-                        "away_yellow": away_yellow,
-                        "home_red": home_red,
-                        "away_red": away_red,
-                        "mb": item.get("MB"),
-                        "result": item.get("Result"),       # zorunlu değil
-                        "game_result": gr_i,               # zorunlu (1)
-                        "live_status": item.get("LiveStatus"),  # karar için kullanılmaz
-                        "fetched_at_tr": fetched_at_tr_bf,
-                        "raw_json": _dump_json(item),
-                    }
-                )
-                backfill_report["upserted"] += 1
-
-    return {
-        "ok": True,
-        "endpoint": "matches-result",
-        "bulk": bulk_report,
-        "bulk_debug": bulk_debug,
-        "backfill": backfill_report,
-        "backfill_debug": backfill_debug,
-    }
-
-@app.get("/db/finished-matches")
-def list_finished_matches(
-    day: Optional[str] = Query(default=None, description="YYYY-MM-DD. Boşsa en son snapshot."),
-    which: str = Query(default="latest", description="latest | oldest"),
-    limit: int = Query(default=50, ge=1, le=500),
-):
-    """
-    Finished matches listesi.
-    - day boşsa: en son (veya oldest seçilirse ilk) snapshot'tan limit kadar döner
-    - day doluysa: o günün biten maçlarını döner
-    """
-    which = (which or "latest").lower().strip()
-    if which not in ("latest", "oldest"):
-        which = "latest"
-
-    snap_sql = "MAX" if which == "latest" else "MIN"
-
-    def _decorate_rows(rows):
-        items = []
-        for r in rows:
-            d = dict(r)
-
-            # skor stringleri
-            d["ft"] = f'{d["ft_home"]}-{d["ft_away"]}' if d.get("ft_home") is not None and d.get("ft_away") is not None else None
-            d["ht"] = f'{d["ht_home"]}-{d["ht_away"]}' if d.get("ht_home") is not None and d.get("ht_away") is not None else None
-
-            # corners
-            hc, ac = d.get("home_corner"), d.get("away_corner")
-            if hc is not None and ac is not None:
-                d["corners_total"] = hc + ac
-                d["corners"] = f"{hc}-{ac}"
-            else:
-                d["corners_total"] = None
-                d["corners"] = None
-
-            # yellow cards
-            hy, ay = d.get("home_yellow"), d.get("away_yellow")
-            if hy is not None and ay is not None:
-                d["yc_total"] = hy + ay
-                d["yc"] = f"{hy}-{ay}"
-            else:
-                d["yc_total"] = None
-                d["yc"] = None
-
-            # red cards
-            hr, ar = d.get("home_red"), d.get("away_red")
-            if hr is not None and ar is not None:
-                d["rc_total"] = hr + ar
-                d["rc"] = f"{hr}-{ar}"
-            else:
-                d["rc_total"] = None
-                d["rc"] = None
-
-            items.append(d)
-        return items
-
-    with engine.begin() as conn:
-        if day:
-            rows = conn.execute(
-                text("""
-                    SELECT
-                        nosy_match_id,
-                        league, team1, team2,
-                        date, time,
-                        ms1, ms0, ms2, alt25, ust25,
-                        ft_home, ft_away, ht_home, ht_away,
-                        home_corner, away_corner,
-                        home_yellow, away_yellow,
-                        home_red, away_red,
-                        betcount,
-                        fetched_at_tr,
-                        updated_at
-                    FROM finished_matches
-                    WHERE date = :day
-                    ORDER BY match_datetime NULLS LAST, nosy_match_id
-                    LIMIT :limit
-                """),
-                {"day": day, "limit": limit},
-            ).mappings().all()
-
-            items = _decorate_rows(rows)
-            return {
-                "ok": True,
-                "day": day,
-                "which": None,
-                "count": len(items),
-                "items": items,
-            }
-
-        snapshot = conn.execute(
-            text(f"SELECT {snap_sql}(fetched_at_tr) AS snap FROM finished_matches")
-        ).scalar()
-
-        if not snapshot:
-            return {"ok": True, "day": None, "which": which, "snapshot": None, "count": 0, "items": []}
-
-        rows = conn.execute(
-            text("""
-                SELECT
-                    nosy_match_id,
-                    league, team1, team2,
-                    date, time,
-                    ms1, ms0, ms2, alt25, ust25,
-                    ft_home, ft_away, ht_home, ht_away,
-                    home_corner, away_corner,
-                    home_yellow, away_yellow,
-                    home_red, away_red,
-                    betcount,
-                    fetched_at_tr,
-                    updated_at
-                FROM finished_matches
-                WHERE fetched_at_tr = :snapshot
-                ORDER BY match_datetime NULLS LAST, nosy_match_id
-                LIMIT :limit
-            """),
-            {"snapshot": snapshot, "limit": limit},
-        ).mappings().all()
-
-        items = _decorate_rows(rows)
-        return {
-            "ok": True,
-            "day": None,
-            "which": which,
-            "snapshot": snapshot,
-            "count": len(items),
-            "items": items,
-            }
-
-@app.get("/health/metrics")
-def health_metrics():
-    with engine.begin() as conn:
-        # -----------------
-        # POOL
-        # -----------------
-        pool_total = conn.execute(
-            text("SELECT COUNT(*) AS c FROM pool_matches")
-        ).mappings().first()["c"]
-
-        pool_latest = conn.execute(
-            text("SELECT MAX(fetched_at_tr) AS mx FROM pool_matches")
-        ).mappings().first()["mx"]
-
-        pool_latest_count = 0
-        if pool_latest:
-            pool_latest_count = conn.execute(
-                text("SELECT COUNT(*) AS c FROM pool_matches WHERE fetched_at_tr = :mx"),
-                {"mx": pool_latest}
-            ).mappings().first()["c"]
-
-        # -----------------
-        # FINISHED
-        # -----------------
-        finished_total = conn.execute(
-            text("SELECT COUNT(*) AS c FROM finished_matches")
-        ).mappings().first()["c"]
-
-        finished_latest = conn.execute(
-            text("SELECT MAX(fetched_at_tr) AS mx FROM finished_matches")
-        ).mappings().first()["mx"]
-
-        finished_latest_count = 0
-        if finished_latest:
-            finished_latest_count = conn.execute(
-                text("SELECT COUNT(*) AS c FROM finished_matches WHERE fetched_at_tr = :mx"),
-                {"mx": finished_latest}
-            ).mappings().first()["c"]
-
-    return {
-        "ok": True,
-        "pool": {
-            "total_in_db": int(pool_total),
-            "latest_snapshot": pool_latest,
-            "latest_snapshot_count": int(pool_latest_count),
-        },
-        "finished": {
-            "total_in_db": int(finished_total),
-            "latest_snapshot": finished_latest,
-            "latest_snapshot_count": int(finished_latest_count),
-        }
-    }
-
-# ------------------------------------------------------------
-# League Profile Stats
-# finished_matches -> aggregation -> panel context
-# ------------------------------------------------------------
-
-@app.get("/stats/league-profile")
-def stats_league_profile(
-    league_code: str = Query(..., min_length=1),
-    league: str = Query(..., min_length=1),
-    min_matches: int = Query(10, ge=1, le=5000),
-):
-    """
-    finished_matches tablosundan lig bazlı profil (V1) üretir.
-    - league_code + league zorunlu
-    - default all-time
-    """
-
-    def _rate(cnt: int, total: int) -> float:
-        if not total:
-            return 0.0
-        return float(cnt) / float(total)
-
-    with engine.begin() as conn:
-        row = conn.execute(
-            text("""
-                SELECT
-                    COUNT(*)::int AS match_count,
-
-                    -- 1X2 (FT skoruna göre)
-                    COUNT(*) FILTER (WHERE ft_home > ft_away)::int AS home_win_count,
-                    COUNT(*) FILTER (WHERE ft_home = ft_away)::int AS draw_count,
-                    COUNT(*) FILTER (WHERE ft_home < ft_away)::int AS away_win_count,
-
-                    -- goals
-                    AVG((ft_home + ft_away)::numeric) AS avg_goals_total,
-                    COUNT(*) FILTER (WHERE (ft_home + ft_away) >= 3)::int AS over25_count,
-                    COUNT(*) FILTER (WHERE ft_home > 0 AND ft_away > 0)::int AS btts_count,
-
-                    -- goal distribution buckets
-                    COUNT(*) FILTER (WHERE (ft_home + ft_away) BETWEEN 0 AND 1)::int AS g0_1_count,
-                    COUNT(*) FILTER (WHERE (ft_home + ft_away) BETWEEN 2 AND 3)::int AS g2_3_count,
-                    COUNT(*) FILTER (WHERE (ft_home + ft_away) BETWEEN 4 AND 5)::int AS g4_5_count,
-                    COUNT(*) FILTER (WHERE (ft_home + ft_away) >= 6)::int AS g6p_count,
-
-                    -- corners
-                    AVG((COALESCE(home_corner,0) + COALESCE(away_corner,0))::numeric) AS avg_corners_total,
-                    AVG(COALESCE(home_corner,0)::numeric) AS avg_home_corner,
-                    AVG(COALESCE(away_corner,0)::numeric) AS avg_away_corner,
-
-                    -- yellow cards
-                    AVG((COALESCE(home_yellow,0) + COALESCE(away_yellow,0))::numeric) AS avg_yellow_total,
-                    AVG(COALESCE(home_yellow,0)::numeric) AS avg_yellow_home,
-                    AVG(COALESCE(away_yellow,0)::numeric) AS avg_yellow_away,
-
-                    -- red cards (match-level)
-                    COUNT(*) FILTER (
-                        WHERE (COALESCE(home_red,0) + COALESCE(away_red,0)) > 0
-                    )::int AS red_match_count
-
-                FROM finished_matches
-                WHERE league_code = :league_code
-                  AND league = :league
-            """),
-            {"league_code": league_code, "league": league},
-        ).mappings().first()
-
-    # Eğer hiç maç yoksa boş profil döndür
-    if not row:
-        return {
-            "ok": True,
-            "league_code": league_code,
-            "league": league,
-            "sample": {"match_count": 0, "low_sample": True, "min_matches": min_matches},
-            "one_x_two": {
-                "home": {"count": 0, "rate": 0.0},
-                "draw": {"count": 0, "rate": 0.0},
-                "away": {"count": 0, "rate": 0.0},
-            },
-            "goals": {
-                "avg_total": 0.0,
-                "over25": {"count": 0, "rate": 0.0},
-                "btts": {"count": 0, "rate": 0.0},
-                "distribution": {
-                    "g0_1": {"count": 0, "rate": 0.0},
-                    "g2_3": {"count": 0, "rate": 0.0},
-                    "g4_5": {"count": 0, "rate": 0.0},
-                    "g6p": {"count": 0, "rate": 0.0},
-                },
-            },
-            "corners": {"avg_total": 0.0, "avg_home": 0.0, "avg_away": 0.0},
-            "cards": {
-                "avg_yellow_total": 0.0,
-                "avg_yellow_home": 0.0,
-                "avg_yellow_away": 0.0,
-                "red_match": {"count": 0, "rate": 0.0},
-            },
-        }
-
-    match_count = int(row["match_count"] or 0)
-
-    # counts
-    home_win_count = int(row["home_win_count"] or 0)
-    draw_count = int(row["draw_count"] or 0)
-    away_win_count = int(row["away_win_count"] or 0)
-
-    over25_count = int(row["over25_count"] or 0)
-    btts_count = int(row["btts_count"] or 0)
-
-    g0_1_count = int(row["g0_1_count"] or 0)
-    g2_3_count = int(row["g2_3_count"] or 0)
-    g4_5_count = int(row["g4_5_count"] or 0)
-    g6p_count = int(row["g6p_count"] or 0)
-
-    red_match_count = int(row["red_match_count"] or 0)
-
-    # avgs (numeric -> float)
-    avg_goals_total = float(row["avg_goals_total"] or 0.0)
-
-    avg_corners_total = float(row["avg_corners_total"] or 0.0)
-    avg_home_corner = float(row["avg_home_corner"] or 0.0)
-    avg_away_corner = float(row["avg_away_corner"] or 0.0)
-
-    avg_yellow_total = float(row["avg_yellow_total"] or 0.0)
-    avg_yellow_home = float(row["avg_yellow_home"] or 0.0)
-    avg_yellow_away = float(row["avg_yellow_away"] or 0.0)
-
-    low_sample = match_count < int(min_matches)
-
-    return {
-        "ok": True,
-        "league_code": league_code,
-        "league": league,
-        "sample": {
-            "match_count": match_count,
-            "low_sample": low_sample,
-            "min_matches": int(min_matches),
-        },
-        "one_x_two": {
-            "home": {"count": home_win_count, "rate": _rate(home_win_count, match_count)},
-            "draw": {"count": draw_count, "rate": _rate(draw_count, match_count)},
-            "away": {"count": away_win_count, "rate": _rate(away_win_count, match_count)},
-        },
-        "goals": {
-            "avg_total": avg_goals_total,
-            "over25": {"count": over25_count, "rate": _rate(over25_count, match_count)},
-            "btts": {"count": btts_count, "rate": _rate(btts_count, match_count)},
-            "distribution": {
-                "g0_1": {"count": g0_1_count, "rate": _rate(g0_1_count, match_count)},
-                "g2_3": {"count": g2_3_count, "rate": _rate(g2_3_count, match_count)},
-                "g4_5": {"count": g4_5_count, "rate": _rate(g4_5_count, match_count)},
-                "g6p": {"count": g6p_count, "rate": _rate(g6p_count, match_count)},
-            },
-        },
-        "corners": {
-            "avg_total": avg_corners_total,
-            "avg_home": avg_home_corner,
-            "avg_away": avg_away_corner,
-        },
-        "cards": {
-            "avg_yellow_total": avg_yellow_total,
-            "avg_yellow_home": avg_yellow_home,
-            "avg_yellow_away": avg_yellow_away,
-            "red_match": {"count": red_match_count, "rate": _rate(red_match_count, match_count)},
-        },
-              }
-
-@app.get("/stats/organizations")
-def stats_organizations(
-    min_matches: int = Query(1, ge=1, le=100000),
-    limit: int = Query(200, ge=1, le=1000),
-):
-    """
-    finished_matches içinden organizasyon (league_code + league) listesini döner.
-    Her organizasyon için toplam maç sayısı ve ilk/son tarih.
-    """
-
-    with engine.begin() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT
-                    league_code,
-                    league,
-                    COUNT(*)::int AS match_count,
-                    MIN(date) AS first_date,
-                    MAX(date) AS last_date
-                FROM finished_matches
-                GROUP BY league_code, league
-                HAVING COUNT(*) >= :min_matches
-                ORDER BY match_count DESC
-                LIMIT :limit
-            """),
-            {"min_matches": min_matches, "limit": limit},
-        ).mappings().all()
-
-    return {
-        "ok": True,
-        "count": len(rows),
-        "items": [dict(r) for r in rows],
-    }
-
-
 # ==========================================================
-# Flashscore API Layer (RapidAPI) - separated in Swagger
+# APP
 # ==========================================================
+app = FastAPI(
+    title="MatchMotor API (Flashscore-only)",
+    version="1.0.0",
+    description="Flashscore (RapidAPI) -> Postgres (Neon) | Only finished matches (1X2 if available).",
+)
 
-# ---------------------------
-# Config (ENV) - FLASHSCORE (RapidAPI)
-# ---------------------------
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
+@app.on_event("startup")
+def _startup():
+    if engine is not None:
+        ensure_schema()
 
-FLASHSCORE_BASE_URL = os.getenv(
-    "FLASHSCORE_BASE_URL",
-    "https://flashscore4.p.rapidapi.com/api/flashscore/v1"
-).strip().rstrip("/")
+@app.get("/health")
+def health():
+    now_utc = datetime.now(timezone.utc)
+    now_tr = now_utc.astimezone(TR_TZ)
+    return {
+        "ok": True,
+        "time_utc": now_utc.isoformat(),
+        "time_tr": now_tr.isoformat(),
+        "tz": "Europe/Istanbul",
+        "db": {"connected": bool(engine), "url_set": bool(DATABASE_URL)},
+        "flashscore": {
+            "base_url": FLASHSCORE_BASE_URL,
+            "host": FLASHSCORE_RAPIDAPI_HOST,
+            "rapidapi_key_set": bool(RAPIDAPI_KEY),
+            "matches_path_template": FLASHSCORE_MATCHES_PATH_TEMPLATE,
+        },
+    }
 
-FLASHSCORE_RAPIDAPI_HOST = os.getenv(
-    "FLASHSCORE_RAPIDAPI_HOST",
-    "flashscore4.p.rapidapi.com"
-).strip()
-
-# ---------------------------
-# FLASHSCORE HELPER
-# ---------------------------
-def _require_rapidapi_key():
-    if not RAPIDAPI_KEY:
-        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY env eksik.")
-
-def flashscore_call(endpoint: str, *, params: dict | None = None) -> dict:
+@app.get("/flashscore/check/base", tags=["Flashscore"])
+def flashscore_check_base():
     """
-    RapidAPI Flashscore çağrısı.
-    Base: https://flashscore4.p.rapidapi.com/api/flashscore/v1
-    Header zorunlu: x-rapidapi-key, x-rapidapi-host
+    Flashscore base URL'ye GET atar (sonunda /ping yok).
+    Rate-limit header'larını göstermek için.
     """
     _require_rapidapi_key()
-
-    url = _join_url(FLASHSCORE_BASE_URL, endpoint)
-
-    headers = {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": FLASHSCORE_RAPIDAPI_HOST,
-    }
-
-    try:
-        r = requests.get(url, headers=headers, params=(params or {}), timeout=30)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Flashscore bağlantı hatası: {e}")
-
-    if r.status_code >= 400:
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text}
-        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
-
-    try:
-        return r.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
-
-def flashscore_base_check() -> dict:
-    """
-    Flashscore RapidAPI base URL'ye GET atar (sonunda /ping yok).
-    Sadece rate limit header'larını ve TR saat bilgilerini döndürür.
-    """
-    _require_rapidapi_key()
-
-    url = FLASHSCORE_BASE_URL  # <- SONUNDA /ping YOK
+    url = FLASHSCORE_BASE_URL
 
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
@@ -1465,36 +291,27 @@ def flashscore_base_check() -> dict:
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Flashscore bağlantı hatası: {e}")
 
-    # Upstream hata ise body'i de gösterelim (debug için)
     if r.status_code >= 400:
         try:
             body = r.json()
         except Exception:
             body = {"raw": r.text}
-        raise HTTPException(
-            status_code=r.status_code,
-            detail={"url": url, "body": body}
-        )
+        raise HTTPException(status_code=r.status_code, detail={"url": url, "body": body})
 
-    # Rate-limit header'larını topla
     h = {k.lower(): v for k, v in r.headers.items()}
     limit = h.get("x-ratelimit-requests-limit")
     remaining = h.get("x-ratelimit-requests-remaining")
-    reset_raw = h.get("x-ratelimit-requests-reset")  # bazen epoch saniye gibi gelir
+    reset_raw = h.get("x-ratelimit-requests-reset")
 
     now_tr = datetime.now(TR_TZ)
 
     reset_tr_iso = None
-    reset_in_seconds = None
-
-    # reset epoch ise TR saatine çevirelim
-    if reset_raw and reset_raw.isdigit():
+    seconds_until_reset = None
+    if reset_raw and str(reset_raw).isdigit():
         reset_epoch = int(reset_raw)
         reset_dt_tr = datetime.fromtimestamp(reset_epoch, tz=timezone.utc).astimezone(TR_TZ)
         reset_tr_iso = reset_dt_tr.isoformat()
-
-        # kaç saniye kaldı (negatifse 0 yap)
-        reset_in_seconds = max(0, int((reset_dt_tr - now_tr).total_seconds()))
+        seconds_until_reset = max(0, int((reset_dt_tr - now_tr).total_seconds()))
 
     return {
         "ok": True,
@@ -1507,444 +324,224 @@ def flashscore_base_check() -> dict:
                 "requests_remaining": remaining,
                 "requests_reset_raw": reset_raw,
                 "requests_reset_tr": reset_tr_iso,
-                "seconds_until_reset": reset_in_seconds,
+                "seconds_until_reset": seconds_until_reset,
             },
             "turkey_time": now_tr.isoformat(),
         },
     }
 
-def flashscore_get(path: str):
-    """
-    Flashscore RapidAPI GET helper.
-    path örn: 'general/1/countries'
-    """
-    _require_rapidapi_key()
-
-    url = f"{FLASHSCORE_BASE_URL}/{path.lstrip('/')}"
-    headers = {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": FLASHSCORE_RAPIDAPI_HOST,
-    }
-
-    try:
-        r = requests.get(url, headers=headers, timeout=30)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Flashscore bağlantı hatası: {e}")
-
-    if r.status_code >= 400:
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text}
-        raise HTTPException(status_code=r.status_code, detail={"url": str(r.url), "body": body})
-
-    try:
-        return r.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail={"url": str(r.url), "body": r.text})
-
-def classify_stage(stage: str | None) -> str:
-    s = (stage or "").strip().lower()
-
-    # finished ayrı ele alınıyor zaten
-    if s in ("inprogress", "in progress", "live", "playing"):
-        return "in_progress"
-
-    if s in ("notstarted", "not started", "scheduled", "upcoming", "fixture"):
-        return "not_started"
-
-    if s in ("postponed", "canceled", "cancelled", "abandoned", "interrupted", "suspended", "walkover", "awarded"):
-        return "postponed_or_cancelled"
-
-    if s == "":
-        return "unknown_stage"
-
-    return f"other:{s}"
-
-@app.get("/flashscore/country", tags=["Flashscore"])
-def flashscore_countries():
-    # Senin verdiğin gerçek endpoint:
-    # /general/1/countries
-    return flashscore_get("general/1/countries")
-
-@app.get("/flashscore/tournaments/{country_id}", tags=["Flashscore"])
-def flashscore_country_tournaments(
-    country_id: int,
-    sport_id: int = Query(1, description="Sport ID (football=1)")
-):
-    # Upstream path: /general/{sport_id}/{country_id}/tournaments
-    path = f"general/{sport_id}/{country_id}/tournaments"
-    return flashscore_get(path)
-
 @app.get("/flashscore/matches/{date}", tags=["Flashscore"])
-def flashscore_matches_by_date(date: str):
+def flashscore_matches(date: str):
     """
-    Tarihe göre maç listesi çeker.
-    Upstream: /match/list/1/{date}
+    Raw matches of a date from Flashscore (RapidAPI).
+    Default endpoint guess: football/matches/{date}
+    You can override with FLASHSCORE_MATCHES_PATH_TEMPLATE env.
     """
-    sport_id = 1  # futbol
-
-    # API URL’de futbol için ilk 1 sabit:
-    path = f"match/list/{sport_id}/{date}"
-
+    path = FLASHSCORE_MATCHES_PATH_TEMPLATE.format(date=date)
     return flashscore_get(path)
-
-@app.get("/flashscore/matches/day/{offset}", tags=["Flashscore"])
-def flashscore_matches_for_offset(offset: int):
-    """
-    -7 to 7 arası gün offsetine göre maç listesi.
-    Upstream: /match/list/1/{offset}
-    """
-    if offset < -7 or offset > 7:
-        raise HTTPException(status_code=400, detail="Offset -7 ile 7 arasında olmalı.")
-
-    sport_id = 1
-
-    return flashscore_get(f"match/list/{sport_id}/{offset}")
-
-@app.get("/flashscore/match-details/{match_id}", tags=["Flashscore"])
-def flashscore_match(match_id: str):
-    return flashscore_get(f"match/details/{match_id}")
-
-@app.get("/flashscore/match-odds/{match_id}", tags=["Flashscore"])
-def flashscore_match_odds(match_id: str):
-    """
-    Tek maça ait oranları çeker.
-    Upstream: /match/odds/{match_id}
-    Örn match_id: GCxZ2uHc
-    """
-    return flashscore_get(f"match/odds/{match_id}")
-
-@app.get("/flashscore/match-stats/{match_id}", tags=["Flashscore"])
-def flashscore_match_stats(match_id: str):
-    """
-    Tek maça ait istatistikleri çeker.
-    Upstream: /match/stats/{match_id}
-    Örn match_id: GCxZ2uHc
-    """
-    return flashscore_get(f"match/stats/{match_id}")
-
-@app.get("/flashscore/match-commentary/{match_id}", tags=["Flashscore"])
-def flashscore_match_commentary(match_id: str):
-    """
-    Tek maça ait anlatım verilerini çeker.
-    Upstream: /match/comumentary/{match_id}
-    Örn match_id: GCxZ2uHc
-    """
-    return flashscore_get(f"match/comumentary/{match_id}")
-
-@app.get("/flashscore/match-standings/{match_id}/{type}", tags=["Flashscore"])
-def flashscore_match_standings(match_id: str, type: str):
-    """
-    Maça göre puan durumu tablosunu çeker.
-    type enum: overall, home, away
-    """
-    type = type.lower()
-
-    if type not in ["overall", "home", "away"]:
-        raise HTTPException(status_code=400, detail="Type overall, home veya away olmalı.")
-
-    # Upstream path:
-    # match/standings-table/{match_id}/{type}
-    return flashscore_get(f"match/standings-table/{match_id}/{type}")
-
-@app.get("/flashscore/match-standings-form/{match_id}/{type}", tags=["Flashscore"])
-def flashscore_standings_form(match_id: str, type: str):
-    """
-    Maçın form (son maçlar performansı) istatistiklerini çeker.
-    type enum: overall, home, away
-    """
-    type = type.lower()
-
-    if type not in ["overall", "home", "away"]:
-        raise HTTPException(status_code=400, detail="Type overall, home veya away olmalı.")
-
-    return flashscore_get(f"match/standings-form/{match_id}/{type}")
-
-# ==========================================================
-# Flashscore -> DB (Finished + MS odds only) - Phase 1
-# ==========================================================
-
-def _safe_int(x):
-    try:
-        if x is None:
-            return None
-        s = str(x).strip()
-        if s == "" or s == "-" or s.lower() == "null":
-            return None
-        return int(s)
-    except Exception:
-        return None
-
-def _safe_float(x):
-    try:
-        if x is None:
-            return None
-        s = str(x).strip().replace(",", ".")
-        if s == "" or s == "-" or s.lower() == "null":
-            return None
-        return float(s)
-    except Exception:
-        return None
-
-def _today_tr_date():
-    return datetime.now(TR_TZ).date()
-
-def _parse_float(v):
-    try:
-        if v is None:
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-def _parse_int(v):
-    try:
-        if v is None:
-            return None
-        return int(v)
-    except Exception:
-        return None
-
-def _fs_ts_to_tr(ts: int) -> Tuple[str, str, str]:
-    """UNIX timestamp -> (match_datetime_tr_iso, date_str, time_str) in TR"""
-    if TR_TZ:
-        dtr = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(TR_TZ)
-    else:
-        dtr = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-    iso = dtr.isoformat()
-    return iso, dtr.date().isoformat(), dtr.time().replace(microsecond=0).isoformat()
-
-def _fs_pick_blocks(payload: Any) -> List[Dict[str, Any]]:
-    """Flashscore match/list payload shape can vary. Normalize to list of blocks."""
-    if isinstance(payload, list):
-        return [b for b in payload if isinstance(b, dict)]
-    if isinstance(payload, dict):
-        for k in ("data", "response", "items", "result"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return [b for b in v if isinstance(b, dict)]
-        # sometimes payload itself is a block
-        return [payload]
-    return []
-
-def _fs_iter_matches(block: Dict[str, Any]) -> List[Dict[str, Any]]:
-    ms = block.get("matches") or block.get("data") or []
-    if isinstance(ms, list):
-        return [m for m in ms if isinstance(m, dict)]
-    return []
-
-def _fs_is_finished(m: Dict[str, Any]) -> bool:
-    return (str(m.get("stage") or "").strip().lower() == "finished")
-
-def _fs_pick_ms_odds(m: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    odds = m.get("odds") or {}
-    if not isinstance(odds, dict):
-        return None, None, None
-    ms1 = _safe_float(odds.get("1"))
-    ms0 = _safe_float(odds.get("X"))
-    ms2 = _safe_float(odds.get("2"))
-    return ms1, ms0, ms2
 
 @app.post("/flashscore/db/finished-ms/sync-date", tags=["Flashscore DB"])
 def flashscore_db_finished_ms_sync_date(
     date: str = Query(..., description="YYYY-MM-DD"),
-    limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz, >0 ise en fazla bu kadar INSERT dene"),
-    sample: int = Query(5, ge=0, le=50, description="debug örnek sayısı (0=kapalı)"),
+    limit_write: int = Query(5000, ge=1, le=20000, description="DB yazım limit (güvenlik)"),
+    sample: int = Query(3, ge=0, le=20, description="response'a örnek maç koy (debug)"),
 ):
     """
-    /match/list/1/{date}
-    KURAL (final veri):
-      - Yalnızca Finished + FT skor + MS(1X2) odds varsa DB'ye yazar.
-      - DB'de aynı flash_match_id varsa DOKUNMAZ (DO NOTHING).
-    Not: Flashscore snapshot değişebilir; bu endpoint API durumunu raporlar, DB finaldir.
+    1) /flashscore/matches/{date} ile maçları çek
+    2) sadece Finished olanları flash_finished_ms tablosuna INSERT (conflict DO NOTHING)
     """
     ensure_schema()
 
-    # date doğrulama
-    try:
-        datetime.strptime(date, "%Y-%m-%d")
-    except Exception:
-        raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
-
-    if engine is None:
-        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
-
-    fetched_at_tr = datetime.now(TR_TZ).isoformat()
-
-    data = flashscore_get(f"match/list/1/{date}")
-    blocks = data if isinstance(data, list) else (data.get("data") or data.get("items") or [])
-    if not isinstance(blocks, list):
-        blocks = []
-
-    # --- counters (API snapshot) ---
-    api_received_total = 0
-    api_stage_counts: dict[str, int] = {}
-
-    # --- pipeline counters ---
-    eligible_for_db = 0
-    inserted_new = 0
-    limited = 0
-
-    skipped: dict[str, int] = {
-        "missing_id_ts": 0,
-        "not_finished": 0,
-        "no_ms_odds": 0,
-        "no_ft_score": 0,
-    }
-    skipped_stage: dict[str, int] = {}  # Finished dışındaki stage'ler (veya boş/garip olanlar)
-
-    # --- samples ---
-    examples = {
-        "missing_id_ts": [],
-        "no_ms_odds": [],
-        "no_ft_score": [],
-        "not_finished": [],
-        "other_stage": [],
-    }
-
-    def _inc(d: dict, k: str, n: int = 1):
-        d[k] = int(d.get(k, 0)) + n
-
-    def _push(bucket: str, m: dict):
-        if sample <= 0:
-            return
-        arr = examples.get(bucket)
-        if arr is None:
-            return
-        if len(arr) >= sample:
-            return
-        arr.append(
-            {
-                "match_id": m.get("match_id"),
-                "stage": m.get("stage"),
-                "timestamp": m.get("timestamp"),
-                "country": (m.get("country") or {}).get("name"),
-                "tournament": (m.get("tournament") or {}).get("name"),
-            }
-        )
-
-    sql_insert = text("""
-        INSERT INTO flash_finished_ms (
-            flash_match_id, match_datetime_tr, date, time,
-            fetched_at_tr, country_name, tournament_name,
-            home, away, ft_home, ft_away,
-            ms1, ms0, ms2,
-            raw_json, updated_at
-        )
-        VALUES (
-            :flash_match_id, :match_datetime_tr, :date, :time,
-            :fetched_at_tr, :country_name, :tournament_name,
-            :home, :away, :ft_home, :ft_away,
-            :ms1, :ms0, :ms2,
-            :raw_json, NOW()
-        )
-        ON CONFLICT (flash_match_id) DO NOTHING
-    """)
-
-    # DB count before/after (o tarihe göre)
+    # DB before count
     with engine.begin() as conn:
         db_count_before = conn.execute(
             text("SELECT COUNT(*)::int FROM flash_finished_ms WHERE date = :d"),
             {"d": date},
         ).scalar() or 0
 
-        for blk in blocks:
-            matches = blk.get("matches") or []
-            if not isinstance(matches, list):
+    fetched_at_tr = datetime.now(TR_TZ).isoformat()
+
+    payload = flashscore_matches(date)  # same process in-app (no extra config)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if data is None:
+        # Some providers return list directly
+        data = payload if isinstance(payload, list) else []
+
+    if not isinstance(data, list):
+        # Fallback: try payload["data"]["events"] etc.
+        if isinstance(payload, dict):
+            for k in ("events", "matches", "items"):
+                v = payload.get(k)
+                if isinstance(v, list):
+                    data = v
+                    break
+        if not isinstance(data, list):
+            data = []
+
+    api_received_total = len(data)
+
+    # Stage stats
+    api_stage_counts = Counter()
+    examples = []
+    inserted_new = 0
+    eligible_for_db = 0
+    limited = False
+
+    # Date distribution based on timestamp->TR date
+    eligible_date_dist = Counter()
+    inserted_date_dist = Counter()
+    min_match_dt_tr = None
+    max_match_dt_tr = None
+
+    skipped = {
+        "non_dict": 0,
+        "missing_id": 0,
+        "missing_timestamp": 0,
+        "not_finished": 0,
+        "no_score": 0,
+    }
+    skipped_stage = Counter()
+
+    with engine.begin() as conn:
+        for m in data:
+            if not isinstance(m, dict):
+                skipped["non_dict"] += 1
                 continue
 
-            for m in matches:
-                api_received_total += 1
+            stage_raw = (
+                m.get("stage")
+                or m.get("status")
+                or m.get("stageName")
+                or m.get("eventStage")
+                or "Unknown"
+            )
+            stage = classify_stage(str(stage_raw))
+            api_stage_counts[stage] += 1
 
-                stage_raw = m.get("stage")
-                stage = (stage_raw or "").strip()
-                _inc(api_stage_counts, stage if stage else "(empty)")
+            if not _fs_is_finished(m):
+                skipped["not_finished"] += 1
+                skipped_stage[stage] += 1
+                continue
 
-                # zorunlu id/ts
-                match_id = m.get("match_id")
-                ts = m.get("timestamp")
-                if not match_id or ts is None:
-                    skipped["missing_id_ts"] += 1
-                    _push("missing_id_ts", m)
-                    continue
+            # Basic identifiers
+            mid = m.get("id") or m.get("eventId") or m.get("matchId")
+            if mid is None:
+                skipped["missing_id"] += 1
+                continue
+            mid_s = str(mid)
 
-                # finished kontrol (case-insensitive)
-                if stage.lower() != "finished":
-                    skipped["not_finished"] += 1
-                    _inc(skipped_stage, stage if stage else "(empty)")
-                    if stage and stage.lower() not in ("finished",):
-                        _push("other_stage", m)
-                    else:
-                        _push("not_finished", m)
-                    continue
+            ts = m.get("timestamp") or m.get("startTimestamp") or m.get("startTime") or m.get("start_time")
+            dt_tr = _fs_ts_to_tr(ts)
+            if dt_tr is None:
+                skipped["missing_timestamp"] += 1
+                continue
 
-                # ms odds (1X2)
-                odds = m.get("odds") or {}
-                ms1 = _safe_float(odds.get("1"))
-                ms0 = _safe_float(odds.get("X"))
-                ms2 = _safe_float(odds.get("2"))
-                if ms1 is None or ms0 is None or ms2 is None:
-                    skipped["no_ms_odds"] += 1
-                    _push("no_ms_odds", m)
-                    continue
+            ft_home, ft_away = _fs_extract_score(m)
+            if ft_home is None or ft_away is None:
+                skipped["no_score"] += 1
+                continue
 
-                # FT skor
-                ht = m.get("home_team") or {}
-                at = m.get("away_team") or {}
-                ft_home = _safe_int(ht.get("score"))
-                ft_away = _safe_int(at.get("score"))
-                if ft_home is None or ft_away is None:
-                    skipped["no_ft_score"] += 1
-                    _push("no_ft_score", m)
-                    continue
+            # Country + tournament names (best effort)
+            country_name = (
+                (m.get("country") or {}).get("name")
+                if isinstance(m.get("country"), dict)
+                else m.get("countryName") or m.get("country") or None
+            )
+            tournament_name = (
+                (m.get("tournament") or {}).get("name")
+                if isinstance(m.get("tournament"), dict)
+                else m.get("tournamentName") or m.get("tournament") or None
+            )
 
-                # artık DB'ye uygun
-                eligible_for_db += 1
+            # Teams
+            ht = m.get("homeTeam") or m.get("home") or {}
+            at = m.get("awayTeam") or m.get("away") or {}
+            home_name = ht.get("name") if isinstance(ht, dict) else (m.get("homeName") or str(ht))
+            away_name = at.get("name") if isinstance(at, dict) else (m.get("awayName") or str(at))
 
-                if limit_write and inserted_new >= limit_write:
-                    limited += 1
-                    continue
+            ms1, ms0, ms2 = _fs_pick_ms_odds(m)
 
-                dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
+            eligible_for_db += 1
+            eligible_date_dist[dt_tr.date().isoformat()] += 1
+            if min_match_dt_tr is None or dt_tr < min_match_dt_tr:
+                min_match_dt_tr = dt_tr
+            if max_match_dt_tr is None or dt_tr > max_match_dt_tr:
+                max_match_dt_tr = dt_tr
+            if inserted_new >= limit_write:
+                limited = True
+                break
 
-                country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
-                tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name")
+            res = conn.execute(
+                text("""
+                    INSERT INTO flash_finished_ms(
+                        flash_match_id,
+                        match_datetime_tr,
+                        date, time,
+                        country_name,
+                        tournament_name,
+                        home, away,
+                        ft_home, ft_away,
+                        ms1, ms0, ms2,
+                        fetched_at_tr,
+                        raw_json,
+                        updated_at
+                    )
+                    VALUES(
+                        :flash_match_id,
+                        :match_datetime_tr,
+                        :date, :time,
+                        :country_name,
+                        :tournament_name,
+                        :home, :away,
+                        :ft_home, :ft_away,
+                        :ms1, :ms0, :ms2,
+                        :fetched_at_tr,
+                        :raw_json,
+                        NOW()
+                    )
+                    ON CONFLICT(flash_match_id) DO NOTHING
+                """),
+                {
+                    "flash_match_id": mid_s,
+                    "match_datetime_tr": dt_tr.isoformat(),
+                    "date": dt_tr.date().isoformat(),
+                    "time": dt_tr.time().strftime("%H:%M:%S"),
+                    "country_name": country_name,
+                    "tournament_name": tournament_name,
+                    "home": home_name,
+                    "away": away_name,
+                    "ft_home": ft_home,
+                    "ft_away": ft_away,
+                    "ms1": ms1,
+                    "ms0": ms0,
+                    "ms2": ms2,
+                    "fetched_at_tr": fetched_at_tr,
+                    "raw_json": _dump_json(m),
+                },
+            )
 
-                res = conn.execute(
-                    sql_insert,
-                    {
-                        "flash_match_id": match_id,
-                        "match_datetime_tr": dt_tr.isoformat(),
-                        "date": dt_tr.date().isoformat(),
-                        "time": dt_tr.time().strftime("%H:%M:%S"),
-                        "fetched_at_tr": fetched_at_tr,
-                        "country_name": country_name,
-                        "tournament_name": tournament_name,
-                        "home": ht.get("name"),
-                        "away": at.get("name"),
-                        "ft_home": ft_home,
-                        "ft_away": ft_away,
-                        "ms1": ms1,
-                        "ms0": ms0,
-                        "ms2": ms2,
-                        "raw_json": json.dumps(m, ensure_ascii=False),
-                    },
-                )
+            # SQLAlchemy rowcount: INSERT olduysa genelde 1, conflict DO NOTHING ise 0
+            if getattr(res, "rowcount", 0) == 1:
+                inserted_new += 1
+                inserted_date_dist[dt_tr.date().isoformat()] += 1
 
-                # SQLAlchemy rowcount: INSERT olduysa genelde 1, conflict DO NOTHING ise 0
-                if getattr(res, "rowcount", 0) == 1:
-                    inserted_new += 1
+            if sample > 0 and len(examples) < sample:
+                examples.append({
+                    "flash_match_id": mid_s,
+                    "stage": stage,
+                    "match_datetime_tr": dt_tr.isoformat(),
+                    "home": home_name,
+                    "away": away_name,
+                    "ft": f"{ft_home}-{ft_away}",
+                    "ms1": ms1, "ms0": ms0, "ms2": ms2,
+                })
 
         db_count_after = conn.execute(
             text("SELECT COUNT(*)::int FROM flash_finished_ms WHERE date = :d"),
             {"d": date},
         ).scalar() or 0
 
-    # özetler
-    api_finished_total = int(api_stage_counts.get("Finished", 0))  # API raw, "Finished" key'i büyük-küçük hassas
-    # yukarıda stage_counts key'leri "Finished" gibi geldiği için böyle bırakıyoruz.
-    # Eğer bazen "finished" gelirse sorun olmaması için aşağıdaki normalize toplamı da veriyoruz:
+    # "Finished" key'i bazen farklı case gelebilir: normalize toplamı da veriyoruz
     api_finished_total_normalized = sum(
         v for k, v in api_stage_counts.items() if (k or "").strip().lower() == "finished"
     )
@@ -1953,15 +550,20 @@ def flashscore_db_finished_ms_sync_date(
         "ok": True,
         "request_date": date,
         "api_received_total": api_received_total,
-        "api_stage_counts": api_stage_counts,
-        "api_finished_total": api_finished_total,
+        "api_stage_counts": dict(api_stage_counts),
         "api_finished_total_normalized": api_finished_total_normalized,
         "eligible_for_db": eligible_for_db,
+        "eligible_date_distribution_tr": dict(eligible_date_dist),
         "inserted_new": inserted_new,
+        "inserted_date_distribution_tr": dict(inserted_date_dist),
+        "match_datetime_tr_range": {
+            "min": min_match_dt_tr.isoformat() if min_match_dt_tr else None,
+            "max": max_match_dt_tr.isoformat() if max_match_dt_tr else None,
+        },
         "limited": limited,
         "skipped": {
             **skipped,
-            "by_non_finished_stage": skipped_stage,  # Finished dışı stage kırılımı
+            "by_non_finished_stage": dict(skipped_stage),
         },
         "db": {
             "count_before": db_count_before,
@@ -1971,211 +573,57 @@ def flashscore_db_finished_ms_sync_date(
         "limit_write": limit_write,
         "fetched_at_tr": fetched_at_tr,
     }
-
     if sample > 0:
         resp["examples"] = examples
-
     return resp
 
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
 def flashscore_db_finished_ms(
-    # Kullanıcı filtreleri (panelde görünenler)
     date: Optional[str] = Query(None, description="YYYY-MM-DD"),
     country: Optional[str] = Query(None, description="Örn: Brazil"),
     tournament: Optional[str] = Query(None, description="Örn: BRAZIL: Copinha"),
-
-    # Panel arka plan modu (UI'da göstermeyebilirsin)
-    mode: str = Query("matches", pattern="^(matches|countries|tournaments)$"),
-
-    # date verilince zaten makul sayıda döner
     limit: int = Query(500, ge=1, le=5000),
 ):
     ensure_schema()
 
-    if engine is None:
-        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
+    where = []
+    params: Dict[str, Any] = {"limit": limit}
 
     if date:
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-        except Exception:
-            raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
+        where.append("date = :date")
+        params["date"] = date
+    if country:
+        where.append("country_name ILIKE :country")
+        params["country"] = f"%{country}%"
+    if tournament:
+        where.append("tournament_name ILIKE :tournament")
+        params["tournament"] = f"%{tournament}%"
 
-    with engine.begin() as conn:
-
-        # 1) Ülke listesi (dropdown)
-        if mode == "countries":
-            rows = conn.execute(text("""
-                SELECT country_name, COUNT(*)::int AS match_count
-                FROM flash_finished_ms
-                WHERE country_name IS NOT NULL AND country_name <> ''
-                GROUP BY country_name
-                ORDER BY match_count DESC, country_name ASC
-            """)).mappings().all()
-            return {"ok": True, "mode": "countries", "items": rows}
-
-        # 2) Lig listesi (ülkeye göre dropdown)
-        if mode == "tournaments":
-            if not country:
-                raise HTTPException(status_code=400, detail="mode=tournaments için country zorunlu")
-            rows = conn.execute(text("""
-                SELECT tournament_name, COUNT(*)::int AS match_count
-                FROM flash_finished_ms
-                WHERE country_name = :country
-                  AND tournament_name IS NOT NULL AND tournament_name <> ''
-                GROUP BY tournament_name
-                ORDER BY match_count DESC, tournament_name ASC
-            """), {"country": country}).mappings().all()
-            return {"ok": True, "mode": "tournaments", "country": country, "items": rows}
-
-        # 3) Maç listesi
-        where = ["1=1"]
-        params = {"limit": limit}
-
-        if date:
-            where.append("date = :date")
-            params["date"] = date
-
-        if country:
-            where.append("country_name = :country")
-            params["country"] = country
-
-        if tournament:
-            where.append("tournament_name = :tournament")
-            params["tournament"] = tournament
-
-        rows = conn.execute(text(f"""
-            SELECT
-                flash_match_id,
-                match_datetime_tr,
-                date, time,
-                country_name, tournament_name,
-                home, away, ft_home, ft_away,
-                ms1, ms0, ms2
-            FROM flash_finished_ms
-            WHERE {" AND ".join(where)}
-            ORDER BY match_datetime_tr ASC
-            LIMIT :limit
-        """), params).mappings().all()
-
-        return {
-            "ok": True,
-            "mode": "matches",
-            "filters": {"date": date, "country": country, "tournament": tournament},
-            "count": len(rows),
-            "items": rows,
-        }
-
-@app.get("/flashscore/db/finished-ms/summary", tags=["Flashscore DB"])
-def flashscore_db_finished_ms_summary():
-    ensure_schema()
-    if engine is None:
-        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
-
-    with engine.begin() as conn:
-        total_in_db = conn.execute(
-            text("SELECT COUNT(*) FROM flash_finished_ms")
-        ).scalar() or 0
-
-        latest_snapshot = conn.execute(
-            text("SELECT MAX(fetched_at_tr) FROM flash_finished_ms")
-        ).scalar()
-
-        # Eğer hiç kayıt yoksa snapshot None gelir
-        if latest_snapshot:
-            latest_snapshot_count = conn.execute(
-                text("SELECT COUNT(*) FROM flash_finished_ms WHERE fetched_at_tr = :snap"),
-                {"snap": latest_snapshot}
-            ).scalar() or 0
-        else:
-            latest_snapshot_count = 0
-
-    return {
-        "ok": True,
-        "finished_ms": {
-            "total_in_db": int(total_in_db),
-            "latest_snapshot": latest_snapshot,           # STRING -> aynen döndür
-            "latest_snapshot_count": int(latest_snapshot_count)
-        }
-    }
-
-@app.get("/flashscore/db/finished-ms/by-tournament", tags=["Flashscore DB"])
-def flashscore_db_finished_ms_by_tournament(
-    limit: int = Query(200, ge=1, le=2000),
-    include_country: int = Query(1, ge=0, le=1, description="1=country+tournament, 0=sadece tournament")
-):
-    ensure_schema()
-    if engine is None:
-        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
-
-    if include_country == 1:
-        sql = text("""
-            SELECT
-                COALESCE(country_name, '') AS country_name,
-                COALESCE(tournament_name, '') AS tournament_name,
-                COUNT(*)::int AS match_count
-            FROM flash_finished_ms
-            GROUP BY 1, 2
-            ORDER BY match_count DESC
-            LIMIT :limit
-        """)
-    else:
-        sql = text("""
-            SELECT
-                COALESCE(tournament_name, '') AS tournament_name,
-                COUNT(*)::int AS match_count
-            FROM flash_finished_ms
-            GROUP BY 1
-            ORDER BY match_count DESC
-            LIMIT :limit
-        """)
-
-    with engine.begin() as conn:
-        rows = conn.execute(sql, {"limit": limit}).mappings().all()
-
-    # JSON formatını temiz döndürelim
-    if include_country == 1:
-        items = [
-            {
-                "country_name": r["country_name"] or None,
-                "tournament_name": r["tournament_name"] or None,
-                "match_count": int(r["match_count"])
-            }
-            for r in rows
-        ]
-    else:
-        items = [
-            {
-                "tournament_name": r["tournament_name"] or None,
-                "match_count": int(r["match_count"])
-            }
-            for r in rows
-        ]
-
-    return {"ok": True, "count": len(items), "items": items}
-
-@app.get("/flashscore/db/finished-ms/daily-counts", tags=["Flashscore DB"])
-def flashscore_db_finished_ms_daily_counts():
-    if engine is None:
-        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
-
-    sql = text("""
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    sql = text(f"""
         SELECT
-            date,
-            COUNT(*) AS match_count
+            flash_match_id,
+            match_datetime_tr,
+            date, time,
+            country_name,
+            tournament_name,
+            home, away,
+            ft_home, ft_away,
+            ms1, ms0, ms2,
+            fetched_at_tr,
+            updated_at
         FROM flash_finished_ms
-        GROUP BY date
-        ORDER BY date
+        {where_sql}
+        ORDER BY date DESC, time DESC
+        LIMIT :limit
     """)
 
     with engine.begin() as conn:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, params).mappings().all()
 
     return {
         "ok": True,
-        "items": [
-            {"date": r.date, "count": r.match_count}
-            for r in rows
-        ]
+        "count": len(rows),
+        "items": [dict(r) for r in rows],
     }
 
