@@ -203,6 +203,33 @@ def _fs_pick_ms_odds(match_obj: dict) -> Tuple[Optional[float], Optional[float],
     # Sometimes odds are under bookmakers[0]['markets'][...]
     return None, None, None
 
+def _safe_float(v):
+    """None/boş/str/num -> float veya None"""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, str):
+            v = v.strip().replace(",", ".")
+            if v == "":
+                return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _safe_int(v):
+    """None/boş/str/num -> int veya None"""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, str):
+            v = v.strip()
+            if v == "":
+                return None
+        return int(float(v))
+    except Exception:
+        return None
+
 # ==========================================================
 # DB SCHEMA
 # ==========================================================
