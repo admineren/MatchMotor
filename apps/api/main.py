@@ -2,7 +2,7 @@ import os
 import json
 import requests
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, Tuple
 from collections import Counter
@@ -343,205 +343,202 @@ def flashscore_matches(date: str):
 @app.post("/flashscore/db/finished-ms/sync-date", tags=["Flashscore DB"])
 def flashscore_db_finished_ms_sync_date(
     date: str = Query(..., description="YYYY-MM-DD"),
-    limit_write: int = Query(5000, ge=1, le=20000, description="DB yazım limit (güvenlik)"),
-    sample: int = Query(3, ge=0, le=20, description="response'a örnek maç koy (debug)"),
+    limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz, >0 ise en fazla bu kadar INSERT dene"),
+    sample: int = Query(5, ge=0, le=50, description="debug örnek sayısı (0=kapalı)"),
 ):
     """
-    1) /flashscore/matches/{date} ile maçları çek
-    2) sadece Finished olanları flash_finished_ms tablosuna INSERT (conflict DO NOTHING)
+    /match/list/1/{date}
+    KURAL (final veri):
+      - Yalnızca Finished + FT skor + MS(1X2) odds varsa DB'ye yazar.
+      - DB'de aynı flash_match_id varsa DOKUNMAZ (DO NOTHING).
+    Not: Flashscore snapshot değişebilir; bu endpoint API durumunu raporlar, DB finaldir.
     """
     ensure_schema()
 
-    # DB before count
+    # date doğrulama
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="date formatı YYYY-MM-DD olmalı")
+
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
+
+    fetched_at_tr = datetime.now(TR_TZ).isoformat()
+
+    data = flashscore_get(f"match/list/1/{date}")
+    blocks = data if isinstance(data, list) else (data.get("data") or data.get("items") or [])
+    if not isinstance(blocks, list):
+        blocks = []
+
+    # --- counters (API snapshot) ---
+    api_received_total = 0
+    api_stage_counts: dict[str, int] = {}
+
+    # --- pipeline counters ---
+    eligible_for_db = 0
+    inserted_new = 0
+    limited = 0
+
+    skipped: dict[str, int] = {
+        "missing_id_ts": 0,
+        "not_finished": 0,
+        "no_ms_odds": 0,
+        "no_ft_score": 0,
+    }
+    skipped_stage: dict[str, int] = {}  # Finished dışındaki stage'ler (veya boş/garip olanlar)
+
+    # --- samples ---
+    examples = {
+        "missing_id_ts": [],
+        "no_ms_odds": [],
+        "no_ft_score": [],
+        "not_finished": [],
+        "other_stage": [],
+    }
+
+    def _inc(d: dict, k: str, n: int = 1):
+        d[k] = int(d.get(k, 0)) + n
+
+    def _push(bucket: str, m: dict):
+        if sample <= 0:
+            return
+        arr = examples.get(bucket)
+        if arr is None:
+            return
+        if len(arr) >= sample:
+            return
+        arr.append(
+            {
+                "match_id": m.get("match_id"),
+                "stage": m.get("stage"),
+                "timestamp": m.get("timestamp"),
+                "country": (m.get("country") or {}).get("name"),
+                "tournament": (m.get("tournament") or {}).get("name"),
+            }
+        )
+
+    sql_insert = text("""
+        INSERT INTO flash_finished_ms (
+            flash_match_id, match_datetime_tr, date, time,
+            fetched_at_tr, country_name, tournament_name,
+            home, away, ft_home, ft_away,
+            ms1, ms0, ms2,
+            raw_json, updated_at
+        )
+        VALUES (
+            :flash_match_id, :match_datetime_tr, :date, :time,
+            :fetched_at_tr, :country_name, :tournament_name,
+            :home, :away, :ft_home, :ft_away,
+            :ms1, :ms0, :ms2,
+            :raw_json, NOW()
+        )
+        ON CONFLICT (flash_match_id) DO NOTHING
+    """)
+
+    # DB count before/after (o tarihe göre)
     with engine.begin() as conn:
         db_count_before = conn.execute(
             text("SELECT COUNT(*)::int FROM flash_finished_ms WHERE date = :d"),
             {"d": date},
         ).scalar() or 0
 
-    fetched_at_tr = datetime.now(TR_TZ).isoformat()
-
-    payload = flashscore_matches(date)  # same process in-app (no extra config)
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if data is None:
-        # Some providers return list directly
-        data = payload if isinstance(payload, list) else []
-
-    if not isinstance(data, list):
-        # Fallback: try payload["data"]["events"] etc.
-        if isinstance(payload, dict):
-            for k in ("events", "matches", "items"):
-                v = payload.get(k)
-                if isinstance(v, list):
-                    data = v
-                    break
-        if not isinstance(data, list):
-            data = []
-
-    api_received_total = len(data)
-
-    # Stage stats
-    api_stage_counts = Counter()
-    examples = []
-    inserted_new = 0
-    eligible_for_db = 0
-    limited = False
-
-    # Date distribution based on timestamp->TR date
-    eligible_date_dist = Counter()
-    inserted_date_dist = Counter()
-    min_match_dt_tr = None
-    max_match_dt_tr = None
-
-    skipped = {
-        "non_dict": 0,
-        "missing_id": 0,
-        "missing_timestamp": 0,
-        "not_finished": 0,
-        "no_score": 0,
-    }
-    skipped_stage = Counter()
-
-    with engine.begin() as conn:
-        for m in data:
-            if not isinstance(m, dict):
-                skipped["non_dict"] += 1
+        for blk in blocks:
+            matches = blk.get("matches") or []
+            if not isinstance(matches, list):
                 continue
 
-            stage_raw = (
-                m.get("stage")
-                or m.get("status")
-                or m.get("stageName")
-                or m.get("eventStage")
-                or "Unknown"
-            )
-            stage = classify_stage(str(stage_raw))
-            api_stage_counts[stage] += 1
+            for m in matches:
+                api_received_total += 1
 
-            if not _fs_is_finished(m):
-                skipped["not_finished"] += 1
-                skipped_stage[stage] += 1
-                continue
+                stage_raw = m.get("stage")
+                stage = (stage_raw or "").strip()
+                _inc(api_stage_counts, stage if stage else "(empty)")
 
-            # Basic identifiers
-            mid = m.get("id") or m.get("eventId") or m.get("matchId")
-            if mid is None:
-                skipped["missing_id"] += 1
-                continue
-            mid_s = str(mid)
+                # zorunlu id/ts
+                match_id = m.get("match_id")
+                ts = m.get("timestamp")
+                if not match_id or ts is None:
+                    skipped["missing_id_ts"] += 1
+                    _push("missing_id_ts", m)
+                    continue
 
-            ts = m.get("timestamp") or m.get("startTimestamp") or m.get("startTime") or m.get("start_time")
-            dt_tr = _fs_ts_to_tr(ts)
-            if dt_tr is None:
-                skipped["missing_timestamp"] += 1
-                continue
+                # finished kontrol (case-insensitive)
+                if stage.lower() != "finished":
+                    skipped["not_finished"] += 1
+                    _inc(skipped_stage, stage if stage else "(empty)")
+                    if stage and stage.lower() not in ("finished",):
+                        _push("other_stage", m)
+                    else:
+                        _push("not_finished", m)
+                    continue
 
-            ft_home, ft_away = _fs_extract_score(m)
-            if ft_home is None or ft_away is None:
-                skipped["no_score"] += 1
-                continue
+                # ms odds (1X2)
+                odds = m.get("odds") or {}
+                ms1 = _safe_float(odds.get("1"))
+                ms0 = _safe_float(odds.get("X"))
+                ms2 = _safe_float(odds.get("2"))
+                if ms1 is None or ms0 is None or ms2 is None:
+                    skipped["no_ms_odds"] += 1
+                    _push("no_ms_odds", m)
+                    continue
 
-            # Country + tournament names (best effort)
-            country_name = (
-                (m.get("country") or {}).get("name")
-                if isinstance(m.get("country"), dict)
-                else m.get("countryName") or m.get("country") or None
-            )
-            tournament_name = (
-                (m.get("tournament") or {}).get("name")
-                if isinstance(m.get("tournament"), dict)
-                else m.get("tournamentName") or m.get("tournament") or None
-            )
+                # FT skor
+                ht = m.get("home_team") or {}
+                at = m.get("away_team") or {}
+                ft_home = _safe_int(ht.get("score"))
+                ft_away = _safe_int(at.get("score"))
+                if ft_home is None or ft_away is None:
+                    skipped["no_ft_score"] += 1
+                    _push("no_ft_score", m)
+                    continue
 
-            # Teams
-            ht = m.get("homeTeam") or m.get("home") or {}
-            at = m.get("awayTeam") or m.get("away") or {}
-            home_name = ht.get("name") if isinstance(ht, dict) else (m.get("homeName") or str(ht))
-            away_name = at.get("name") if isinstance(at, dict) else (m.get("awayName") or str(at))
+                # artık DB'ye uygun
+                eligible_for_db += 1
 
-            ms1, ms0, ms2 = _fs_pick_ms_odds(m)
+                if limit_write and inserted_new >= limit_write:
+                    limited += 1
+                    continue
 
-            eligible_for_db += 1
-            eligible_date_dist[dt_tr.date().isoformat()] += 1
-            if min_match_dt_tr is None or dt_tr < min_match_dt_tr:
-                min_match_dt_tr = dt_tr
-            if max_match_dt_tr is None or dt_tr > max_match_dt_tr:
-                max_match_dt_tr = dt_tr
-            if inserted_new >= limit_write:
-                limited = True
-                break
+                dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
 
-            res = conn.execute(
-                text("""
-                    INSERT INTO flash_finished_ms(
-                        flash_match_id,
-                        match_datetime_tr,
-                        date, time,
-                        country_name,
-                        tournament_name,
-                        home, away,
-                        ft_home, ft_away,
-                        ms1, ms0, ms2,
-                        fetched_at_tr,
-                        raw_json,
-                        updated_at
-                    )
-                    VALUES(
-                        :flash_match_id,
-                        :match_datetime_tr,
-                        :date, :time,
-                        :country_name,
-                        :tournament_name,
-                        :home, :away,
-                        :ft_home, :ft_away,
-                        :ms1, :ms0, :ms2,
-                        :fetched_at_tr,
-                        :raw_json,
-                        NOW()
-                    )
-                    ON CONFLICT(flash_match_id) DO NOTHING
-                """),
-                {
-                    "flash_match_id": mid_s,
-                    "match_datetime_tr": dt_tr.isoformat(),
-                    "date": dt_tr.date().isoformat(),
-                    "time": dt_tr.time().strftime("%H:%M:%S"),
-                    "country_name": country_name,
-                    "tournament_name": tournament_name,
-                    "home": home_name,
-                    "away": away_name,
-                    "ft_home": ft_home,
-                    "ft_away": ft_away,
-                    "ms1": ms1,
-                    "ms0": ms0,
-                    "ms2": ms2,
-                    "fetched_at_tr": fetched_at_tr,
-                    "raw_json": _dump_json(m),
-                },
-            )
+                country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
+                tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name")
 
-            # SQLAlchemy rowcount: INSERT olduysa genelde 1, conflict DO NOTHING ise 0
-            if getattr(res, "rowcount", 0) == 1:
-                inserted_new += 1
-                inserted_date_dist[dt_tr.date().isoformat()] += 1
+                res = conn.execute(
+                    sql_insert,
+                    {
+                        "flash_match_id": match_id,
+                        "match_datetime_tr": dt_tr.isoformat(),
+                        "date": dt_tr.date().isoformat(),
+                        "time": dt_tr.time().strftime("%H:%M:%S"),
+                        "fetched_at_tr": fetched_at_tr,
+                        "country_name": country_name,
+                        "tournament_name": tournament_name,
+                        "home": ht.get("name"),
+                        "away": at.get("name"),
+                        "ft_home": ft_home,
+                        "ft_away": ft_away,
+                        "ms1": ms1,
+                        "ms0": ms0,
+                        "ms2": ms2,
+                        "raw_json": json.dumps(m, ensure_ascii=False),
+                    },
+                )
 
-            if sample > 0 and len(examples) < sample:
-                examples.append({
-                    "flash_match_id": mid_s,
-                    "stage": stage,
-                    "match_datetime_tr": dt_tr.isoformat(),
-                    "home": home_name,
-                    "away": away_name,
-                    "ft": f"{ft_home}-{ft_away}",
-                    "ms1": ms1, "ms0": ms0, "ms2": ms2,
-                })
+                # SQLAlchemy rowcount: INSERT olduysa genelde 1, conflict DO NOTHING ise 0
+                if getattr(res, "rowcount", 0) == 1:
+                    inserted_new += 1
 
         db_count_after = conn.execute(
             text("SELECT COUNT(*)::int FROM flash_finished_ms WHERE date = :d"),
             {"d": date},
         ).scalar() or 0
 
-    # "Finished" key'i bazen farklı case gelebilir: normalize toplamı da veriyoruz
+    # özetler
+    api_finished_total = int(api_stage_counts.get("Finished", 0))  # API raw, "Finished" key'i büyük-küçük hassas
+    # yukarıda stage_counts key'leri "Finished" gibi geldiği için böyle bırakıyoruz.
+    # Eğer bazen "finished" gelirse sorun olmaması için aşağıdaki normalize toplamı da veriyoruz:
     api_finished_total_normalized = sum(
         v for k, v in api_stage_counts.items() if (k or "").strip().lower() == "finished"
     )
@@ -550,20 +547,15 @@ def flashscore_db_finished_ms_sync_date(
         "ok": True,
         "request_date": date,
         "api_received_total": api_received_total,
-        "api_stage_counts": dict(api_stage_counts),
+        "api_stage_counts": api_stage_counts,
+        "api_finished_total": api_finished_total,
         "api_finished_total_normalized": api_finished_total_normalized,
         "eligible_for_db": eligible_for_db,
-        "eligible_date_distribution_tr": dict(eligible_date_dist),
         "inserted_new": inserted_new,
-        "inserted_date_distribution_tr": dict(inserted_date_dist),
-        "match_datetime_tr_range": {
-            "min": min_match_dt_tr.isoformat() if min_match_dt_tr else None,
-            "max": max_match_dt_tr.isoformat() if max_match_dt_tr else None,
-        },
         "limited": limited,
         "skipped": {
             **skipped,
-            "by_non_finished_stage": dict(skipped_stage),
+            "by_non_finished_stage": skipped_stage,  # Finished dışı stage kırılımı
         },
         "db": {
             "count_before": db_count_before,
@@ -573,8 +565,10 @@ def flashscore_db_finished_ms_sync_date(
         "limit_write": limit_write,
         "fetched_at_tr": fetched_at_tr,
     }
+
     if sample > 0:
         resp["examples"] = examples
+
     return resp
 
 @app.get("/flashscore/db/finished-ms", tags=["Flashscore DB"])
