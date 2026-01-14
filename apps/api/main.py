@@ -279,7 +279,7 @@ def flashscore_check_base():
     Rate-limit header'larını göstermek için.
     """
     _require_rapidapi_key()
-    url = FLASHSCORE_BASE_URL
+    url = f"{FLASHSCORE_BASE_URL}/match/list/1/{datetime.now(TR_TZ).date().isoformat()}"
 
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
@@ -626,4 +626,85 @@ def flashscore_db_finished_ms(
         "count": len(rows),
         "items": [dict(r) for r in rows],
     }
+
+@app.get("/flashscore/db/finished-ms/daily-counts", tags=["Flashscore DB"])
+def flashscore_db_finished_ms_daily_counts():
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
+
+    sql = text("""
+        SELECT
+            date,
+            COUNT(*) AS match_count
+        FROM flash_finished_ms
+        GROUP BY date
+        ORDER BY date
+    """)
+
+    with engine.begin() as conn:
+        rows = conn.execute(sql).fetchall()
+
+    return {
+        "ok": True,
+        "items": [
+            {"date": r.date, "count": r.match_count}
+            for r in rows
+        ]
+    }
+
+@app.get("/flashscore/db/finished-ms/by-tournament", tags=["Flashscore DB"])
+def flashscore_db_finished_ms_by_tournament(
+    limit: int = Query(200, ge=1, le=2000),
+    include_country: int = Query(1, ge=0, le=1, description="1=country+tournament, 0=sadece tournament")
+):
+    ensure_schema()
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL/engine yok")
+
+    if include_country == 1:
+        sql = text("""
+            SELECT
+                COALESCE(country_name, '') AS country_name,
+                COALESCE(tournament_name, '') AS tournament_name,
+                COUNT(*)::int AS match_count
+            FROM flash_finished_ms
+            GROUP BY 1, 2
+            ORDER BY match_count DESC
+            LIMIT :limit
+        """)
+    else:
+        sql = text("""
+            SELECT
+                COALESCE(tournament_name, '') AS tournament_name,
+                COUNT(*)::int AS match_count
+            FROM flash_finished_ms
+            GROUP BY 1
+            ORDER BY match_count DESC
+            LIMIT :limit
+        """)
+
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {"limit": limit}).mappings().all()
+
+    # JSON formatını temiz döndürelim
+    if include_country == 1:
+        items = [
+            {
+                "country_name": r["country_name"] or None,
+                "tournament_name": r["tournament_name"] or None,
+                "match_count": int(r["match_count"])
+            }
+            for r in rows
+        ]
+    else:
+        items = [
+            {
+                "tournament_name": r["tournament_name"] or None,
+                "match_count": int(r["match_count"])
+            }
+            for r in rows
+        ]
+
+    return {"ok": True, "count": len(items), "items": items}
+
 
