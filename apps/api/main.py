@@ -527,7 +527,7 @@ def flashscore_db_finished_ms_sync_date(
                     limited += 1
                     continue
 
-                dt_tr = datetime.fromtimestamp(int(ts), tz=TR_TZ)
+                dt_tr = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(TR_TZ)
 
                 country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
                 tournament_name = (m.get("tournament") or {}).get("name") or blk.get("name")
