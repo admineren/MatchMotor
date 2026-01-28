@@ -370,16 +370,16 @@ def flashscore_matches(date: str):
 @app.post("/flashscore/db/finished-ms/sync-date", tags=["Flashscore DB"])
 def flashscore_db_finished_ms_sync_date(
     date: str = Query(..., description="YYYY-MM-DD"),
-    limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz, >0 ise en fazla bu kadar INSERT dene"),
-    sample: int = Query(5, ge=0, le=50, description="debug örnek sayısı (0=kapalı)"),
+    limit_write: int = Query(0, ge=0, le=5000, description="0=limitsiz"),
+    sample: int = Query(0, ge=0, le=50, description="debug örnek (0=kapalı)"),
 ):
     """
-    /match/list/1/{date}
-    KURAL (final veri):
-      - Yalnızca Finished + FT skor + MS(1X2) odds varsa DB'ye yazar.
-      - DB'de aynı flash_match_id varsa DOKUNMAZ (DO NOTHING).
-    Not: Flashscore snapshot değişebilir; bu endpoint API durumunu raporlar, DB finaldir.
+    KURAL:
+      - FT skoru varsa maç bitmiştir.
+      - FT skor + MS(1X2) odds varsa DB'ye yazılır.
+      - Aynı flash_match_id varsa INSERT yapılmaz.
     """
+
     ensure_schema()
 
     # date doğrulama
@@ -398,50 +398,31 @@ def flashscore_db_finished_ms_sync_date(
     if not isinstance(blocks, list):
         blocks = []
 
-    # --- counters (API snapshot) ---
-    api_received_total = 0
-    api_stage_counts: dict[str, int] = {}
-
-    # --- pipeline counters ---
+    # --- counters ---
+    api_total = 0
+    finished_detected = 0
     eligible_for_db = 0
     inserted_new = 0
-    limited = 0
 
-    skipped: dict[str, int] = {
+    skipped = {
         "missing_id_ts": 0,
         "not_finished": 0,
         "no_ms_odds": 0,
-        "no_ft_score": 0,
-    }
-    skipped_stage: dict[str, int] = {}  # Finished dışındaki stage'ler (veya boş/garip olanlar)
-
-    # --- samples ---
-    examples = {
-        "missing_id_ts": [],
-        "no_ms_odds": [],
-        "no_ft_score": [],
-        "not_finished": [],
-        "other_stage": [],
     }
 
-    def _inc(d: dict, k: str, n: int = 1):
-        d[k] = int(d.get(k, 0)) + n
+    examples = {"not_finished": [], "no_ms_odds": []}
 
     def _push(bucket: str, m: dict):
         if sample <= 0:
             return
         arr = examples.get(bucket)
-        if arr is None:
-            return
-        if len(arr) >= sample:
+        if arr is None or len(arr) >= sample:
             return
         arr.append(
             {
                 "match_id": m.get("match_id"),
-                "stage": m.get("stage"),
                 "timestamp": m.get("timestamp"),
-                "country": (m.get("country") or {}).get("name"),
-                "tournament": (m.get("tournament") or {}).get("name"),
+                "stage": m.get("stage"),
             }
         )
 
@@ -463,7 +444,6 @@ def flashscore_db_finished_ms_sync_date(
         ON CONFLICT (flash_match_id) DO NOTHING
     """)
 
-    # DB count before/after (o tarihe göre)
     with engine.begin() as conn:
         db_count_before = conn.execute(
             text("SELECT COUNT(*)::int FROM flash_finished_ms WHERE date = :d"),
@@ -476,57 +456,48 @@ def flashscore_db_finished_ms_sync_date(
                 continue
 
             for m in matches:
-                api_received_total += 1
+                api_total += 1
 
-                stage_raw = m.get("stage")
-                stage = (stage_raw or "").strip()
-                _inc(api_stage_counts, stage if stage else "(empty)")
-
-                # zorunlu id/ts
                 match_id = m.get("match_id")
                 ts = m.get("timestamp")
+
                 if not match_id or ts is None:
                     skipped["missing_id_ts"] += 1
-                    _push("missing_id_ts", m)
                     continue
 
-                # finished kontrol (case-insensitive)
-                if stage.lower() != "finished":
+                # --- FT skor ---
+                ht = m.get("home_team") or {}
+                at = m.get("away_team") or {}
+
+                ft_home = _safe_int(ht.get("score"))
+                ft_away = _safe_int(at.get("score"))
+
+                is_finished = (ft_home is not None and ft_away is not None)
+
+                if not is_finished:
                     skipped["not_finished"] += 1
-                    _inc(skipped_stage, stage if stage else "(empty)")
-                    if stage and stage.lower() not in ("finished",):
-                        _push("other_stage", m)
-                    else:
-                        _push("not_finished", m)
+                    _push("not_finished", m)
                     continue
 
-                # ms odds (1X2)
+                finished_detected += 1
+
+                # --- MS odds ---
                 odds = m.get("odds") or {}
                 ms1 = _safe_float(odds.get("1"))
                 ms0 = _safe_float(odds.get("X"))
                 ms2 = _safe_float(odds.get("2"))
+
                 if ms1 is None or ms0 is None or ms2 is None:
                     skipped["no_ms_odds"] += 1
                     _push("no_ms_odds", m)
                     continue
 
-                # FT skor
-                ht = m.get("home_team") or {}
-                at = m.get("away_team") or {}
-                ft_home = _safe_int(ht.get("score"))
-                ft_away = _safe_int(at.get("score"))
-                if ft_home is None or ft_away is None:
-                    skipped["no_ft_score"] += 1
-                    _push("no_ft_score", m)
-                    continue
-
-                # artık DB'ye uygun
                 eligible_for_db += 1
 
                 if limit_write and inserted_new >= limit_write:
-                    limited += 1
                     continue
 
+                # ✅ UTC → TR dönüşümü (kritik fix)
                 dt_tr = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(TR_TZ)
 
                 country_name = (m.get("country") or {}).get("name") or blk.get("country_name")
@@ -553,7 +524,6 @@ def flashscore_db_finished_ms_sync_date(
                     },
                 )
 
-                # SQLAlchemy rowcount: INSERT olduysa genelde 1, conflict DO NOTHING ise 0
                 if getattr(res, "rowcount", 0) == 1:
                     inserted_new += 1
 
@@ -562,34 +532,17 @@ def flashscore_db_finished_ms_sync_date(
             {"d": date},
         ).scalar() or 0
 
-    # özetler
-    api_finished_total = int(api_stage_counts.get("Finished", 0))  # API raw, "Finished" key'i büyük-küçük hassas
-    # yukarıda stage_counts key'leri "Finished" gibi geldiği için böyle bırakıyoruz.
-    # Eğer bazen "finished" gelirse sorun olmaması için aşağıdaki normalize toplamı da veriyoruz:
-    api_finished_total_normalized = sum(
-        v for k, v in api_stage_counts.items() if (k or "").strip().lower() == "finished"
-    )
-
+    # --- sade response ---
     resp = {
         "ok": True,
-        "request_date": date,
-        "api_received_total": api_received_total,
-        "api_stage_counts": api_stage_counts,
-        "api_finished_total": api_finished_total,
-        "api_finished_total_normalized": api_finished_total_normalized,
+        "date": date,
+        "api_total": api_total,
+        "finished_detected": finished_detected,
         "eligible_for_db": eligible_for_db,
         "inserted_new": inserted_new,
-        "limited": limited,
-        "skipped": {
-            **skipped,
-            "by_non_finished_stage": skipped_stage,  # Finished dışı stage kırılımı
-        },
-        "db": {
-            "count_before": db_count_before,
-            "count_after": db_count_after,
-            "delta": db_count_after - db_count_before,
-        },
-        "limit_write": limit_write,
+        "skipped": skipped,
+        "db_total_for_day": db_count_after,
+        "delta": db_count_after - db_count_before,
         "fetched_at_tr": fetched_at_tr,
     }
 
